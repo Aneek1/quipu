@@ -1,6 +1,6 @@
 import json
 
-from quipu.results_table import build_table
+from quipu.results_table import build_table, main
 
 
 def write_run(tmp_path, run_id, final_train, final_val, status="completed"):
@@ -169,3 +169,75 @@ def test_rows_are_sorted_by_run_id(tmp_path):
     body_lines = [l for l in table.splitlines() if l.startswith("| ")][2:]  # skip header + separator
     run_ids = [l.split("|")[1].strip() for l in body_lines]
     assert run_ids == sorted(run_ids)
+
+
+def test_malformed_record_gets_a_flagged_row_not_a_crash_when_steps_is_a_string(tmp_path):
+    write_run(tmp_path, "good", 3.9, 4.0)
+    record = {"run_id": "bad-steps", "status": "running", "config": {}, "steps": "notalist", "evals": []}
+    (tmp_path / "bad-steps.json").write_text(json.dumps(record), encoding="utf-8")
+
+    table = build_table(tmp_path)
+
+    assert "good" in table and "3.9000" in table
+    lines = [l for l in table.splitlines() if l.startswith("| bad-steps")]
+    assert lines
+    cells = [c.strip() for c in lines[0].strip("|").split("|")]
+    assert cells[1] == "malformed"
+    assert all(c == "-" for c in cells[2:])
+
+
+def test_malformed_record_gets_a_flagged_row_not_a_crash_when_step_missing_train_loss(tmp_path):
+    write_run(tmp_path, "good", 3.9, 4.0)
+    record = {
+        "run_id": "no-train-loss",
+        "status": "running",
+        "config": {},
+        "steps": [{"step": 1, "lr": 1e-4, "tokens": 1}],
+        "evals": [],
+    }
+    (tmp_path / "no-train-loss.json").write_text(json.dumps(record), encoding="utf-8")
+
+    table = build_table(tmp_path)
+
+    assert "good" in table and "3.9000" in table
+    lines = [l for l in table.splitlines() if l.startswith("| no-train-loss")]
+    assert lines
+    cells = [c.strip() for c in lines[0].strip("|").split("|")]
+    assert cells[1] == "malformed"
+    assert all(c == "-" for c in cells[2:])
+
+
+def test_run_id_with_pipe_character_does_not_break_the_row(tmp_path):
+    # "|" is invalid in a Windows filename, so the run_id (from inside the
+    # record) can differ from the file's stem; write the file under a safe name.
+    record = {
+        "run_id": "weird|run",
+        "status": "completed",
+        "config": {},
+        "steps": [{"step": 1, "train_loss": 3.9, "lr": 1e-4, "tokens": 1}],
+        "evals": [],
+    }
+    (tmp_path / "weird-run.json").write_text(json.dumps(record), encoding="utf-8")
+
+    table = build_table(tmp_path)
+
+    # The pipe is escaped, so it stays inside the run's cell rather than
+    # opening a phantom extra column.
+    assert "weird\\|run" in table
+    lines = [l for l in table.splitlines() if l.startswith("|")]
+    assert len(lines) == 3  # header, separator, one data row
+    header_cols = table.splitlines()[0].count("| ")
+    data_line = [l for l in lines if "weird" in l][0]
+    assert data_line.count("| ") == header_cols
+
+
+def test_main_with_out_writes_utf8_file_without_bom(tmp_path):
+    write_run(tmp_path, "run-a", 3.9, 4.0)
+    out_file = tmp_path / "RESULTS.md"
+    main(["--out", str(out_file), str(tmp_path)])
+
+    data = out_file.read_bytes()
+    assert data.startswith(b"# Quipu results")
+    assert not data.startswith(b"\xef\xbb\xbf")
+    assert not data.startswith(b"\xff\xfe")
+    assert not data.startswith(b"\xfe\xff")

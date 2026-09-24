@@ -1,16 +1,68 @@
 """Generate RESULTS.md from run records. Nothing here is ever typed by hand.
 
 Run: uv run python -m quipu.results_table results/runs > RESULTS.md
+Or:  uv run python -m quipu.results_table results/runs --out RESULTS.md
+     (PowerShell's `>` redirection writes UTF-16LE with a BOM, which renders
+     as garbage on GitHub, so --out writes UTF-8 directly instead.)
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
+from quipu.fsio import replace_with_retry
+
+# Exceptions raised while shaping a *validly-parsed* record into a row: wrong
+# types, missing keys, empty sequences indexed anyway. Distinct from the
+# OSError/JSONDecodeError that mean the file itself couldn't be read as JSON.
+_MALFORMED_ERRORS = (KeyError, TypeError, IndexError, AttributeError, ValueError)
+
 
 def _fmt_int(n) -> str:
     return f"{n:,}" if isinstance(n, (int, float)) else "-"
+
+
+def _esc(value) -> str:
+    """Escape '|' so a value can't be mistaken for a markdown cell boundary."""
+    return str(value).replace("|", "\\|")
+
+
+def _blank_row(run_id, status: str) -> str:
+    return f"| {_esc(run_id)} | {status} | - | - | - | - | - | - | - |"
+
+
+def _build_row(record: dict, path: Path) -> tuple[str, str]:
+    """Raises one of _MALFORMED_ERRORS if `record` isn't shaped like a run log."""
+    run_id = record.get("run_id", path.stem)
+
+    steps = record.get("steps") or []
+    evals = record.get("evals") or []
+    resumes = record.get("resumes") or []
+    last_step = steps[-1] if steps else {}
+
+    planned = record.get("config", {}).get("derived", {}).get("steps")
+    if steps:
+        if planned is not None:
+            steps_col = f"{last_step['step']:,} / {planned:,}"
+        else:
+            steps_col = f"{last_step['step']:,}"
+    else:
+        steps_col = "0"
+
+    row = "| {run} | {status} | {steps} | {train} | {val} | {tokens} | {resumes} | {skipped} | {wraps} |".format(
+        run=_esc(run_id),
+        status=_esc(record.get("status", "?")),
+        steps=steps_col,
+        train=f"{last_step['train_loss']:.4f}" if steps else "-",
+        val=f"{evals[-1]['val_loss']:.4f}" if evals else "-",
+        tokens=_fmt_int(last_step.get("tokens")) if steps else "-",
+        resumes=len(resumes),
+        skipped=last_step.get("skipped", 0) if steps else "-",
+        wraps=last_step.get("wraps", 0) if steps else "-",
+    )
+    return run_id, row
 
 
 def build_table(run_dir: str | Path) -> str:
@@ -19,42 +71,24 @@ def build_table(run_dir: str | Path) -> str:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            rows.append(
-                (path.stem, "| {run} | unreadable | - | - | - | - | - | - | - |".format(run=path.stem))
-            )
+            rows.append((path.stem, _blank_row(path.stem, "unreadable")))
             continue
 
-        steps = record.get("steps") or []
-        evals = record.get("evals") or []
-        resumes = record.get("resumes") or []
-        last_step = steps[-1] if steps else {}
+        try:
+            run_id, row = _build_row(record, path)
+        except _MALFORMED_ERRORS:
+            # A record that parsed as JSON but isn't shaped like a run log
+            # (wrong types, missing fields) must not take down the whole
+            # table either -- flag it distinctly from an unreadable file.
+            fallback_id = path.stem
+            try:
+                fallback_id = record.get("run_id", path.stem)
+            except AttributeError:
+                pass
+            rows.append((fallback_id, _blank_row(fallback_id, "malformed")))
+            continue
 
-        planned = record.get("config", {}).get("derived", {}).get("steps")
-        if steps:
-            if planned is not None:
-                steps_col = f"{last_step['step']:,} / {planned:,}"
-            else:
-                steps_col = f"{last_step['step']:,}"
-        else:
-            steps_col = "0"
-
-        run_id = record.get("run_id", path.stem)
-        rows.append(
-            (
-                run_id,
-                "| {run} | {status} | {steps} | {train} | {val} | {tokens} | {resumes} | {skipped} | {wraps} |".format(
-                    run=run_id,
-                    status=record.get("status", "?"),
-                    steps=steps_col,
-                    train=f"{last_step['train_loss']:.4f}" if steps else "-",
-                    val=f"{evals[-1]['val_loss']:.4f}" if evals else "-",
-                    tokens=_fmt_int(last_step.get("tokens")) if steps else "-",
-                    resumes=len(resumes),
-                    skipped=last_step.get("skipped", 0) if steps else "-",
-                    wraps=last_step.get("wraps", 0) if steps else "-",
-                ),
-            )
-        )
+        rows.append((run_id, row))
 
     rows.sort(key=lambda r: r[0])
     header = (
@@ -64,11 +98,33 @@ def build_table(run_dir: str | Path) -> str:
     return header + "\n" + "\n".join(row for _, row in rows) + "\n"
 
 
-def main() -> None:
-    run_dir = sys.argv[1] if len(sys.argv) > 1 else "results/runs"
-    print("# Quipu results\n")
-    print("Generated by `quipu/results_table.py`. Do not edit by hand.\n")
-    print(build_table(run_dir))
+def _render(run_dir: str | Path) -> str:
+    return (
+        "# Quipu results\n\n"
+        "Generated by `quipu/results_table.py`. Do not edit by hand.\n\n"
+        + build_table(run_dir)
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", nargs="?", default="results/runs")
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="write the table to this path as UTF-8 instead of printing to stdout",
+    )
+    args = parser.parse_args(argv)
+
+    output = _render(args.run_dir)
+
+    if args.out:
+        out_path = Path(args.out)
+        tmp = out_path.with_name(out_path.name + ".tmp")
+        tmp.write_text(output, encoding="utf-8")
+        replace_with_retry(tmp, out_path)
+    else:
+        print(output)
 
 
 if __name__ == "__main__":
