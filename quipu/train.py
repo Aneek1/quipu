@@ -12,6 +12,7 @@ import dataclasses
 import math
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +27,8 @@ from quipu.model import Quipu
 from quipu.runlog import RunLog
 
 LATEST = "latest.pt"
+PRINT_EVERY = 10
+MAX_NONFINITE_STREAK = 3
 _CKPT_NAME = re.compile(r"^step_(\d+)\.pt$")
 
 
@@ -59,6 +62,7 @@ class Trainer:
         self.device = device
         self.step = 0
         self.log_failures = 0
+        self.nonfinite_streak = 0
         self.ckpt_dir = Path(train_cfg.ckpt_dir)
 
         self.model = Quipu(model_cfg).to(device)
@@ -124,23 +128,55 @@ class Trainer:
         for group in self.opt.param_groups:
             group["lr"] = lr
 
-        self.model.train()
-        self.opt.zero_grad(set_to_none=True)
-        total = 0.0
-        use_amp = self.device.startswith("cuda")
-        for _ in range(cfg.grad_accum):
-            x, y = self.stream.next_batch()
-            x, y = x.to(self.device), y.to(self.device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                logits = self.model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1))
-            # Divide before backward so the accumulated gradient is the mean over the
-            # whole batch, not the sum over micro-batches.
-            (loss / cfg.grad_accum).backward()
-            total += loss.item() / cfg.grad_accum
+        t0 = time.perf_counter()
+        # If anything escapes before opt.step() (Ctrl+C mid-step, most likely), the
+        # batches read so far had their gradients thrown away; rewind so the
+        # interrupt checkpoint does not skip them.
+        start = self.stream.state_dict()
+        try:
+            self.model.train()
+            self.opt.zero_grad(set_to_none=True)
+            total = 0.0
+            use_amp = self.device.startswith("cuda")
+            for _ in range(cfg.grad_accum):
+                x, y = self.stream.next_batch()
+                x, y = x.to(self.device), y.to(self.device)
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = self.model(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1))
+                # Divide before backward so the accumulated gradient is the mean over
+                # the whole batch, not the sum over micro-batches.
+                (loss / cfg.grad_accum).backward()
+                total += loss.item() / cfg.grad_accum
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-        self.opt.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+            if not (math.isfinite(total) and torch.isfinite(grad_norm)):
+                # One NaN/inf batch taken as a step would poison the weights and
+                # AdamW's moments, and every later checkpoint (retention would then
+                # prune the clean ones). Skip it: step and lr stay where they are.
+                self.opt.zero_grad(set_to_none=True)
+                self.nonfinite_streak += 1
+                print(
+                    f"warning: non-finite loss/grad at step {self.step} "
+                    f"(loss {total}, grad norm {float(grad_norm)}); step skipped "
+                    f"({self.nonfinite_streak} in a row)",
+                    file=sys.stderr, flush=True,
+                )
+                if self.nonfinite_streak >= MAX_NONFINITE_STREAK:
+                    raise RuntimeError(
+                        f"non-finite loss/grad for {MAX_NONFINITE_STREAK} consecutive "
+                        f"steps at step {self.step}; stopping without checkpointing "
+                        "poisoned weights"
+                    )
+                return total
+            self.nonfinite_streak = 0
+            self.opt.step()
+        except BaseException:
+            self.stream.load_state_dict(start)
+            raise
+        # Free the gradients now rather than at the next step: eval and checkpointing
+        # run in between, and VRAM headroom at micro_batch 4 is ~480 MiB.
+        self.opt.zero_grad(set_to_none=True)
         self.step += 1
         # wraps > 0 means the model is re-reading data; it must be visible in the log.
         self._safe_log(
@@ -149,6 +185,17 @@ class Trainer:
             tokens=self.step * cfg.batch_tokens,
             wraps=self.stream.wraps, grad_norm=float(grad_norm),
         )
+        if self.step % PRINT_EVERY == 0:
+            if self.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            tok_s = cfg.batch_tokens / max(time.perf_counter() - t0, 1e-9)
+            line = (
+                f"step {self.step}/{cfg.steps}  loss {total:.4f}  lr {lr:.2e}  "
+                f"grad {float(grad_norm):.3f}  {tok_s:,.0f} tok/s"
+            )
+            if self.stream.wraps:
+                line += f"  wraps {self.stream.wraps}"
+            print(line, flush=True)
         return total
 
     # ---- checkpoints ---------------------------------------------------------
@@ -195,7 +242,9 @@ class Trainer:
         if path is None:
             pointer = torch.load(self.ckpt_dir / LATEST, weights_only=False)
             path = self.ckpt_dir / pointer["file"]
-        state = torch.load(path, map_location=self.device, weights_only=False)
+        # Load to CPU: set_rng_state needs CPU ByteTensors, and model/optimizer
+        # load_state_dict move their tensors to the right device themselves.
+        state = torch.load(path, map_location="cpu", weights_only=False)
         self.step = state["step"]
         self.model.load_state_dict(state["model"])
         self.opt.load_state_dict(state["optimizer"])
@@ -217,11 +266,14 @@ class Trainer:
         saved_at = None
         try:
             while self.step < cfg.steps:
+                before = self.step
                 loss = self.train_step()
+                if self.step == before:
+                    continue       # non-finite step skipped; nothing new to eval or save
                 if self.step % cfg.eval_every == 0 and self.val_stream is not None:
                     val = estimate_loss(self.model, self.val_stream, cfg.eval_batches, self.device)
                     self._safe_log(self.log.log_eval, self.step, val)
-                    print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}")
+                    print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}", flush=True)
                 if self.step % cfg.ckpt_every == 0:
                     self.save_checkpoint()
                     saved_at = self.step
@@ -231,6 +283,11 @@ class Trainer:
         except KeyboardInterrupt:
             self.save_checkpoint()
             self._safe_log(self.log.finish, "interrupted")
+            raise
+        except Exception:
+            # No checkpoint here: the likeliest cause is the non-finite guard, and
+            # saving would write the very weights it refused to train on.
+            self._safe_log(self.log.finish, "crashed")
             raise
 
 

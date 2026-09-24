@@ -1,6 +1,8 @@
+import dataclasses
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from quipu.config import ModelConfig, TrainConfig
@@ -30,10 +32,11 @@ def make_data(tmp_path):
     return tmp_path
 
 
-def build(tmp_path, data_dir, resume=False, ckpt_keep=3):
+def build(tmp_path, data_dir, resume=False, ckpt_keep=3, device="cpu", **train_over):
+    train_cfg = dataclasses.replace(tiny_train(tmp_path, ckpt_keep), **train_over)
     return Trainer(
-        model_cfg=tiny_model(), train_cfg=tiny_train(tmp_path, ckpt_keep),
-        shard_dir=data_dir, device="cpu", run_dir=tmp_path / "runs", run_id="t",
+        model_cfg=tiny_model(), train_cfg=train_cfg,
+        shard_dir=data_dir, device=device, run_dir=tmp_path / "runs", run_id="t",
         resume=resume,
     )
 
@@ -214,3 +217,136 @@ def test_run_completes_and_marks_the_log(tmp_path):
     assert [s["step"] for s in record["steps"]] == list(range(1, 21))
     names = sorted(p.name for p in (tmp_path / "ckpt").glob("step_*.pt"))
     assert names == ["step_000010.pt", "step_000015.pt", "step_000020.pt"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_resume_on_cuda(tmp_path):
+    # torch.load(map_location="cuda") used to move the saved RNG ByteTensors onto
+    # the GPU, and torch.set_rng_state rejects those: every --resume on CUDA crashed.
+    data = make_data(tmp_path)
+    a = build(tmp_path, data, device="cuda")
+    for _ in range(3):
+        a.train_step()
+    a.save_checkpoint()
+
+    b = build(tmp_path, data, resume=True, device="cuda")
+    b.resume_from_latest()
+    assert b.step == 3
+    loss = b.train_step()
+    assert b.step == 4 and np.isfinite(loss)
+    assert next(b.model.parameters()).device.type == "cuda"
+
+
+def test_resume_restores_the_rng_state(tmp_path):
+    data = make_data(tmp_path)
+    a = build(tmp_path, data)
+    for _ in range(3):
+        a.train_step()
+    torch.rand(5)                  # advance the RNG past where a fresh Trainer leaves it
+    a.save_checkpoint()
+    expected = torch.rand(3)
+
+    b = build(tmp_path, data, resume=True)
+    b.resume_from_latest()
+    assert torch.equal(torch.rand(3), expected)
+
+
+def _poison_grads(monkeypatch, trainer, times):
+    """Make the next `times` train_steps see a NaN gradient."""
+    real = torch.nn.utils.clip_grad_norm_
+    left = {"n": times}
+
+    def clip(params, max_norm):
+        params = list(params)
+        if left["n"] > 0:
+            left["n"] -= 1
+            params[0].grad[0].fill_(float("nan"))
+        return real(params, max_norm)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip)
+
+
+def test_a_non_finite_gradient_skips_the_step(tmp_path, monkeypatch, capsys):
+    trainer = build(tmp_path, make_data(tmp_path))
+    trainer.train_step()
+    before = [p.detach().clone() for p in trainer.model.parameters()]
+    adam_steps = [st["step"].item() for st in trainer.opt.state.values()]
+
+    _poison_grads(monkeypatch, trainer, times=1)
+    trainer.train_step()
+
+    assert trainer.step == 1
+    assert trainer.nonfinite_streak == 1
+    for p, q in zip(before, trainer.model.parameters()):
+        assert torch.equal(p, q)
+    assert [st["step"].item() for st in trainer.opt.state.values()] == adam_steps
+    assert "non-finite" in capsys.readouterr().err
+
+    trainer.train_step()           # a clean step resets the streak
+    assert trainer.step == 2 and trainer.nonfinite_streak == 0
+
+
+def test_three_non_finite_steps_stop_the_run_without_checkpointing(tmp_path, monkeypatch):
+    trainer = build(tmp_path, make_data(tmp_path))
+    _poison_grads(monkeypatch, trainer, times=3)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        trainer.run()
+    assert trainer.step == 0
+    ckpt = tmp_path / "ckpt"
+    assert not ckpt.exists() or not list(ckpt.iterdir())
+    assert logged(tmp_path)["status"] == "crashed"
+
+
+def test_progress_is_printed_every_ten_steps(tmp_path, capsys):
+    trainer = build(tmp_path, make_data(tmp_path))
+    for _ in range(9):
+        trainer.train_step()
+    assert "step" not in capsys.readouterr().out
+    trainer.train_step()
+    out = capsys.readouterr().out
+    assert "step 10/20" in out and "tok/s" in out and "grad" in out
+
+
+def test_an_interrupt_mid_step_rewinds_the_stream(tmp_path):
+    trainer = build(tmp_path, make_data(tmp_path), batch_tokens=16 * 2 * 2, total_tokens=16 * 4 * 20)
+    assert trainer.train_cfg.grad_accum == 2
+    trainer.train_step()
+    position = trainer.stream.position
+    real_forward = trainer.model.forward
+    calls = {"n": 0}
+
+    def forward(x):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        return real_forward(x)
+
+    trainer.model.forward = forward
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train_step()
+    assert trainer.stream.position == position
+    assert trainer.step == 1
+
+
+def test_ctrl_c_during_run_checkpoints_and_marks_interrupted(tmp_path, monkeypatch):
+    trainer = build(tmp_path, make_data(tmp_path))
+    real_step = trainer.train_step
+
+    def step():
+        if trainer.step == 7:
+            raise KeyboardInterrupt
+        return real_step()
+
+    monkeypatch.setattr(trainer, "train_step", step)
+    with pytest.raises(KeyboardInterrupt):
+        trainer.run()
+    assert (tmp_path / "ckpt" / "step_000007.pt").exists()
+    assert logged(tmp_path)["status"] == "interrupted"
+
+
+def test_gradients_are_freed_after_the_optimizer_step(tmp_path):
+    # Eval and checkpointing run between steps; holding ~0.46 GiB of gradients
+    # through them leaves too little VRAM headroom on the laptop GPU.
+    trainer = build(tmp_path, make_data(tmp_path))
+    trainer.train_step()
+    assert all(p.grad is None for p in trainer.model.parameters())
