@@ -63,3 +63,84 @@ class SwiGLU(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class Attention(nn.Module):
+    """Grouped-query attention with RoPE and a causal mask."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.n_head = cfg.n_head
+        self.n_kv_head = cfg.n_kv_head
+        self.head_dim = cfg.head_dim
+        self.q = nn.Linear(cfg.d_model, cfg.n_head * cfg.head_dim, bias=False)
+        self.k = nn.Linear(cfg.d_model, cfg.n_kv_head * cfg.head_dim, bias=False)
+        self.v = nn.Linear(cfg.d_model, cfg.n_kv_head * cfg.head_dim, bias=False)
+        self.o = nn.Linear(cfg.n_head * cfg.head_dim, cfg.d_model, bias=False)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        q = self.q(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.v(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        q = apply_rope(q, cos[:, :, :T], sin[:, :, :T])
+        k = apply_rope(k, cos[:, :, :T], sin[:, :, :T])
+
+        # is_causal=True is the mask. enable_gqa lets 12 query heads share 4 KV heads
+        # without materialising the repeat.
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        return self.o(y.transpose(1, 2).contiguous().view(B, T, -1))
+
+
+class Block(nn.Module):
+    """Pre-norm residual block."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.norm1 = RMSNorm(cfg.d_model, cfg.norm_eps)
+        self.attn = Attention(cfg)
+        self.norm2 = RMSNorm(cfg.d_model, cfg.norm_eps)
+        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), cos, sin)
+        return x + self.ffn(self.norm2(x))
+
+
+class Quipu(nn.Module):
+    def __init__(self, cfg: ModelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
+        self.norm = RMSNorm(cfg.d_model, cfg.norm_eps)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight   # tied: saves 38.6M parameters
+
+        cos, sin = build_rope_cache(cfg.context, cfg.head_dim, cfg.rope_base)
+        # Buffers, not parameters: they are derived constants and must not be trained
+        # or saved into the optimiser state.
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
+        self.apply(self._init)
+        # Scale the residual projections by depth, as GPT-2 does, so the residual
+        # stream does not grow with n_layer.
+        for name, p in self.named_parameters():
+            if name.endswith("o.weight") or name.endswith("down.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layer) ** 0.5)
+
+    @staticmethod
+    def _init(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        x = self.embed(idx)
+        cos, sin = self.rope_cos, self.rope_sin
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        return self.lm_head(self.norm(x))
