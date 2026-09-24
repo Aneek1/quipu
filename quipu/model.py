@@ -87,9 +87,17 @@ class Attention(nn.Module):
         q = apply_rope(q, cos[:, :, :T], sin[:, :, :T])
         k = apply_rope(k, cos[:, :, :T], sin[:, :, :T])
 
-        # is_causal=True is the mask. enable_gqa lets 12 query heads share 4 KV heads
-        # without materialising the repeat.
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        # is_causal=True is the mask. enable_gqa=True would materialise the repeat
+        # for free in principle, but on this build (Windows torch 2.11 cu128, sm_120)
+        # there is no flash-attention kernel and the memory-efficient kernel doesn't
+        # accept enable_gqa, so SDPA silently falls back to the MATH kernel: far more
+        # memory and much slower. Expanding K/V ourselves with repeat_interleave (so
+        # query head h reads KV head h // rep, matching GQA grouping) lets SDPA pick
+        # the memory-efficient kernel instead.
+        rep = self.n_head // self.n_kv_head
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(y.transpose(1, 2).contiguous().view(B, T, -1))
 
 
@@ -139,6 +147,9 @@ class Quipu(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        assert idx.shape[1] <= self.cfg.context, (
+            f"sequence length {idx.shape[1]} exceeds context {self.cfg.context}"
+        )
         x = self.embed(idx)
         cos, sin = self.rope_cos, self.rope_sin
         for block in self.blocks:
