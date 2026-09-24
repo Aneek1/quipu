@@ -1,9 +1,12 @@
+import dataclasses
+from pathlib import Path
+
 import pytest
 
 from quipu.config import load_config
 
 
-CONFIG = "configs/quipu-114m.toml"
+CONFIG = Path(__file__).resolve().parents[1] / "configs" / "quipu-114m.toml"
 
 
 def test_loads_the_shipped_config():
@@ -22,10 +25,10 @@ def test_derives_step_count_from_token_budget():
 
 def test_derives_gradient_accumulation():
     cfg = load_config(CONFIG)
-    # 524,288 tokens per step / (micro_batch x context)
-    expected = cfg.train.batch_tokens // (cfg.train.micro_batch * cfg.model.context)
-    assert cfg.train.grad_accum == expected
-    assert cfg.train.grad_accum >= 1
+    assert cfg.train.grad_accum == 64
+    cfg2 = load_config(CONFIG, overrides={"train": {"micro_batch": 16}})
+    assert cfg2.train.grad_accum == 32
+    assert cfg.train.context == cfg.model.context
 
 
 def test_rejects_a_batch_that_does_not_divide_evenly():
@@ -35,7 +38,66 @@ def test_rejects_a_batch_that_does_not_divide_evenly():
         load_config(CONFIG, overrides={"train": {"batch_tokens": 524_289}})
 
 
-def test_config_is_frozen():
+@pytest.mark.parametrize(
+    "get_target, attr",
+    [
+        (lambda cfg: cfg.model, "d_model"),
+        (lambda cfg: cfg.data, "dataset"),
+        (lambda cfg: cfg.train, "lr"),
+        (lambda cfg: cfg, "name"),
+    ],
+)
+def test_config_is_frozen(get_target, attr):
     cfg = load_config(CONFIG)
-    with pytest.raises(Exception):
-        cfg.model.d_model = 1024
+    target = get_target(cfg)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(target, attr, "mutated")
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"model": {"n_head": 10}}, "d_model"),
+        ({"model": {"n_kv_head": 5}}, "n_kv_head"),
+        ({"model": {"d_model": 780, "n_head": 12}}, "head_dim"),
+    ],
+)
+def test_model_guards(overrides, match):
+    # Each override should only disturb the field it names, and the resulting
+    # error must name the guard it actually trips (not a different guard tripped
+    # first by the same override).
+    with pytest.raises(ValueError, match=match):
+        load_config(CONFIG, overrides=overrides)
+
+
+def test_train_context_belongs_to_model():
+    with pytest.raises(ValueError, match="context"):
+        load_config(CONFIG, overrides={"train": {"context": 2048}})
+
+
+def test_rejects_unknown_top_level_key():
+    with pytest.raises(ValueError, match="trian"):
+        load_config(CONFIG, overrides={"trian": {}})
+
+
+def test_rejects_a_non_int_value_for_an_int_field():
+    with pytest.raises(ValueError, match="micro_batch"):
+        load_config(CONFIG, overrides={"train": {"micro_batch": 8.0}})
+
+
+def test_rejects_zero_micro_batch_without_a_zero_division_error():
+    # micro_batch feeds a modulo below (batch_tokens % (micro_batch * context)); the
+    # positivity check must run before that division, not surface it as a crash.
+    with pytest.raises(ValueError, match="micro_batch"):
+        load_config(CONFIG, overrides={"train": {"micro_batch": 0}})
+
+
+def test_rejects_a_run_with_zero_steps():
+    # A run this short exits at step 0 and "succeeds" having trained nothing.
+    with pytest.raises(ValueError, match="steps"):
+        load_config(CONFIG, overrides={"train": {"total_tokens": 100}})
+
+
+def test_rejects_warmup_longer_than_the_run():
+    with pytest.raises(ValueError, match="warmup"):
+        load_config(CONFIG, overrides={"train": {"warmup_steps": 10_000}})
