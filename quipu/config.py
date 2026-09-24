@@ -2,7 +2,7 @@
 so no two call sites can disagree about how many steps there are.
 
 steps floors total_tokens / batch_tokens, so up to batch_tokens-1 tokens are unused
-(194,816 for the shipped config)."""
+(12,032 for the shipped config)."""
 from __future__ import annotations
 
 import dataclasses

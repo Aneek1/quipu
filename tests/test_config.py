@@ -19,8 +19,8 @@ def test_loads_the_shipped_config():
 
 def test_derives_step_count_from_token_budget():
     cfg = load_config(CONFIG)
-    # 2,500,000,000 / 524,288 = 4768 (floor)
-    assert cfg.train.steps == 4768
+    # 1,500,000,000 / 524,288 = 2861 (floor)
+    assert cfg.train.steps == 2861
 
 
 def test_derives_gradient_accumulation():
