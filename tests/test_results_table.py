@@ -231,6 +231,54 @@ def test_run_id_with_pipe_character_does_not_break_the_row(tmp_path):
     assert data_line.count("| ") == header_cols
 
 
+def test_null_run_id_next_to_a_normal_run_does_not_crash_the_table(tmp_path):
+    write_run(tmp_path, "normal", 3.9, 4.0)
+    record = {
+        "run_id": None,
+        "status": "running",
+        "config": {},
+        "steps": [{"step": 1, "train_loss": 5.0, "lr": 1e-4, "tokens": 1}],
+        "evals": [],
+    }
+    (tmp_path / "null-run-id.json").write_text(json.dumps(record), encoding="utf-8")
+
+    table = build_table(tmp_path)
+
+    assert "normal" in table and "3.9000" in table
+    assert "5.0000" in table
+
+
+def test_list_run_id_next_to_a_normal_run_does_not_crash_the_table(tmp_path):
+    write_run(tmp_path, "normal", 3.9, 4.0)
+    record = {
+        "run_id": ["not", "a", "string"],
+        "status": "running",
+        "config": {},
+        "steps": [{"step": 1, "train_loss": 5.0, "lr": 1e-4, "tokens": 1}],
+        "evals": [],
+    }
+    (tmp_path / "list-run-id.json").write_text(json.dumps(record), encoding="utf-8")
+
+    table = build_table(tmp_path)
+
+    assert "normal" in table and "3.9000" in table
+    assert "5.0000" in table
+
+
+def test_malformed_record_with_null_run_id_is_labelled_with_the_file_stem(tmp_path):
+    record = {"run_id": None, "status": "running", "config": {}, "steps": "notalist", "evals": []}
+    (tmp_path / "malformed-null-run-id.json").write_text(json.dumps(record), encoding="utf-8")
+
+    table = build_table(tmp_path)
+
+    lines = [l for l in table.splitlines() if l.startswith("| malformed-null-run-id")]
+    assert lines
+    cells = [c.strip() for c in lines[0].strip("|").split("|")]
+    assert cells[0] == "malformed-null-run-id"
+    assert cells[1] == "malformed"
+    assert all(c == "-" for c in cells[2:])
+
+
 def test_main_with_out_writes_utf8_file_without_bom(tmp_path):
     write_run(tmp_path, "run-a", 3.9, 4.0)
     out_file = tmp_path / "RESULTS.md"

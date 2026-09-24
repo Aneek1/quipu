@@ -80,17 +80,18 @@ def build_table(run_dir: str | Path) -> str:
             # A record that parsed as JSON but isn't shaped like a run log
             # (wrong types, missing fields) must not take down the whole
             # table either -- flag it distinctly from an unreadable file.
-            fallback_id = path.stem
-            try:
-                fallback_id = record.get("run_id", path.stem)
-            except AttributeError:
-                pass
-            rows.append((fallback_id, _blank_row(fallback_id, "malformed")))
+            # Label and sort by the filename, not the record's own run_id:
+            # a malformed record's run_id is untrusted too (it could be
+            # missing, null, or non-string), while path.stem is always a
+            # unique, valid string.
+            rows.append((path.stem, _blank_row(path.stem, "malformed")))
             continue
 
         rows.append((run_id, row))
 
-    rows.sort(key=lambda r: r[0])
+    # Two files can legitimately claim the same run_id; that renders as two
+    # rows with the same label rather than being deduplicated.
+    rows.sort(key=lambda r: str(r[0]))
     header = (
         "| Run | Status | Steps | Final train loss | Final val loss | Tokens | Resumes | Skipped | Wraps |\n"
         "|---|---|---:|---:|---:|---:|---:|---:|---:|"
