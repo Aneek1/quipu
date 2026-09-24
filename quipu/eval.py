@@ -9,21 +9,28 @@ from quipu.model import Quipu
 
 
 @torch.no_grad()
-def estimate_loss(model: Quipu, stream: TokenStream, batches: int, device: str) -> float:
+def estimate_loss(
+    model: Quipu, stream: TokenStream, batches: int, device: str, amp: bool = True
+) -> float:
     """Mean cross-entropy over `batches` batches, leaving the stream where it was.
 
     Evaluation must not consume training tokens, so the position is saved and
     restored rather than shared.
+
+    Training runs under bf16 autocast; eval defaults to the same numerics so the
+    train and val curves are comparable, and because fp32 eval is markedly slower.
+    CPU stays fp32 regardless of `amp`, since autocast("cuda", ...) is a no-op there.
     """
     was_training = model.training
     saved = stream.state_dict()
     model.eval()
     total = 0.0
-    for _ in range(batches):
-        x, y = stream.next_batch()
-        x, y = x.to(device), y.to(device)
-        logits = model(x)
-        total += F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1)).item()
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and str(device).startswith("cuda")):
+        for _ in range(batches):
+            x, y = stream.next_batch()
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            total += F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1)).item()
     stream.load_state_dict(saved)
     if was_training:
         model.train()
@@ -40,6 +47,7 @@ def generate(
     top_k: int | None = 50,
 ) -> torch.Tensor:
     """Sample continuations. Used only for eyeballing coherence, never for a metric."""
+    was_training = model.training
     model.eval()
     idx = idx.to(device)
     for _ in range(max_new_tokens):
@@ -52,4 +60,6 @@ def generate(
             logits = logits.masked_fill(logits < kth, float("-inf"))
         probs = F.softmax(logits, dim=-1)
         idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
+    if was_training:
+        model.train()
     return idx

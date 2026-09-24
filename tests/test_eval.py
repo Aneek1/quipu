@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from quipu.config import ModelConfig
@@ -54,6 +55,43 @@ def test_estimate_loss_does_not_move_the_stream_wraps(tmp_path):
     estimate_loss(Quipu(tiny()), stream, batches=3, device="cpu")
     assert stream.position == 0
     assert stream.wraps == 5, "estimate_loss must restore the wrap count too"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_estimate_loss_runs_the_forward_in_bf16_under_amp_on_cuda(tmp_path):
+    # Training runs under bf16 autocast; eval must match, or the train and val
+    # curves are computed under different numerics.
+    write_shard(tmp_path / "shard_000.bin", np.random.randint(0, 128, 4096).astype(np.uint16))
+    stream = TokenStream(tmp_path, micro_batch=2, context=16)
+    model = Quipu(tiny()).to("cuda")
+    original_forward = model.forward
+    dtypes: list[torch.dtype] = []
+
+    def recording_forward(idx):
+        logits = original_forward(idx)
+        dtypes.append(logits.dtype)
+        return logits
+
+    model.forward = recording_forward
+
+    estimate_loss(model, stream, batches=2, device="cuda")
+    assert dtypes and all(dt == torch.bfloat16 for dt in dtypes), (
+        "estimate_loss must run the forward under bf16 autocast when amp=True on CUDA"
+    )
+
+    dtypes.clear()
+    estimate_loss(model, stream, batches=2, device="cuda", amp=False)
+    assert dtypes and all(dt == torch.float32 for dt in dtypes), (
+        "estimate_loss must stay fp32 when amp=False"
+    )
+
+
+def test_generate_restores_training_mode():
+    model = Quipu(tiny())
+    model.train()
+    prompt = torch.randint(0, 128, (1, 4))
+    generate(model, prompt, max_new_tokens=3, device="cpu")
+    assert model.training, "generate must restore training mode"
 
 
 def test_generate_returns_the_requested_number_of_new_tokens():
