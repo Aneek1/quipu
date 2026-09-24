@@ -71,12 +71,12 @@ def test_write_does_not_leave_a_partial_shard_on_failure(tmp_path, monkeypatch):
     # A kill (or any exception) mid-write must not leave a truncated file at the
     # final path, since the loader's shard_*.bin glob can't tell it apart from a
     # complete one. Simulate a crash between the tmp write and the atomic swap.
-    import quipu.data as data_module
+    import quipu.fsio as fsio_module
 
     def boom(*args, **kwargs):
         raise OSError("simulated crash mid-write")
 
-    monkeypatch.setattr(data_module.os, "replace", boom)
+    monkeypatch.setattr(fsio_module.os, "replace", boom)
     path = tmp_path / "shard_000.bin"
     with pytest.raises(OSError):
         write_shard(path, np.array([1, 2, 3], dtype=np.uint16))

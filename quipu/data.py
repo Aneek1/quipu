@@ -6,12 +6,12 @@ The vocabulary is 50257, so uint16 is exact; tokenizer.py asserts that.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 
+from quipu.fsio import replace_with_retry
 from quipu.tokenizer import Tokenizer
 
 
@@ -32,7 +32,7 @@ def write_shard(path: str | Path, tokens: np.ndarray) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    os.replace(tmp, path)
+    replace_with_retry(tmp, path)
 
 
 def read_shard(path: str | Path) -> np.ndarray:
