@@ -195,3 +195,25 @@ cannot fail is not evidence.
 | 5 | The claim: repo-knowledge benchmark vs 3.5B–10B models | ~2 weeks |
 
 Each gets its own spec, plan and build.
+
+### Noted option for sub-project 3: scoring instead of generation
+
+Emitting a tool call from nothing — name, valid JSON, argument values — is categorically harder
+for a small model than choosing among candidates that are already enumerated. Reformulating the
+agentic layer as **scoring a candidate set** rather than generating free-form text is therefore a
+live design option, not a fallback.
+
+Two pieces of evidence point at it:
+
+- **Muose-50M-Decision** (2026) reached 79.94% across all 77 BANKING77 intents from a 50M model
+  pretrained on 500M tokens on an RTX 3070 — by scoring enumerated options rather than generating.
+  For calibration, a fine-tuned BERT-base baseline on the same benchmark is 93.66%
+  (Casanueva et al.), so this is well short of an off-the-shelf encoder; the relevant point is
+  that the *task reformulation* is what made a 50M model viable at all.
+- **Aura's own measurements** already lean the same way: schema-mode constrained decoding lowered
+  model-level false actions relative to free decoding, at a latency cost recorded in
+  `auroraos/tests/results/`.
+
+The cost is that the candidate set has to come from somewhere — retrieval, a registry, or a
+generate-then-rerank pass — which is a design problem in its own right. Decided in sub-project 3,
+on measurements, not now.
