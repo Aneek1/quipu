@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from quipu.data import write_shard
@@ -60,6 +61,46 @@ def test_crosses_a_shard_boundary_without_a_gap(tmp_path):
     stream.load_state_dict({"position": 998})
     x, _ = stream.next_batch()
     assert x[0].tolist() == [998, 999, 1000, 1001]
+
+
+def test_wraps_increments_exactly_once_when_a_batch_runs_past_the_end(tmp_path):
+    # 64 tokens, need = micro_batch*context + 1 = 17 per batch, position steps by 16.
+    # 0 -> 16 -> 32 -> 48 -> (48+17=65 > 64) wrap to 0 -> 16.
+    stream = TokenStream(make_shards(tmp_path, n_shards=1, per_shard=64),
+                         micro_batch=2, context=8)
+    for _ in range(3):
+        stream.next_batch()
+        assert stream.wraps == 0
+    stream.next_batch()
+    assert stream.wraps == 1
+    stream.next_batch()
+    assert stream.wraps == 1
+
+
+def test_wraps_round_trips_through_state_dict(tmp_path):
+    a = TokenStream(make_shards(tmp_path, n_shards=1, per_shard=64),
+                    micro_batch=2, context=8)
+    for _ in range(4):
+        a.next_batch()
+    assert a.wraps == 1
+    state = a.state_dict()
+    assert state["wraps"] == 1
+
+    b = TokenStream(tmp_path, micro_batch=2, context=8)
+    b.load_state_dict(state)
+    assert b.wraps == 1
+
+
+def test_load_state_dict_rejects_position_at_or_past_the_end(tmp_path):
+    stream = TokenStream(make_shards(tmp_path), micro_batch=2, context=8)
+    with pytest.raises(ValueError):
+        stream.load_state_dict({"position": len(stream)})
+
+
+def test_load_state_dict_rejects_negative_position(tmp_path):
+    stream = TokenStream(make_shards(tmp_path), micro_batch=2, context=8)
+    with pytest.raises(ValueError):
+        stream.load_state_dict({"position": -1})
 
 
 def test_ignores_leftover_tmp_files_from_atomic_writes(tmp_path):

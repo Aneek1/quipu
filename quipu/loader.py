@@ -28,6 +28,11 @@ class TokenStream:
         # a memmap and nothing else changes.
         self.tokens = np.concatenate([read_shard(p) for p in paths])
         self.position = 0
+        # Wrapping means the stream is about to re-serve tokens the model has
+        # already seen. That is fine at small scale but must not happen
+        # silently, so the trainer can log it instead of the loss curve just
+        # looking a little too good.
+        self.wraps = 0
 
     def __len__(self) -> int:
         return len(self.tokens)
@@ -36,6 +41,7 @@ class TokenStream:
         need = self.micro_batch * self.context + 1   # +1 for the shifted target
         if self.position + need > len(self.tokens):
             self.position = 0
+            self.wraps += 1
         chunk = self.tokens[self.position : self.position + need].astype(np.int64)
         x = torch.from_numpy(chunk[:-1]).view(self.micro_batch, self.context)
         y = torch.from_numpy(chunk[1:]).view(self.micro_batch, self.context)
@@ -43,7 +49,14 @@ class TokenStream:
         return x, y
 
     def state_dict(self) -> dict[str, int]:
-        return {"position": self.position}
+        return {"position": self.position, "wraps": self.wraps}
 
     def load_state_dict(self, state: dict[str, int]) -> None:
-        self.position = int(state["position"])
+        position = state["position"]
+        if not isinstance(position, int) or isinstance(position, bool) or not (0 <= position < len(self.tokens)):
+            raise ValueError(
+                f"corrupted checkpoint: position {position!r} out of range "
+                f"[0, {len(self.tokens)})"
+            )
+        self.position = position
+        self.wraps = int(state.get("wraps", 0))
