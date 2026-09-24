@@ -43,11 +43,13 @@ def build_rope_cache(
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Rotate (B, H, T, D) by position. Splits the head in halves, GPT-NeoX style."""
-    x1, x2 = x.chunk(2, dim=-1)
-    cos = cos[..., : x1.shape[-1]].to(x.dtype)
-    sin = sin[..., : x1.shape[-1]].to(x.dtype)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    """Rotate (B, H, T, D) by position. Splits the head in halves, GPT-NeoX style.
+    Computed in at least fp32 and cast back, so bf16 q/k are rotated with full-precision angles."""
+    assert cos.shape[-1] == x.shape[-1] // 2, "RoPE cache width must be head_dim // 2"
+    compute = torch.promote_types(x.dtype, torch.float32)
+    x1, x2 = x.to(compute).chunk(2, dim=-1)
+    cos, sin = cos.to(compute), sin.to(compute)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(x.dtype)
 
 
 class SwiGLU(nn.Module):
