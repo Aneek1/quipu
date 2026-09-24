@@ -85,16 +85,20 @@ def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _validate_int_fields(instance: Any) -> None:
+def _validate_int_fields(instance: Any, allow_zero: frozenset[str] = frozenset()) -> None:
     """Every int-annotated field must actually be an int (not bool, not float) and
-    strictly positive, so a typo or a 0 doesn't silently reach a division below."""
+    strictly positive, so a typo or a 0 doesn't silently reach a division below.
+    Fields named in allow_zero may additionally be 0 (e.g. seed)."""
     for f in dataclasses.fields(instance):
-        if f.type != "int":
+        # f.type is the raw annotation; it's the string "int" under `from __future__
+        # import annotations` and the type int otherwise, so cover both.
+        if f.type not in (int, "int"):
             continue
         value = getattr(instance, f.name)
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{f.name} must be an int, got {value!r}")
-        if value <= 0:
+        minimum = 0 if f.name in allow_zero else 1
+        if value < minimum:
             raise ValueError(f"{f.name} must be positive, got {value!r}")
 
 
@@ -116,10 +120,12 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
 
     # Type/positivity checks must run before any division below (e.g. grad_accum's
     # micro_batch * context), so a bad value raises a clear ValueError instead of a
-    # ZeroDivisionError or a silently-wrong result.
+    # ZeroDivisionError or a silently-wrong result. seed may be 0; everything else in
+    # TrainConfig, including warmup_steps (Task 10's lr_at divides by it), must stay
+    # strictly positive.
     _validate_int_fields(model)
     _validate_int_fields(data)
-    _validate_int_fields(train)
+    _validate_int_fields(train, allow_zero=frozenset({"seed"}))
 
     if model.d_model % model.n_head != 0:
         raise ValueError("d_model must divide evenly by n_head")

@@ -101,3 +101,32 @@ def test_rejects_a_run_with_zero_steps():
 def test_rejects_warmup_longer_than_the_run():
     with pytest.raises(ValueError, match="warmup"):
         load_config(CONFIG, overrides={"train": {"warmup_steps": 10_000}})
+
+
+def test_rejects_non_positive_lr():
+    # match is anchored to "lr must be positive" (not just "lr") so this test can't
+    # be satisfied by the lr_min guard firing instead of the lr guard.
+    with pytest.raises(ValueError, match=r"^lr must be positive"):
+        load_config(CONFIG, overrides={"train": {"lr": 0.0}})
+
+
+def test_rejects_lr_min_above_lr():
+    with pytest.raises(ValueError, match="lr_min"):
+        load_config(CONFIG, overrides={"train": {"lr_min": 1e-3}})
+
+
+def test_rejects_negative_lr_min():
+    with pytest.raises(ValueError, match="lr_min"):
+        load_config(CONFIG, overrides={"train": {"lr_min": -1e-5}})
+
+
+def test_rejects_a_bool_for_an_int_field():
+    # bool is an int subclass; without an explicit check, True would silently
+    # become micro_batch=1.
+    with pytest.raises(ValueError, match="micro_batch"):
+        load_config(CONFIG, overrides={"train": {"micro_batch": True}})
+
+
+def test_seed_zero_is_a_legitimate_seed():
+    cfg = load_config(CONFIG, overrides={"train": {"seed": 0}})
+    assert cfg.train.seed == 0
