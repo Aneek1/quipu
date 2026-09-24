@@ -350,3 +350,37 @@ def test_gradients_are_freed_after_the_optimizer_step(tmp_path):
     trainer = build(tmp_path, make_data(tmp_path))
     trainer.train_step()
     assert all(p.grad is None for p in trainer.model.parameters())
+
+
+def test_skipped_steps_are_recorded_in_the_log_and_survive_resume(tmp_path, monkeypatch):
+    data = make_data(tmp_path)
+    a = build(tmp_path, data)
+    _poison_grads(monkeypatch, a, times=1)
+    a.train_step()                 # skipped
+    a.train_step()                 # clean
+    assert a.skipped_steps == 1
+    assert logged(tmp_path)["steps"][-1]["skipped"] == 1
+    a.save_checkpoint()
+
+    b = build(tmp_path, data, resume=True)
+    b.resume_from_latest()
+    assert b.skipped_steps == 1
+    b.train_step()
+    record = logged(tmp_path)["steps"][-1]
+    assert record["step"] == 2 and record["skipped"] == 1
+
+
+def test_an_interrupt_inside_the_optimizer_step_does_not_rewind(tmp_path, monkeypatch):
+    # Once opt.step() has started, the weights may already be updated from these
+    # batches; rewinding would train on them twice.
+    trainer = build(tmp_path, make_data(tmp_path))
+    trainer.train_step()
+    position = trainer.stream.position
+
+    def interrupted_step(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(trainer.opt, "step", interrupted_step)
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train_step()
+    assert trainer.stream.position == position + 16 * 2

@@ -63,6 +63,7 @@ class Trainer:
         self.step = 0
         self.log_failures = 0
         self.nonfinite_streak = 0
+        self.skipped_steps = 0      # cumulative non-finite skips, checkpointed
         self.ckpt_dir = Path(train_cfg.ckpt_dir)
 
         self.model = Quipu(model_cfg).to(device)
@@ -133,6 +134,7 @@ class Trainer:
         # batches read so far had their gradients thrown away; rewind so the
         # interrupt checkpoint does not skip them.
         start = self.stream.state_dict()
+        stepped = False
         try:
             self.model.train()
             self.opt.zero_grad(set_to_none=True)
@@ -156,6 +158,7 @@ class Trainer:
                 # prune the clean ones). Skip it: step and lr stay where they are.
                 self.opt.zero_grad(set_to_none=True)
                 self.nonfinite_streak += 1
+                self.skipped_steps += 1
                 print(
                     f"warning: non-finite loss/grad at step {self.step} "
                     f"(loss {total}, grad norm {float(grad_norm)}); step skipped "
@@ -170,9 +173,13 @@ class Trainer:
                     )
                 return total
             self.nonfinite_streak = 0
+            stepped = True
             self.opt.step()
         except BaseException:
-            self.stream.load_state_dict(start)
+            # Once opt.step() has started the weights may already reflect these
+            # batches, so rewinding would train on them twice; only rewind before.
+            if not stepped:
+                self.stream.load_state_dict(start)
             raise
         # Free the gradients now rather than at the next step: eval and checkpointing
         # run in between, and VRAM headroom at micro_batch 4 is ~480 MiB.
@@ -184,6 +191,7 @@ class Trainer:
             step=self.step, train_loss=total, lr=lr,
             tokens=self.step * cfg.batch_tokens,
             wraps=self.stream.wraps, grad_norm=float(grad_norm),
+            skipped=self.skipped_steps,
         )
         if self.step % PRINT_EVERY == 0:
             if self.device.startswith("cuda"):
@@ -209,6 +217,7 @@ class Trainer:
                 "model": self.model.state_dict(),
                 "optimizer": self.opt.state_dict(),
                 "stream": self.stream.state_dict(),
+                "skipped_steps": self.skipped_steps,
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             },
@@ -249,6 +258,7 @@ class Trainer:
         self.model.load_state_dict(state["model"])
         self.opt.load_state_dict(state["optimizer"])
         self.stream.load_state_dict(state["stream"])
+        self.skipped_steps = int(state.get("skipped_steps", 0))   # absent before it existed
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
