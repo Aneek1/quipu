@@ -88,15 +88,38 @@ def test_attention_runs_on_a_fused_kernel():
     cos, sin = build_rope_cache(cfg.context, cfg.head_dim, device="cuda")
     x = torch.randn(8, cfg.context, cfg.d_model, device="cuda")
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    # Measure a DELTA, not an absolute peak: max_memory_allocated counts every live
+    # CUDA tensor in the process, so an unrelated allocation elsewhere (e.g. a later
+    # GPU test in the same session) would inflate the absolute number and falsely
+    # fail this one.
+    base = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     with torch.autocast("cuda", dtype=torch.bfloat16):
         y = attn(x, cos, sin)
     y.float().sum().backward()
     torch.cuda.synchronize()
-    peak_mib = torch.cuda.max_memory_allocated() / 1024 / 1024
-    # MATH-kernel fallback measures ~1.7 GiB here; the fused kernel ~0.23 GiB.
+    peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
+    # MATH-kernel fallback measures ~1709 MiB here; the fused kernel ~221 MiB.
     assert peak_mib < 500, f"peak {peak_mib:.0f} MiB: attention is not on a fused kernel"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_attention_runs_under_efficient_attention_only():
+    """Deterministic companion to the memory-delta guard above: restrict SDPA to
+    EFFICIENT_ATTENTION only (no cuDNN, no math) and run a real forward+backward.
+    enable_gqa=True raises "No available kernel" here, because the
+    memory-efficient kernel rejects mismatched query/KV head counts outright;
+    the repeat_interleave fix passes because K/V are pre-expanded to match."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    cfg = load_config(CONFIG_PATH).model  # the real 114M shape
+    attn = Attention(cfg).cuda()
+    cos, sin = build_rope_cache(cfg.context, cfg.head_dim, device="cuda")
+    x = torch.randn(2, cfg.context, cfg.d_model, device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16), \
+         sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+        y = attn(x, cos, sin)
+    y.float().sum().backward()
 
 
 def test_grouped_query_attention_matches_explicit_per_head_grouping():
