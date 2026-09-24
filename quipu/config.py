@@ -55,6 +55,7 @@ class TrainConfig:
     seed: int
     ckpt_dir: str
     ckpt_every: int
+    ckpt_keep: int
     eval_every: int
     eval_batches: int
 

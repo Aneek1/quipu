@@ -130,3 +130,10 @@ def test_rejects_a_bool_for_an_int_field():
 def test_seed_zero_is_a_legitimate_seed():
     cfg = load_config(CONFIG, overrides={"train": {"seed": 0}})
     assert cfg.train.seed == 0
+
+
+def test_ckpt_keep_is_loaded_and_must_be_positive():
+    # ckpt_keep=0 would let retention delete every checkpoint it just wrote.
+    assert load_config(CONFIG).train.ckpt_keep == 3
+    with pytest.raises(ValueError, match="ckpt_keep"):
+        load_config(CONFIG, overrides={"train": {"ckpt_keep": 0}})

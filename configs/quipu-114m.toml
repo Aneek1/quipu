@@ -32,5 +32,6 @@ grad_clip     = 1.0
 seed          = 1337
 ckpt_dir      = "checkpoints"
 ckpt_every    = 100
+ckpt_keep     = 3             # ~1.4 GB each (fp32 weights + AdamW moments)
 eval_every    = 100
 eval_batches  = 20
