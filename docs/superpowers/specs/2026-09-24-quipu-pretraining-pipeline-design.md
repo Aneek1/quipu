@@ -65,19 +65,26 @@ Decoder-only transformer, modern recipe throughout: **RMSNorm** (pre-norm), **Sw
 | KV heads (GQA) | 4 |
 | FFN hidden | 2,048 (SwiGLU, 3 matrices) |
 | context | 1,024 |
-| parameters | ~114M with tied embeddings |
+| parameters | 114,114,048 with tied embeddings |
 
 Parameter arithmetic, so the test can assert it rather than trust it:
 
 ```
-embedding      50257 x 768                        = 38.6M
-per layer      attn  768x768x2 + 768x256x2        =  1.57M
-               ffn   768x2048x3                   =  4.72M
-                                                    -------
-                                                     6.29M
-12 layers                                          = 75.5M
-total (tied lm_head)                               ~114.1M
+embedding      50257 x 768                          = 38,597,376
+per layer      attn   768x768x2 + 768x256x2         =  1,572,864
+               ffn    768x2048x3                    =  4,718,592
+               norms  768x2 (pre-attn, pre-ffn)     =      1,536
+                                                      ----------
+                                                       6,292,992
+12 layers                                            = 75,515,904
+final norm                                           =        768
+                                                      ----------
+total (tied lm_head)                                  114,114,048
 ```
+
+The RMSNorm weights are 19,200 of that. They are small enough to round away in prose and
+large enough to fail an exact-equality test, so the figure above is the one `test_model_shapes.py`
+asserts.
 
 ## 5. Data
 
