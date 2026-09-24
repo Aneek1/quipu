@@ -106,11 +106,11 @@ alternative (padding to document length) wastes a large fraction of the budget.
 | precision | bf16 autocast, fp32 master weights |
 | optimiser | AdamW, betas (0.9, 0.95), weight decay 0.1 |
 | peak LR | 6e-4, cosine decay to 6e-5 |
-| warmup | 700 steps |
+| warmup | 200 steps (4.2% of the run) |
 | grad clip | 1.0 |
 | total batch | ~0.5M tokens per step |
 | micro-batch | tuned to fit 8 GB; gradient accumulation makes up the rest |
-| steps | ~5,000 (2.5B tokens / 0.5M) |
+| steps | 4,768 (2,500,000,000 / 524,288) |
 | estimated wall clock | 19–24 hours |
 
 The wall-clock estimate comes from 6 × params × tokens FLOPs at an assumed ~20 TFLOPS effective.
