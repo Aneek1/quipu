@@ -105,3 +105,12 @@ Loss on the FineWeb val and on the code val for every milestone snapshot, so the
 ## 8. Not in scope
 
 Approach B (learned kNN memory), long-document perplexity, iterative "explore while generating" retrieval, instruction tuning, a code tokenizer, 350M.
+
+### Roadmap requirement recorded 2026-09-25: MCP / full-stack app building
+
+The owner requires Quipu to build full-stack apps through MCP plugins inside OpenCode. That has two parts, neither of which belongs in pretraining:
+
+1. **Serving (engineering, next week):** an OpenAI-compatible chat-completions endpoint with tool calling, so OpenCode — already an MCP client — can offer Quipu every configured MCP server's tools. No training dependency.
+2. **Skill (sub-project 3):** agentic fine-tuning on tool-call traces so the model emits valid tool calls step after step; the "score enumerated candidates instead of generating" option (see the pipeline spec) is the leading approach for a small model.
+
+Expectation stated plainly: short tool-driven tasks after sub-project 3; end-to-end full-stack app generation is the long-term target that needs 350M, the retrieval map (repo, framework docs, API signatures) and agentic fine-tuning together. It is not claimed for the 114M model.
