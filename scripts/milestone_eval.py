@@ -279,6 +279,13 @@ def run(cfg: Config, device: str, eval_batches: int, out_dir: Path) -> bool:
 
     for label, step, path, preloaded_state in checkpoints:
         t0 = time.perf_counter()
+        # Buffered locally and merged into `samples`/`metrics` only once this
+        # checkpoint's whole body has succeeded: if sample_for_prompt (or anything
+        # else here) raises partway through the prompt loop, the prompts already
+        # sampled for this checkpoint must not survive into samples.md while
+        # metrics.json marks the checkpoint as failed and the "No samples were
+        # generated" banner is shown for it — that would be self-contradictory.
+        checkpoint_samples: dict[str, tuple[str, str]] = {}
         try:
             model = (
                 load_final_model(cfg, path, device, state=preloaded_state)
@@ -289,12 +296,14 @@ def run(cfg: Config, device: str, eval_batches: int, out_dir: Path) -> bool:
             text_loss, code_loss, note = evaluate_losses(model, cfg, device, eval_batches)
 
             for prompt in ALL_PROMPTS:
-                greedy_text, sampled_text = sample_for_prompt(model, tok, prompt, device)
-                samples[prompt].append((label, step, greedy_text, sampled_text))
+                checkpoint_samples[prompt] = sample_for_prompt(model, tok, prompt, device)
 
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            for prompt, (greedy_text, sampled_text) in checkpoint_samples.items():
+                samples[prompt].append((label, step, greedy_text, sampled_text))
 
             elapsed = time.perf_counter() - t0
             record = {

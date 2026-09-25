@@ -41,7 +41,8 @@ def tiny_data_cfg(shard_dir: Path) -> DataConfig:
     return DataConfig(
         dataset="x", subset="x", shard_dir=str(shard_dir), shard_tokens=1000, val_tokens=1000,
         code_dataset="x", code_share=0.1, code_languages=("Python",), code_licenses=("mit",),
-        html_cap=0.1, code_val_tokens=1000, code_heldout_first_file=1, code_files_total=2,
+        html_cap=0.1, code_max_doc_tokens=100_000,
+        code_val_tokens=1000, code_heldout_first_file=1, code_files_total=2,
     )
 
 
@@ -289,3 +290,49 @@ def test_a_corrupt_milestone_does_not_lose_the_other_checkpoints_results(tmp_pat
         # The good checkpoints still produced samples for every prompt.
         assert "step_000010" in samples[section_start:]
         assert "step_000030" in samples[section_start:]
+
+
+def test_a_failure_partway_through_sampling_leaves_no_partial_samples(tmp_path, monkeypatch):
+    """sample_for_prompt raising on its 3rd call, mid-checkpoint, must not leave
+    the prompts already sampled for that checkpoint in samples.md: the checkpoint
+    is either complete (in both metrics.json and samples.md) or entirely absent
+    from samples.md, never a contradictory mix."""
+    cfg = build_cfg(tmp_path)
+    _write_val_shards(cfg)
+    _save_milestone(cfg, 10, _fresh_model(cfg, 1))   # processed first, must stay good
+    _save_milestone(cfg, 20, _fresh_model(cfg, 2))   # fails on its 3rd prompt
+
+    real_sample_for_prompt = milestone_eval.sample_for_prompt
+    calls = {"n": 0}
+
+    def flaky(model, tok, prompt, device):
+        calls["n"] += 1
+        # Checkpoint 10 has len(ALL_PROMPTS) calls first; this is the 3rd call
+        # within checkpoint 20's own prompt loop.
+        if calls["n"] == len(milestone_eval.ALL_PROMPTS) + 3:
+            raise RuntimeError("boom: sample_for_prompt failed mid-checkpoint")
+        return real_sample_for_prompt(model, tok, prompt, device)
+
+    monkeypatch.setattr(milestone_eval, "sample_for_prompt", flaky)
+
+    out_dir = tmp_path / "out"
+    ok = milestone_eval.run(cfg, device="cpu", eval_batches=2, out_dir=out_dir)
+    assert ok is False
+
+    import json
+    metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))["checkpoints"]
+    by_step = {m["step"]: m for m in metrics}
+    assert "error" not in by_step[10] and isinstance(by_step[10]["text_val_loss"], float)
+    assert "error" in by_step[20] and "text_val_loss" not in by_step[20]
+
+    samples = (out_dir / "samples.md").read_text(encoding="utf-8")
+    prompt_positions = sorted(samples.index(f"`{p}`") for p in milestone_eval.ALL_PROMPTS)
+    for prompt in milestone_eval.ALL_PROMPTS:
+        start = samples.index(f"`{prompt}`")
+        end = min((p for p in prompt_positions if p > start), default=len(samples))
+        section = samples[start:end]
+        assert "step_000010" in section, f"good checkpoint missing from {prompt!r}"
+        assert "step_000020" not in section, (
+            f"failed checkpoint must have zero sample entries for {prompt!r}, "
+            "not a partial set from before it raised"
+        )
