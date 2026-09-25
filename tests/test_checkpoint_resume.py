@@ -219,7 +219,7 @@ def test_run_completes_and_marks_the_log(tmp_path):
     assert names == ["step_000010.pt", "step_000015.pt", "step_000020.pt"]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.cuda
 def test_resume_on_cuda(tmp_path):
     # torch.load(map_location="cuda") used to move the saved RNG ByteTensors onto
     # the GPU, and torch.set_rng_state rejects those: every --resume on CUDA crashed.

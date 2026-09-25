@@ -1,5 +1,19 @@
-"""The gate: if these fail, nothing downstream is worth building."""
+"""The gate: if these fail, nothing downstream is worth building.
+
+These tests deliberately FAIL, not skip, when CUDA is missing: a silently skipped
+gate would let everything downstream run on CPU. They carry the `gpu_gate` marker
+(see tests/conftest.py) and are not covered by the `cuda` auto-skip.
+
+To run the rest of the suite with the GPU hidden (e.g. while a training run owns it):
+
+    CUDA_VISIBLE_DEVICES= python -m uv run python -m pytest -m "not gpu_gate"
+
+The `cuda`-marked tests elsewhere then skip instead of failing.
+"""
+import pytest
 import torch
+
+pytestmark = pytest.mark.gpu_gate
 
 
 def test_torch_is_a_cuda_build():

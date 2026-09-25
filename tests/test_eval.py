@@ -57,7 +57,7 @@ def test_estimate_loss_does_not_move_the_stream_wraps(tmp_path):
     assert stream.wraps == 5, "estimate_loss must restore the wrap count too"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.cuda
 def test_estimate_loss_runs_the_forward_in_bf16_under_amp_on_cuda(tmp_path):
     # Training runs under bf16 autocast; eval must match, or the train and val
     # curves are computed under different numerics.

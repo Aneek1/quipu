@@ -66,7 +66,7 @@ def test_accepts_a_sequence_shorter_than_the_context():
     assert Quipu(cfg)(torch.randint(0, cfg.vocab_size, (1, 5))).shape == (1, 5, cfg.vocab_size)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.cuda
 def test_attention_runs_on_a_fused_kernel():
     """Performance guard: on this build (Windows torch 2.11 cu128, sm_120) SDPA's
     default backend picker sends enable_gqa=True to the MATH kernel even though a
@@ -103,7 +103,7 @@ def test_attention_runs_on_a_fused_kernel():
     assert peak_mib < 500, f"peak {peak_mib:.0f} MiB: attention is not on a fused kernel"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.cuda
 def test_attention_runs_under_efficient_attention_only():
     """Deterministic companion to the memory-delta guard above: restrict SDPA to
     EFFICIENT_ATTENTION only (no cuDNN, no math) and run a real forward+backward.

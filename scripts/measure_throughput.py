@@ -7,9 +7,11 @@ the config's cadence.
 
 This laptop never raises CUDA OOM: the Windows (WDDM) driver spills VRAM into
 shared system RAM and the step silently becomes tens to hundreds of times slower.
-So the fit test is by memory, not by exception: after the warm-up step, if the
-peak reserved memory exceeds --vram-budget-gib the run stops there and says so.
-A timed step more than 3x the median is also reported as a likely spill.
+So the fit test is by memory, not by exception. The warm-up runs a training step,
+one eval and one checkpoint save (the last two grow reserved memory by ~0.8 GiB),
+and if peak reserved memory then exceeds --vram-budget-gib the script stops and
+exits 2. The same check runs again after the timed steps, also exiting 2 on a
+breach. A timed step more than 3x the median is reported as a likely spill.
 
 Everything (run log, checkpoint) goes into a fresh temporary directory, so repeated
 runs never collide on a run id and never leave files in the repo.
@@ -51,7 +53,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         sys.exit("CUDA is not available; this measures the GPU loop only")
 
-    with tempfile.TemporaryDirectory(prefix="quipu-throughput-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="quipu-throughput-", ignore_cleanup_errors=True) as tmp:
         tmp_path = Path(tmp)
         cfg = load_config(
             args.config,
@@ -70,6 +72,16 @@ def main() -> None:
         print(f"micro_batch={tc.micro_batch}  grad_accum={tc.grad_accum}  "
               f"batch_tokens={tc.batch_tokens:,}  budget={args.vram_budget_gib:.2f} GiB")
 
+        def over_budget(when: str) -> bool:
+            reserved = torch.cuda.max_memory_reserved() / GIB
+            allocated = torch.cuda.max_memory_allocated() / GIB
+            print(f"peak {when}: {allocated:.2f} GiB allocated, {reserved:.2f} GiB reserved")
+            if reserved > args.vram_budget_gib:
+                print(f"micro_batch {tc.micro_batch}: {reserved:.2f} GiB reserved exceeds VRAM "
+                      f"budget of {args.vram_budget_gib:.2f} GiB — would spill to shared memory")
+                return True
+            return False
+
         torch.cuda.reset_peak_memory_stats()
         # Warm up: the first step includes allocator growth and kernel selection.
         for i in range(args.warmup):
@@ -78,12 +90,17 @@ def main() -> None:
             _sync()
             print(f"  warm-up step {i + 1}: {time.perf_counter() - t0:.2f} s")
 
-        reserved = torch.cuda.max_memory_reserved() / GIB
-        allocated = torch.cuda.max_memory_allocated() / GIB
-        print(f"peak after warm-up: {allocated:.2f} GiB allocated, {reserved:.2f} GiB reserved")
-        if reserved > args.vram_budget_gib:
-            print(f"micro_batch {tc.micro_batch}: {reserved:.2f} GiB reserved exceeds VRAM "
-                  f"budget of {args.vram_budget_gib:.2f} GiB — would spill to shared memory")
+        # One eval and one checkpoint, timed the way run() would call them. Done in
+        # the warm-up so the memory gate below already includes their peak.
+        t0 = time.perf_counter()
+        estimate_loss(trainer.model, trainer.val_stream, tc.eval_batches, "cuda")
+        _sync()
+        eval_s = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        trainer.save_checkpoint()
+        ckpt_s = time.perf_counter() - t0
+
+        if over_budget("after warm-up, eval and checkpoint"):
             sys.exit(2)
 
         times: list[float] = []
@@ -100,15 +117,6 @@ def main() -> None:
             print(f"WARNING: {len(slow)} step(s) over {SPILL_FACTOR:.0f}x the median "
                   f"({', '.join(f'{t:.1f}s' for t in slow)}) — likely spilling to shared memory")
 
-        # One eval and one checkpoint, timed the way run() would call them.
-        t0 = time.perf_counter()
-        estimate_loss(trainer.model, trainer.val_stream, tc.eval_batches, "cuda")
-        _sync()
-        eval_s = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        trainer.save_checkpoint()
-        ckpt_s = time.perf_counter() - t0
-
         per_step = sum(times) / len(times)
         tps = tc.batch_tokens / per_step
         allocated = torch.cuda.max_memory_allocated() / GIB
@@ -123,12 +131,13 @@ def main() -> None:
               f"(card {torch.cuda.get_device_properties(0).total_memory / GIB:.2f} GiB)")
         print(f"one eval ({tc.eval_batches} batches): {eval_s:.2f} s, every {tc.eval_every} steps")
         print(f"one checkpoint save: {ckpt_s:.2f} s, every {tc.ckpt_every} steps")
-        if reserved > args.vram_budget_gib:
-            print(f"WARNING: peak reserved {reserved:.2f} GiB after eval/checkpoint exceeds the "
-                  f"{args.vram_budget_gib:.2f} GiB budget — would spill to shared memory")
         print(f"projected full run ({tc.steps:,} steps): {total_h:.1f} hours "
               f"(train {train_h:.2f} + eval {eval_h:.2f} + checkpoints {ckpt_h:.2f})")
+        # Second gate: the timed steps must not have pushed the peak over either.
+        breached = over_budget("over the whole measurement")
         del trainer
+    if breached:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
