@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
+import json
 import math
 import re
 import sys
@@ -75,9 +76,17 @@ def _set_thread_execution_state(flags: int) -> None:
     if sys.platform != "win32":
         return
     try:
-        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        previous = ctypes.windll.kernel32.SetThreadExecutionState(flags)
     except (AttributeError, OSError) as exc:
         print(f"warning: keep-awake request failed: {exc}", file=sys.stderr, flush=True)
+        return
+    if previous == 0:          # the documented failure return
+        print(f"warning: SetThreadExecutionState({flags:#x}) failed; the laptop may sleep",
+              file=sys.stderr, flush=True)
+
+
+def _last_logged_step(record: dict[str, Any]) -> int:
+    return max((s["step"] for s in record.get("steps", [])), default=0)
 
 
 def _bf16_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -89,7 +98,7 @@ def _bf16_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
         key = (v.data_ptr(), v.dtype, tuple(v.shape))
         if key not in seen:
             v = v.detach()
-            seen[key] = v.to("cpu", torch.bfloat16) if v.is_floating_point() else v.cpu()
+            seen[key] = v.cpu().to(torch.bfloat16) if v.is_floating_point() else v.cpu()
         out[k] = seen[key]
     return out
 
@@ -157,6 +166,18 @@ class Trainer:
             "train": dataclasses.asdict(train_cfg),
             "derived": {"steps": train_cfg.steps, "grad_accum": train_cfg.grad_accum},
         }
+        if resume and not (self.ckpt_dir / LATEST).exists():
+            # Checked before RunLog, whose resume path rewrites the log on open: a
+            # refused resume must leave the log exactly as it was. An unreadable
+            # log is left for RunLog to report.
+            try:
+                record = json.loads(
+                    (Path(run_dir) / f"{run_id}.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                record = None
+            if isinstance(record, dict):
+                self._check_restart_allowed(_last_logged_step(record))
         try:
             self.log = RunLog(run_dir, run_id, config, resume=resume)
         except ValueError as exc:
@@ -315,6 +336,23 @@ class Trainer:
                 print(f"warning: could not delete old checkpoint {p}: {exc}",
                       file=sys.stderr, flush=True)
 
+    def _check_restart_allowed(self, last_step: int) -> None:
+        """With no latest.pt, restarting from 0 is safe only if no step_*.pt exists
+        in ckpt_dir and the run log never got past the first checkpoint interval."""
+        ckpts = (
+            sorted(p.name for p in self.ckpt_dir.iterdir() if _CKPT_NAME.match(p.name))
+            if self.ckpt_dir.is_dir() else []
+        )
+        every = self.train_cfg.ckpt_every
+        if ckpts or last_step > every:
+            found = f"found {', '.join(ckpts)} but " if ckpts else ""
+            raise UsageError(
+                f"cannot resume: {found}no {LATEST} in {self.ckpt_dir}, and the run "
+                f"log reaches step {last_step} (ckpt_every {every}), so a checkpoint "
+                "should exist. Refusing to restart from step 0 over real progress; "
+                f"check ckpt_dir in the config or restore {LATEST}"
+            )
+
     def milestone_path(self, step: int) -> Path:
         return self.ckpt_dir / MILESTONE_DIR / f"step_{step:06d}.pt"
 
@@ -351,10 +389,17 @@ class Trainer:
 
         A run log with no checkpoint yet (the first attempt died before its first
         save) restarts from step 0 rather than failing: the launcher resumes any run
-        id that has a log, and a crash would otherwise repeat on every retry."""
+        id that has a log, and a crash would otherwise repeat on every retry. That is
+        allowed only when nothing suggests real progress exists somewhere: no
+        latest.pt, no step_*.pt in ckpt_dir, and a run log that never got past the
+        first checkpoint interval. Anything else (a deleted pointer, a moved or
+        renamed ckpt_dir) is a UsageError and the run log is left untouched."""
         if not (self.ckpt_dir / LATEST).exists():
+            last = _last_logged_step(self.log.record)
+            self._check_restart_allowed(last)
             print(
-                f"no checkpoint in {self.ckpt_dir} yet; starting again from step 0",
+                f"no checkpoint in {self.ckpt_dir} yet (run log reaches step {last}); "
+                "starting again from step 0",
                 flush=True,
             )
             self.log.truncate_to(0)
@@ -375,7 +420,12 @@ class Trainer:
         cfg = self.train_cfg
         milestones = set(cfg.milestones)
         saved_at = None
+        # Resumed from checkpoint N whose milestone never got written (a Ctrl+C
+        # during the milestone write or the eval before it saves checkpoint N and
+        # exits): the weights just loaded are exactly the step-N weights.
         try:
+            if self.step > 0 and (self.step in milestones or self.step == cfg.steps):
+                self.save_milestone()      # no-op when the file exists
             while self.step < cfg.steps:
                 before = self.step
                 loss = self.train_step()
@@ -426,7 +476,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", default="configs/quipu-114m.toml")
     parser.add_argument("--run-id", default="quipu-114m-001")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--device", default="auto", help="auto (cuda if usable), cuda or cpu")
+    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                        help="auto = cuda if usable, else cpu")
     args = parser.parse_args(argv)
 
     try:

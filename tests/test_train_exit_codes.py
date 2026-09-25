@@ -171,6 +171,56 @@ def test_a_missing_config_exits_2(in_tmp):
     assert run_main(args(in_tmp / "nope.toml")) == EXIT_USAGE
 
 
+def test_resume_refuses_to_restart_when_checkpoints_exist_but_latest_is_gone(in_tmp, monkeypatch):
+    # Crash at step 17 with step_10 and step_15 on disk, then latest.pt deleted:
+    # restarting from 0 would silently throw away 15 steps and truncate the log.
+    config = tiny_config(in_tmp)
+    real_step = Trainer.train_step
+
+    def dies_at_17(self):
+        if self.step == 17:
+            raise RuntimeError("transient")
+        return real_step(self)
+    monkeypatch.setattr(Trainer, "train_step", dies_at_17)
+    assert run_main(args(config)) == EXIT_CRASH
+    monkeypatch.setattr(Trainer, "train_step", real_step)
+    ckpt = in_tmp / "ckpt"
+    assert sorted(p.name for p in ckpt.glob("step_*.pt")) == ["step_000010.pt", "step_000015.pt"]
+    (ckpt / "latest.pt").unlink()
+    before = run_log(in_tmp).read_bytes()
+
+    assert run_main(args(config, "--resume")) == EXIT_USAGE
+    assert run_log(in_tmp).read_bytes() == before              # untouched
+
+
+def test_resume_refuses_to_restart_when_the_log_is_past_the_first_checkpoint(
+        in_tmp, monkeypatch, capsys):
+    # The checkpoint folder was moved (or ckpt_dir edited): no files at all, but the
+    # log shows progress past the first checkpoint interval.
+    config = tiny_config(in_tmp)
+    real_step = Trainer.train_step
+
+    def dies_at_17(self):
+        if self.step == 17:
+            raise RuntimeError("transient")
+        return real_step(self)
+    monkeypatch.setattr(Trainer, "train_step", dies_at_17)
+    assert run_main(args(config)) == EXIT_CRASH
+    monkeypatch.setattr(Trainer, "train_step", real_step)
+    (in_tmp / "ckpt").rename(in_tmp / "ckpt_moved")
+    before = run_log(in_tmp).read_bytes()
+    capsys.readouterr()
+
+    assert run_main(args(config, "--resume")) == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "ckpt" in err and "step 17" in err and "latest.pt" in err
+    assert run_log(in_tmp).read_bytes() == before
+
+
+def test_a_typo_in_device_is_a_usage_error():
+    assert run_main(["--device", "gpu"]) == 2
+
+
 def test_resume_after_a_crash_before_the_first_checkpoint_restarts_at_0(in_tmp, monkeypatch):
     # The launcher passes --resume whenever a run log exists. If the first attempt
     # died before its first checkpoint, that resume must start over, not crash on

@@ -303,7 +303,11 @@ ChildRunner = Callable[[list[str], Path], int]
 
 
 def build_train_cmd(config: str, run_id: str, resume: bool) -> list[str]:
-    cmd = [sys.executable, "-m", "quipu.train", "--config", config, "--run-id", run_id]
+    # --device cuda, never auto: after a driver reset auto would quietly fall back
+    # to CPU and spend the weekend there. cuda fails loudly (exit 1), is retried,
+    # and shows up in the summary.
+    cmd = [sys.executable, "-m", "quipu.train", "--config", config, "--run-id", run_id,
+           "--device", "cuda"]
     if resume:
         cmd.append("--resume")
     return cmd

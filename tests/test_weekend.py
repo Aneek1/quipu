@@ -733,3 +733,14 @@ def test_parse_args_overrides():
     assert args.retry_wait_s == 0
     assert args.max_retries == 1
     assert args.dry_run is True
+
+
+def test_the_training_command_pins_the_device_to_cuda():
+    # auto would fall back to CPU after a driver reset and train there all weekend;
+    # cuda fails loudly instead, so the retry and the summary show it.
+    for resume in (False, True):
+        cmd = weekend.build_train_cmd("c.toml", "rid", resume)
+        assert cmd[1:3] == ["-m", "quipu.train"]
+        i = cmd.index("--device")
+        assert cmd[i + 1] == "cuda"
+        assert ("--resume" in cmd) == resume

@@ -426,10 +426,10 @@ def test_milestones_are_never_used_for_resume(tmp_path):
     for p in list(ckpt.glob("step_*.pt")) + [ckpt / "latest.pt"]:
         p.unlink()
 
-    b = build(tmp_path, data, resume=True, milestones=(3, 7))
-    b.resume_from_latest()
-    assert b.step == 0                     # started over; did not pick up a milestone
-    assert logged(tmp_path)["steps"] == []
+    # Milestones alone are not something to resume from: with the checkpoints gone
+    # and a log past the first interval, the resume refuses rather than loading one.
+    with pytest.raises(train_mod.UsageError, match="step 20"):
+        build(tmp_path, data, resume=True, milestones=(3, 7))
 
 
 def test_a_resume_does_not_rewrite_existing_milestones(tmp_path, monkeypatch):
@@ -480,6 +480,64 @@ def test_a_milestone_on_a_checkpoint_step_is_written_before_the_checkpoint(tmp_p
     assert b.step == 5
     b.run()
     assert milestone_names(tmp_path) == ["step_000010.pt", "step_000020.pt"]
+
+@pytest.mark.parametrize("where", ["milestone write", "eval before the milestone"])
+def test_an_interrupt_that_loses_a_milestone_is_repaired_on_resume(tmp_path, monkeypatch, where):
+    # Ctrl+C during milestone 10 (or the eval just before it) makes the interrupt
+    # handler save checkpoint 10; the resume then starts after step 10, so the
+    # milestone must be written from the just-loaded step-10 weights.
+    data = make_data(tmp_path)
+    a = build(tmp_path, data, milestones=(10,), eval_every=10)
+    a.val_stream = a.stream        # give it an eval to interrupt
+    if where == "milestone write":
+        real_save = Trainer.save_milestone
+
+        def interrupted(self):
+            if self.step == 10:
+                raise KeyboardInterrupt
+            return real_save(self)
+        monkeypatch.setattr(Trainer, "save_milestone", interrupted)
+    else:
+        def interrupted_eval(*args, **kwargs):
+            raise KeyboardInterrupt
+        monkeypatch.setattr(train_mod, "estimate_loss", interrupted_eval)
+    with pytest.raises(KeyboardInterrupt):
+        a.run()
+    monkeypatch.undo()
+    m10 = tmp_path / "ckpt" / "milestones" / "step_000010.pt"
+    assert not m10.exists()
+    expected = {k: v.to(torch.bfloat16) for k, v in a.model.state_dict().items()}
+
+    b = build(tmp_path, data, resume=True, milestones=(10,))
+    b.resume_from_latest()
+    assert b.step == 10
+    b.run()
+    state = torch.load(m10, weights_only=True)
+    for k, v in state.items():
+        assert torch.equal(v, expected[k])
+
+
+def test_resume_with_only_an_early_log_and_no_checkpoints_restarts_at_0(tmp_path):
+    data = make_data(tmp_path)
+    a = build(tmp_path, data)
+    for _ in range(3):             # below ckpt_every (5): nothing saved yet
+        a.train_step()
+    b = build(tmp_path, data, resume=True)
+    b.resume_from_latest()
+    assert b.step == 0 and logged(tmp_path)["steps"] == []
+
+
+def test_resume_refuses_when_step_files_exist_without_latest(tmp_path):
+    data = make_data(tmp_path)
+    a = build(tmp_path, data)
+    for _ in range(5):
+        a.train_step()
+    a.save_checkpoint()
+    (tmp_path / "ckpt" / "latest.pt").unlink()
+    before = (tmp_path / "runs" / "t.json").read_bytes()
+    with pytest.raises(train_mod.UsageError, match="step_000005.pt"):
+        build(tmp_path, data, resume=True)
+    assert (tmp_path / "runs" / "t.json").read_bytes() == before
 
 # ---- keep-awake ---------------------------------------------------------------
 
@@ -551,3 +609,12 @@ def test_keep_awake_does_nothing_elsewhere(monkeypatch):
     monkeypatch.setattr(train_mod.sys, "platform", "linux")
     train_mod._set_thread_execution_state(AWAKE)
     assert kernel32.calls == []
+
+
+def test_keep_awake_warns_when_the_api_reports_failure(monkeypatch, capsys):
+    kernel32 = _FakeKernel32()
+    kernel32.SetThreadExecutionState = lambda flags: 0     # documented failure return
+    monkeypatch.setattr(train_mod, "ctypes", _fake_ctypes(kernel32))
+    monkeypatch.setattr(train_mod.sys, "platform", "win32")
+    train_mod._set_thread_execution_state(AWAKE)
+    assert "SetThreadExecutionState" in capsys.readouterr().err
