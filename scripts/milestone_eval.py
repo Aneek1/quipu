@@ -61,9 +61,13 @@ class NoCheckpointsFound(RuntimeError):
     """Nothing under <ckpt_dir>/milestones and no usable latest.pt either."""
 
 
-def discover_checkpoints(ckpt_dir: Path) -> list[tuple[str, int, Path]]:
-    """Return (label, step, path) triples, sorted by step, milestones first then a
-    trailing "final" entry when it adds anything.
+def discover_checkpoints(ckpt_dir: Path) -> list[tuple[str, int, Path, dict | None]]:
+    """Return (label, step, path, preloaded_final_state) quadruples, sorted by step,
+    milestones first then a trailing "final" entry when it adds anything.
+    `preloaded_final_state` is the "final" entry's fp32 model state_dict (already
+    read off disk while deciding whether to include it), or None for a milestone
+    entry; passing it on lets the caller avoid reading the full checkpoint (model +
+    optimiser state) a second time.
 
     The final checkpoint is included unless its step equals the last milestone's
     step AND its weights are identical to that milestone's — a run that finishes
@@ -79,7 +83,9 @@ def discover_checkpoints(ckpt_dir: Path) -> list[tuple[str, int, Path]]:
                 found.append((int(m.group(1)), p))
     found.sort()
 
-    out: list[tuple[str, int, Path]] = [(f"step_{step:06d}", step, path) for step, path in found]
+    out: list[tuple[str, int, Path, dict | None]] = [
+        (f"step_{step:06d}", step, path, None) for step, path in found
+    ]
 
     latest_ptr = ckpt_dir / LATEST
     if latest_ptr.exists():
@@ -91,16 +97,19 @@ def discover_checkpoints(ckpt_dir: Path) -> list[tuple[str, int, Path]]:
         final_path = ckpt_dir / pointer["file"]
         m = _STEP_RE.match(final_path.name)
         final_step = int(m.group(1)) if m else None
+        # Read the full checkpoint (model + optimiser state) exactly once here, and
+        # hand the model state_dict on to the caller, so load_final_model never has
+        # to re-read it.
+        final_full = torch.load(final_path, map_location="cpu", weights_only=False)
+        final_state = final_full["model"]
         include = True
         if found and final_step == found[-1][0]:
             # Same step as the last milestone: include only if the weights differ
             # (the final checkpoint is fp32 + optimiser state; compare model weights).
             last_milestone_state = torch.load(found[-1][1], map_location="cpu", weights_only=True)
-            final_full = torch.load(final_path, map_location="cpu", weights_only=False)
-            final_state = final_full["model"]
             include = not _state_dicts_equal(last_milestone_state, final_state)
         if include:
-            out.append(("final", final_step if final_step is not None else -1, final_path))
+            out.append(("final", final_step if final_step is not None else -1, final_path, final_state))
 
     if not out:
         raise NoCheckpointsFound(
@@ -154,16 +163,21 @@ def load_milestone_model(cfg: Config, path: Path, device: str) -> Quipu:
     return model
 
 
-def load_final_model(cfg: Config, path: Path, device: str) -> Quipu:
+def load_final_model(cfg: Config, path: Path, device: str, state: dict | None = None) -> Quipu:
     """The full checkpoint is `{"model": state_dict (fp32), "optimizer": ..., ...}`.
     torch.save writes the optimiser state as a plain (non-tensor) nested dict/list of
     Python numbers and tensors, which weights_only=True's restricted unpickler does
-    not accept for every torch version this script may run under, so this one load
-    falls back to weights_only=False. Still read-only: map_location="cpu", never
+    not accept for every torch version this script may run under, so a from-scratch
+    load falls back to weights_only=False. Still read-only: map_location="cpu", never
     written back, and only the "model" key is used.
+
+    `state` lets a caller that already read the checkpoint (discover_checkpoints, to
+    decide whether "final" duplicates the last milestone) hand over the model
+    state_dict directly, so the ~1.4 GB full checkpoint is never read from disk twice.
     """
-    full = torch.load(path, map_location="cpu", weights_only=False)
-    state = full["model"]
+    if state is None:
+        full = torch.load(path, map_location="cpu", weights_only=False)
+        state = full["model"]
     model = Quipu(cfg.model).to(device)
     model.load_state_dict(state, strict=True)
     assert model.lm_head.weight is model.embed.weight
@@ -243,48 +257,73 @@ def sample_for_prompt(
     return greedy_text, sampled_text
 
 
-def run(cfg: Config, device: str, eval_batches: int, out_dir: Path) -> None:
+def run(cfg: Config, device: str, eval_batches: int, out_dir: Path) -> bool:
+    """Evaluate every checkpoint and write metrics.json + samples.md.
+
+    A single corrupt/unreadable checkpoint must not lose the other checkpoints'
+    results after a 50-hour run: each checkpoint's load + eval + sampling is
+    isolated in its own try/except, a failure is recorded (metrics gets an
+    "error" entry, samples.md notes it) and evaluation continues. Both files are
+    always written. Returns True iff every checkpoint succeeded; the caller uses
+    this to decide the process exit code.
+    """
     ckpt_dir = Path(cfg.train.ckpt_dir)
     checkpoints = discover_checkpoints(ckpt_dir)
     tok = Tokenizer()
 
     metrics: list[dict] = []
+    failures: list[tuple[str, int, str]] = []
     # samples[prompt] = list of (label, step, greedy_text, sampled_text), appended
     # in checkpoint order (checkpoints is already step-sorted).
     samples: dict[str, list[tuple[str, int, str, str]]] = {p: [] for p in ALL_PROMPTS}
 
-    for label, step, path in checkpoints:
+    for label, step, path, preloaded_state in checkpoints:
         t0 = time.perf_counter()
-        model = load_final_model(cfg, path, device) if label == "final" else load_milestone_model(cfg, path, device)
+        try:
+            model = (
+                load_final_model(cfg, path, device, state=preloaded_state)
+                if label == "final"
+                else load_milestone_model(cfg, path, device)
+            )
 
-        text_loss, code_loss, note = evaluate_losses(model, cfg, device, eval_batches)
+            text_loss, code_loss, note = evaluate_losses(model, cfg, device, eval_batches)
 
-        for prompt in ALL_PROMPTS:
-            greedy_text, sampled_text = sample_for_prompt(model, tok, prompt, device)
-            samples[prompt].append((label, step, greedy_text, sampled_text))
+            for prompt in ALL_PROMPTS:
+                greedy_text, sampled_text = sample_for_prompt(model, tok, prompt, device)
+                samples[prompt].append((label, step, greedy_text, sampled_text))
 
-        del model
-        elapsed = time.perf_counter() - t0
-        record = {
-            "label": label,
-            "step": step,
-            "text_val_loss": text_loss,
-            "code_val_loss": code_loss,
-            "seconds": elapsed,
-        }
-        if note:
-            record["note"] = note
-        metrics.append(record)
-        print(
-            f"{label} (step {step}): text_val_loss={text_loss:.4f} "
-            f"code_val_loss={'n/a' if code_loss is None else f'{code_loss:.4f}'} "
-            f"({elapsed:.1f}s)",
-            flush=True,
-        )
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            elapsed = time.perf_counter() - t0
+            record = {
+                "label": label,
+                "step": step,
+                "text_val_loss": text_loss,
+                "code_val_loss": code_loss,
+                "seconds": elapsed,
+            }
+            if note:
+                record["note"] = note
+            metrics.append(record)
+            print(
+                f"{label} (step {step}): text_val_loss={text_loss:.4f} "
+                f"code_val_loss={'n/a' if code_loss is None else f'{code_loss:.4f}'} "
+                f"({elapsed:.1f}s)",
+                flush=True,
+            )
+        except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            error = f"{type(exc).__name__}: {exc}"
+            metrics.append({"label": label, "step": step, "error": error, "seconds": elapsed})
+            failures.append((label, step, error))
+            print(f"error: {label} (step {step}) failed: {error}", file=sys.stderr, flush=True)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_metrics(out_dir / "metrics.json", metrics)
-    _write_samples(out_dir / "samples.md", samples)
+    _write_samples(out_dir / "samples.md", samples, failures)
+    return not failures
 
 
 def _write_metrics(path: Path, metrics: list[dict]) -> None:
@@ -294,7 +333,11 @@ def _write_metrics(path: Path, metrics: list[dict]) -> None:
     replace_with_retry(tmp, path)
 
 
-def _write_samples(path: Path, samples: dict[str, list[tuple[str, int, str, str]]]) -> None:
+def _write_samples(
+    path: Path,
+    samples: dict[str, list[tuple[str, int, str, str]]],
+    failures: list[tuple[str, int, str]] | None = None,
+) -> None:
     lines = [
         "# Milestone samples",
         "",
@@ -306,6 +349,17 @@ def _write_samples(path: Path, samples: dict[str, list[tuple[str, int, str, str]
         "reproducible across runs.",
         "",
     ]
+    if failures:
+        lines.append("## Failed checkpoints")
+        lines.append("")
+        lines.append(
+            "These checkpoints could not be loaded or evaluated; see metrics.json "
+            "for the same errors. No samples were generated for them."
+        )
+        lines.append("")
+        for label, step, error in failures:
+            lines.append(f"- **{label}** (step {step}): {error}")
+        lines.append("")
     for prompt in samples:
         lines.append(f"## Prompt: `{prompt}`")
         lines.append("")
@@ -332,7 +386,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/quipu-114m.toml")
     parser.add_argument("--eval-batches", type=int, default=50)
-    parser.add_argument("--device", default="auto", help="auto (cuda if usable), cuda or cpu")
+    parser.add_argument(
+        "--device", default="auto", choices=["auto", "cuda", "cpu"],
+        help="auto (cuda if usable), cuda or cpu",
+    )
     parser.add_argument("--out-dir", default="results/milestones")
     args = parser.parse_args(argv)
 
@@ -340,11 +397,11 @@ def main(argv: list[str] | None = None) -> int:
     device = _pick_device(args.device)
 
     try:
-        run(cfg, device, args.eval_batches, Path(args.out_dir))
+        ok = run(cfg, device, args.eval_batches, Path(args.out_dir))
     except NoCheckpointsFound as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return 1
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

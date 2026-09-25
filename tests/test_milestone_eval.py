@@ -1,5 +1,6 @@
 """scripts/milestone_eval.py: CPU only, tiny model, fake milestones built exactly the
-way quipu/train.py builds them (bf16 state_dict, tied lm_head.weight omitted).
+way quipu/train.py builds them (bf16 state_dict; the tied "embed.weight" and
+"lm_head.weight" are both present as keys, sharing one on-disk storage).
 """
 from __future__ import annotations
 
@@ -73,8 +74,9 @@ def _write_val_shards(cfg: Config, with_code: bool = True, seed: int = 0) -> Non
 
 
 def _save_milestone(cfg: Config, step: int, model: Quipu) -> Path:
-    """Replicates Trainer.save_milestone exactly: bf16 state_dict, tied tensor
-    written once (so lm_head.weight is absent), atomic save."""
+    """Replicates Trainer.save_milestone exactly: bf16 state_dict where the tied
+    "embed.weight"/"lm_head.weight" tensor is written to disk once (both keys are
+    still present, pointing at the same storage), atomic save."""
     path = Path(cfg.train.ckpt_dir) / "milestones" / f"step_{step:06d}.pt"
     state = train_mod._bf16_state_dict(model)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +246,7 @@ def test_final_identical_to_last_milestone_is_skipped(tmp_path):
     _save_final(cfg, 20, model)  # same step, same weights
 
     checkpoints = milestone_eval.discover_checkpoints(Path(cfg.train.ckpt_dir))
-    assert [label for label, _, _ in checkpoints] == ["step_000020"]
+    assert [label for label, _, _, _ in checkpoints] == ["step_000020"]
 
 
 def test_final_at_same_step_with_different_weights_is_kept(tmp_path):
@@ -253,4 +255,37 @@ def test_final_at_same_step_with_different_weights_is_kept(tmp_path):
     _save_final(cfg, 20, _fresh_model(cfg, 99))  # same step, different weights
 
     checkpoints = milestone_eval.discover_checkpoints(Path(cfg.train.ckpt_dir))
-    assert [label for label, _, _ in checkpoints] == ["step_000020", "final"]
+    assert [label for label, _, _, _ in checkpoints] == ["step_000020", "final"]
+
+
+def test_a_corrupt_milestone_does_not_lose_the_other_checkpoints_results(tmp_path):
+    cfg = build_cfg(tmp_path)
+    _write_val_shards(cfg)
+    _save_milestone(cfg, 10, _fresh_model(cfg, 1))
+    bad_path = _save_milestone(cfg, 20, _fresh_model(cfg, 2))
+    _save_milestone(cfg, 30, _fresh_model(cfg, 3))
+    # Corrupt the middle milestone: delete a real weight, matching how
+    # load_milestone_model fails loudly on a real corruption.
+    state = torch.load(bad_path, map_location="cpu", weights_only=True)
+    del state["blocks.0.attn.q.weight"]
+    train_mod._atomic_save(state, bad_path)
+
+    out_dir = tmp_path / "out"
+    ok = milestone_eval.run(cfg, device="cpu", eval_batches=2, out_dir=out_dir)
+    assert ok is False, "a per-checkpoint failure must be reported back to the caller"
+
+    import json
+    metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))["checkpoints"]
+    by_step = {m["step"]: m for m in metrics}
+    assert set(by_step) == {10, 20, 30}
+    assert "error" not in by_step[10] and isinstance(by_step[10]["text_val_loss"], float)
+    assert "error" not in by_step[30] and isinstance(by_step[30]["text_val_loss"], float)
+    assert "error" in by_step[20] and "text_val_loss" not in by_step[20]
+
+    samples = (out_dir / "samples.md").read_text(encoding="utf-8")
+    assert "step_000020" in samples and "error" in samples.lower()
+    for prompt in milestone_eval.ALL_PROMPTS:
+        section_start = samples.index(f"`{prompt}`")
+        # The good checkpoints still produced samples for every prompt.
+        assert "step_000010" in samples[section_start:]
+        assert "step_000030" in samples[section_start:]
