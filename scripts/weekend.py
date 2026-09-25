@@ -1,8 +1,22 @@
 """The weekend launcher: start it once, come back Monday.
 
 Runs `python -m quipu.train` as a child process, auto-resuming on failures that
-aren't the non-finite stop or a user interrupt (the trainer gives those exit
-codes 3 and 130 so this launcher can tell them apart from an ordinary crash).
+are worth another try. The trainer's contract: 0 success; 2 a usage/config
+error (reused run id without --resume, or --resume with a missing/corrupt run
+log); 3 the non-finite stop; 130 a user interrupt. 2, 3 and interrupt codes are
+never retried -- retrying a usage error or the non-finite stop would just fail
+identically, and an interrupt means the owner asked to stop. Everything else
+(1, or an unrelated crash such as a CUDA fault) is retried, up to a cap.
+
+Ctrl+C is handled specially, because the launcher and the child share a
+console: on Windows a Ctrl+C'd child can exit via STATUS_CONTROL_C_EXIT
+(0xC000013A), which subprocess reports as -1073741510 (or its unsigned
+equivalent, 3221225786, if something upstream treats it as unsigned) rather
+than the POSIX-style 130. All of these are treated as "interrupted". If the
+launcher's own process receives the Ctrl+C first (same console, most likely),
+it is caught around the child call: the child is given a few seconds to exit
+on its own, then terminated if it hasn't, and the run stops without retrying.
+
 After a completed run it runs the evaluation scripts, each as its own process
 so one failing step doesn't stop the rest. A one-page summary is (re)written
 atomically after every single attempt, so a hard power-off mid-run still
@@ -16,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import os
 import platform
 import shutil
 import subprocess
@@ -26,17 +41,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from quipu.config import load_config
 from quipu.fsio import replace_with_retry
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# The trainer's own contract (spec section 4 / the non-finite stop and
-# KeyboardInterrupt): these two exit codes mean "don't retry, it would just
-# fail the same way (3) or the owner asked to stop (130)". Everything else
-# non-zero is an ordinary crash worth one more try.
+# The trainer's own contract (spec section 4): 0 success, 2 usage/config
+# error, 3 the non-finite stop, 130 a user interrupt (POSIX-style; see the
+# module docstring for the Windows Ctrl+C exit codes the child can actually
+# report). None of these are retried.
+EXIT_USAGE_ERROR = 2
 EXIT_NONFINITE = 3
 EXIT_INTERRUPT = 130
-NO_RETRY_CODES = frozenset({EXIT_NONFINITE, EXIT_INTERRUPT})
+# Raw Windows exit codes for a Ctrl+C'd child (STATUS_CONTROL_C_EXIT,
+# 0xC000013A), signed and unsigned, on top of the POSIX-style 130.
+WIN_CTRL_C_EXIT_CODES = frozenset({-1073741510, 3221225786})
+INTERRUPT_CODES = frozenset({EXIT_INTERRUPT}) | WIN_CTRL_C_EXIT_CODES
+NO_RETRY_CODES = frozenset({EXIT_USAGE_ERROR, EXIT_NONFINITE}) | INTERRUPT_CODES
 
 
 def _now() -> str:
@@ -102,19 +123,23 @@ def probe_other_gpu_vram_gb() -> float | None:
 
 
 class _SYSTEM_POWER_STATUS(ctypes.Structure):
+    # The real Win32 struct's fields are BYTE (unsigned); c_byte here would
+    # read ACLineStatus 255 (unknown) back as -1 and break the 255 check below.
     _fields_ = [
-        ("ACLineStatus", ctypes.c_byte),
-        ("BatteryFlag", ctypes.c_byte),
-        ("BatteryLifePercent", ctypes.c_byte),
-        ("Reserved1", ctypes.c_byte),
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("Reserved1", ctypes.c_ubyte),
         ("BatteryLifeTime", ctypes.c_ulong),
         ("BatteryFullLifeTime", ctypes.c_ulong),
     ]
 
 
-def probe_on_battery() -> bool | None:
-    """True on battery, False on AC. None on non-Windows, or if Windows can't
-    answer -- in which case the guard treats it as "can't tell, don't block"."""
+def probe_on_battery() -> bool | None | str:
+    """True on battery, False on AC, "unknown" if Windows itself reports
+    ACLineStatus 255 (genuinely ambiguous -- must not be silently treated as
+    AC), None on non-Windows or if Windows can't answer at all (in which case
+    the guard treats it as "can't tell, don't block")."""
     if platform.system() != "Windows":
         return None
     status = _SYSTEM_POWER_STATUS()
@@ -124,6 +149,8 @@ def probe_on_battery() -> bool | None:
         return None
     if not ok:
         return None
+    if status.ACLineStatus == 255:
+        return "unknown"
     return status.ACLineStatus == 0
 
 
@@ -147,7 +174,7 @@ def run_guards(
     shard_dir: Path,
     force: bool,
     probe_vram: Callable[[], float | None] = probe_other_gpu_vram_gb,
-    probe_battery: Callable[[], bool | None] = probe_on_battery,
+    probe_battery: Callable[[], bool | None | str] = probe_on_battery,
     probe_disk: Callable[[Path], float] = probe_free_disk_gb,
     probe_shards: Callable[[Path], tuple[bool, bool]] = probe_shards_present,
 ) -> list[GuardResult]:
@@ -174,6 +201,12 @@ def run_guards(
     if battery is None:
         results.append(GuardResult(
             "power", True, "not on Windows, or power status unavailable; skipping this guard",
+        ))
+    elif battery == "unknown":
+        ok = force
+        results.append(GuardResult(
+            "power", ok, "power state unknown (Windows reported ACLineStatus 255)",
+            fix="" if ok else "power state unknown -- plug in and re-run, or use --force",
         ))
     else:
         ok = force or not battery
@@ -211,15 +244,39 @@ def run_guards(
 # --------------------------------------------------------------------------
 
 
+def _stop_child(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Give a Ctrl+C'd child a moment to exit on its own -- it received the same
+    console signal -- then escalate to terminate/kill if it's still alive."""
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def default_run_child(cmd: list[str], log_path: Path) -> int:
     """Run `cmd`, inheriting stdout/stderr to the console (so progress lines
-    still show up live) while also teeing every line to `log_path`."""
+    still show up live) while also teeing every line to `log_path`. Unbuffered
+    so those lines arrive promptly instead of sitting in the child's stdio
+    buffer for a 50-hour run."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     with open(log_path, "w", encoding="utf-8") as logf:
         try:
             proc = subprocess.Popen(
                 cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, bufsize=1, env=env,
             )
         except OSError as exc:
             msg = f"weekend.py: failed to launch {cmd!r}: {exc}\n"
@@ -227,11 +284,17 @@ def default_run_child(cmd: list[str], log_path: Path) -> int:
             logf.write(msg)
             return 1
         assert proc.stdout is not None
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            logf.write(line)
-        proc.wait()
-        return proc.returncode
+        try:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                logf.write(line)
+            proc.wait()
+            return proc.returncode
+        except KeyboardInterrupt:
+            # The launcher's own process got the Ctrl+C too (same console);
+            # make sure the child is actually gone before this propagates.
+            _stop_child(proc)
+            raise
 
 
 ChildRunner = Callable[[list[str], Path], int]
@@ -261,31 +324,50 @@ def run_training(
     run_child: ChildRunner = default_run_child,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    """Returns the exit code of the final attempt (0 iff training completed)."""
-    resume = run_log_exists(run_id)
+    """Returns the exit code of the final attempt (0 iff training completed).
+
+    --resume is decided fresh before every attempt by asking `run_log_exists`,
+    never assumed: a failed first attempt might have crashed before RunLog's
+    __init__ ever flushed (e.g. a usage error, or a crash during model
+    construction), in which case there is still no run log and forcing
+    --resume would hand the trainer a --resume flag with nothing to resume."""
     retries_used = 0
     attempt_n = 0
     code = 1
     while True:
         attempt_n += 1
+        resume = run_log_exists(run_id)
         cmd = build_train_cmd(config, run_id, resume)
         log_path = log_dir / f"train_attempt_{attempt_n}.log"
         started = _now()
-        code = run_child(cmd, log_path)
+        try:
+            code = run_child(cmd, log_path)
+        except KeyboardInterrupt:
+            finished = _now()
+            on_attempt(Attempt(
+                kind="train", args=cmd, returncode=EXIT_INTERRUPT, started_at=started,
+                finished_at=finished, log_path=str(log_path), retried=False,
+                note="stopped by owner (Ctrl+C)",
+            ))
+            return EXIT_INTERRUPT
         finished = _now()
         will_retry = (
             code != 0
             and code not in NO_RETRY_CODES
             and retries_used < max_retries
         )
+        note = "stopped by owner (Ctrl+C)" if code in INTERRUPT_CODES else (
+            "usage/config error" if code == EXIT_USAGE_ERROR else (
+                "non-finite stop" if code == EXIT_NONFINITE else ""
+            )
+        )
         on_attempt(Attempt(
             kind="train", args=cmd, returncode=code, started_at=started,
-            finished_at=finished, log_path=str(log_path), retried=will_retry,
+            finished_at=finished, log_path=str(log_path), retried=will_retry, note=note,
         ))
         if code == 0 or not will_retry:
             return code
         retries_used += 1
-        resume = True  # the failed attempt has left a run log behind either way
         sleep(retry_wait_s)
 
 
@@ -424,13 +506,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve(path_str: str) -> Path:
+    p = Path(path_str)
+    return p if p.is_absolute() else REPO_ROOT / p
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     summary_path = REPO_ROOT / "results" / "weekend_summary.md"
     log_dir = REPO_ROOT / "results" / "weekend"
     run_log_dir = REPO_ROOT / "results" / "runs"
-    shard_dir = REPO_ROOT / "data" / "shards"
+    # The shard layout is whatever the run's own --config says, not a
+    # hard-coded guess -- a differently-configured run must be guarded
+    # against its own shards, not the default ones.
+    cfg = load_config(args.config)
+    shard_dir = _resolve(cfg.data.shard_dir)
 
     state = WeekendState(forced=args.force)
 
@@ -489,18 +580,36 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if last_code != 0:
-        state.final_status = (
-            f"training did not complete; last exit code {last_code} "
-            f"({len(state.train_attempts)} attempt(s))"
-        )
+        if last_code in INTERRUPT_CODES:
+            state.final_status = "stopped by owner (Ctrl+C)"
+            exit_code = EXIT_INTERRUPT
+        elif last_code == EXIT_USAGE_ERROR:
+            state.final_status = (
+                "training did not complete: usage/config error (exit 2) -- "
+                "not retried, a retry would fail identically"
+            )
+            exit_code = last_code
+        else:
+            state.final_status = (
+                f"training did not complete; last exit code {last_code} "
+                f"({len(state.train_attempts)} attempt(s))"
+            )
+            exit_code = last_code
         write_summary(state, summary_path)
-        return last_code
+        return exit_code
 
     def _on_eval_attempt(a: Attempt) -> None:
         state.eval_attempts.append(a)
         write_summary(state, summary_path)
 
-    run_evals(log_dir=log_dir, on_attempt=_on_eval_attempt)
+    try:
+        run_evals(log_dir=log_dir, on_attempt=_on_eval_attempt)
+    except KeyboardInterrupt:
+        # run_training already absorbs a Ctrl+C during training; this is the
+        # backstop for one landing during the (much shorter) evaluation phase.
+        state.final_status = "stopped by owner (Ctrl+C) during evaluation"
+        write_summary(state, summary_path)
+        return EXIT_INTERRUPT
 
     failed_evals = [a for a in state.eval_attempts if a.returncode not in (0, None)]
     if failed_evals:
