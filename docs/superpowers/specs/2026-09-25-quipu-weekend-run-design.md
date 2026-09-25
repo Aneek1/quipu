@@ -120,3 +120,10 @@ The owner requires Quipu to build full-stack apps through MCP plugins inside Ope
 2. **Skill (sub-project 3):** agentic fine-tuning on tool-call traces so the model emits valid tool calls step after step; the "score enumerated candidates instead of generating" option (see the pipeline spec) is the leading approach for a small model.
 
 Expectation stated plainly: short tool-driven tasks after sub-project 3; end-to-end full-stack app generation is the long-term target that needs 350M, the retrieval map (repo, framework docs, API signatures) and agentic fine-tuning together. It is not claimed for the 114M model.
+
+### Roadmap requirements recorded 2026-09-25: document upload and image generation
+
+Neither is a pretraining concern; neither changes the weekend run.
+
+- **Document upload** — ingestion (PDF/DOCX text extraction → chunks) into the same memory store approach A builds, so answers come from the uploaded document. Reuse the ingestion/retrieval/citation design from the owner's soft-robotics chatbot rather than rebuilding it.
+- **Image generation** — a text model cannot emit pixels, and training an image generator from scratch is out of reach on 8 GB. Route: Quipu calls an image model **as a tool** through the same tool-calling/MCP path — a local model that fits in 8 GB (never concurrently with training), or an external API behind an explicit opt-in because the prompt leaves the machine.
