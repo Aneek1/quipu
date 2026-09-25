@@ -244,6 +244,55 @@ def test_keyboard_interrupt_writes_owner_stop_summary(tmp_path):
     assert "stopped by owner (Ctrl+C)" in text
 
 
+def test_keyboard_interrupt_during_retry_wait_stops_without_retry(tmp_path):
+    """A Ctrl+C landing during the multi-minute pause between attempts (not
+    during the child run itself) must not be lost: one attempt recorded, no
+    second child launch, exit 130."""
+    runner = ScriptedRunner([1, 0])  # the 2nd call must never happen
+
+    def sleep(_seconds):
+        raise KeyboardInterrupt
+
+    attempts = []
+    code = weekend.run_training(
+        config="cfg.toml", run_id="run-a", max_retries=3, retry_wait_s=120,
+        log_dir=tmp_path, run_log_exists=lambda rid: False,
+        on_attempt=attempts.append, run_child=runner, sleep=sleep,
+    )
+
+    assert code == weekend.EXIT_INTERRUPT
+    assert len(attempts) == 1
+    assert len(runner.calls) == 1  # never retried
+    assert attempts[0].returncode == 1
+    assert attempts[0].retried is False
+    assert "interrupted while waiting to retry" in attempts[0].note
+
+
+def test_keyboard_interrupt_during_retry_wait_writes_owner_stop_summary(tmp_path):
+    summary_path = tmp_path / "results" / "weekend_summary.md"
+    state = weekend.WeekendState()
+    runner = ScriptedRunner([1])
+
+    def sleep(_seconds):
+        raise KeyboardInterrupt
+
+    def on_attempt(a):
+        state.train_attempts.append(a)
+        weekend.write_summary(state, summary_path)
+
+    code = weekend.run_training(
+        config="cfg.toml", run_id="run-a", max_retries=3, retry_wait_s=120,
+        log_dir=tmp_path, run_log_exists=lambda rid: False,
+        on_attempt=on_attempt, run_child=runner, sleep=sleep,
+    )
+    assert code == 130
+    state.final_status = "stopped by owner (Ctrl+C)"
+    weekend.write_summary(state, summary_path)
+    text = summary_path.read_text(encoding="utf-8")
+    assert "stopped by owner (Ctrl+C)" in text
+    assert "interrupted while waiting to retry" in text
+
+
 def test_resume_rechecked_before_every_attempt_not_forced_true(tmp_path):
     """A first attempt that crashes before ever writing a run log (e.g. exit 1
     from a usage-ish failure that still left no results/runs/<id>.json) must
@@ -354,6 +403,9 @@ def test_shards_guard_trips_and_force_bypasses(tmp_path):
     shards = next(g for g in results if g.name == "shards")
     assert shards.ok is False
     assert "val" in shards.detail
+    # The actual configured shard_dir, not a hard-coded "data/shards" guess.
+    assert str(shard_dir / "val") in shards.detail
+    assert str(shard_dir) in shards.fix
 
     forced = weekend.run_guards(
         max_other_vram_gb=1.5, min_free_gb=1.0, shard_dir=shard_dir, force=True,

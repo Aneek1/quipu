@@ -232,8 +232,10 @@ def run_guards(
     results.append(GuardResult(
         "shards", ok,
         "present" if not missing else
-        f"missing or empty: {', '.join(f'data/shards/{d}' for d in missing)}",
-        fix="" if ok else "run scripts/build_shards.py to build the shards first, or pass --force",
+        f"missing or empty: {', '.join(str(shard_dir / d) for d in missing)}",
+        fix="" if ok else (
+            f"run scripts/build_shards.py to build the shards at {shard_dir} first, or pass --force"
+        ),
     ))
 
     return results
@@ -361,14 +363,30 @@ def run_training(
                 "non-finite stop" if code == EXIT_NONFINITE else ""
             )
         )
-        on_attempt(Attempt(
-            kind="train", args=cmd, returncode=code, started_at=started,
-            finished_at=finished, log_path=str(log_path), retried=will_retry, note=note,
-        ))
         if code == 0 or not will_retry:
+            on_attempt(Attempt(
+                kind="train", args=cmd, returncode=code, started_at=started,
+                finished_at=finished, log_path=str(log_path), retried=False, note=note,
+            ))
             return code
         retries_used += 1
-        sleep(retry_wait_s)
+        # The launcher waits here for minutes between attempts; a Ctrl+C during
+        # that wait must not be lost. Delay recording this attempt until the
+        # wait is over (or interrupted), so the one record written reflects
+        # what actually happened, not a "retried" claim that never came true.
+        try:
+            sleep(retry_wait_s)
+        except KeyboardInterrupt:
+            on_attempt(Attempt(
+                kind="train", args=cmd, returncode=code, started_at=started,
+                finished_at=finished, log_path=str(log_path), retried=False,
+                note="interrupted while waiting to retry",
+            ))
+            return EXIT_INTERRUPT
+        on_attempt(Attempt(
+            kind="train", args=cmd, returncode=code, started_at=started,
+            finished_at=finished, log_path=str(log_path), retried=True, note=note,
+        ))
 
 
 # --------------------------------------------------------------------------
@@ -442,9 +460,10 @@ def render_summary(state: WeekendState) -> str:
         lines.append("(none yet)")
     for i, a in enumerate(state.train_attempts, 1):
         retry_note = "  -> retrying" if a.retried else ""
+        note = f"  ({a.note})" if a.note else ""
         lines.append(
             f"{i}. exit {a.returncode}  ({a.started_at} to {a.finished_at})  "
-            f"log: {a.log_path}{retry_note}"
+            f"log: {a.log_path}{retry_note}{note}"
         )
     lines.append("")
 
