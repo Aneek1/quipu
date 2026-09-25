@@ -199,3 +199,33 @@ def test_a_missing_code_field_is_an_error(tmp_path):
                    encoding="utf-8")
     with pytest.raises(TypeError, match="code_share"):
         load_config(cfg)
+
+
+def test_milestones_are_loaded_as_a_tuple():
+    cfg = load_config(CONFIG)
+    assert cfg.train.milestones == (100, 250, 500, 1000, 2000, 4000)
+    assert all(m < cfg.train.steps for m in cfg.train.milestones)
+
+
+def test_milestones_may_be_empty():
+    assert load_config(CONFIG, overrides={"train": {"milestones": []}}).train.milestones == ()
+
+
+@pytest.mark.parametrize(
+    "milestones, match",
+    [
+        ([100, 100], "strictly increasing"),
+        ([250, 100], "strictly increasing"),
+        ([0, 100], "positive"),
+        ([-5], "positive"),
+        ([100.0], "ints"),
+        ([True], "ints"),
+        (["100"], "ints"),
+        (100, "list"),
+        ([100, 5722], "less than steps"),
+        ([100, 9000], "less than steps"),
+    ],
+)
+def test_bad_milestones_are_rejected(milestones, match):
+    with pytest.raises(ValueError, match=match):
+        load_config(CONFIG, overrides={"train": {"milestones": milestones}})

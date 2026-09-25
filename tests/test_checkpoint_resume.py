@@ -7,7 +7,10 @@ import torch
 
 from quipu.config import ModelConfig, TrainConfig
 from quipu.data import write_shard
-from quipu.train import Trainer
+import hashlib
+
+import quipu.train as train_mod
+from quipu.train import ES_CONTINUOUS, ES_SYSTEM_REQUIRED, NonFiniteStop, Trainer
 
 
 def tiny_model() -> ModelConfig:
@@ -289,7 +292,7 @@ def test_a_non_finite_gradient_skips_the_step(tmp_path, monkeypatch, capsys):
 def test_three_non_finite_steps_stop_the_run_without_checkpointing(tmp_path, monkeypatch):
     trainer = build(tmp_path, make_data(tmp_path))
     _poison_grads(monkeypatch, trainer, times=3)
-    with pytest.raises(RuntimeError, match="non-finite"):
+    with pytest.raises(NonFiniteStop, match="non-finite"):
         trainer.run()
     assert trainer.step == 0
     ckpt = tmp_path / "ckpt"
@@ -384,3 +387,167 @@ def test_an_interrupt_inside_the_optimizer_step_does_not_rewind(tmp_path, monkey
     with pytest.raises(KeyboardInterrupt):
         trainer.train_step()
     assert trainer.stream.position == position + 16 * 2
+
+
+# ---- milestones ---------------------------------------------------------------
+
+def milestone_names(tmp_path) -> list[str]:
+    return sorted(p.name for p in (tmp_path / "ckpt" / "milestones").iterdir())
+
+
+def test_milestones_are_written_at_their_steps_and_the_final_step_in_bf16(tmp_path):
+    trainer = build(tmp_path, make_data(tmp_path), milestones=(3, 7, 50))   # 50 never reached
+    trainer.run()
+    assert milestone_names(tmp_path) == ["step_000003.pt", "step_000007.pt", "step_000020.pt"]
+
+    state = torch.load(tmp_path / "ckpt" / "milestones" / "step_000020.pt", weights_only=True)
+    live = trainer.model.state_dict()
+    assert set(state) == set(live)                        # model weights only
+    assert all(v.dtype == torch.bfloat16 and v.device.type == "cpu" for v in state.values())
+    for k, v in state.items():
+        assert torch.equal(v, live[k].to(torch.bfloat16))
+    # The tied embedding / lm_head is stored once, not twice.
+    assert state["embed.weight"].data_ptr() == state["lm_head.weight"].data_ptr()
+    assert not list((tmp_path / "ckpt" / "milestones").glob("*.tmp"))
+
+
+def test_milestones_survive_checkpoint_pruning(tmp_path):
+    trainer = build(tmp_path, make_data(tmp_path), ckpt_keep=1, ckpt_every=1,
+                    milestones=(2, 4))
+    trainer.run()
+    assert sorted(p.name for p in (tmp_path / "ckpt").glob("step_*.pt")) == ["step_000020.pt"]
+    assert milestone_names(tmp_path) == ["step_000002.pt", "step_000004.pt", "step_000020.pt"]
+
+
+def test_milestones_are_never_used_for_resume(tmp_path):
+    data = make_data(tmp_path)
+    build(tmp_path, data, milestones=(3, 7)).run()
+    ckpt = tmp_path / "ckpt"
+    for p in list(ckpt.glob("step_*.pt")) + [ckpt / "latest.pt"]:
+        p.unlink()
+
+    b = build(tmp_path, data, resume=True, milestones=(3, 7))
+    b.resume_from_latest()
+    assert b.step == 0                     # started over; did not pick up a milestone
+    assert logged(tmp_path)["steps"] == []
+
+
+def test_a_resume_does_not_rewrite_existing_milestones(tmp_path, monkeypatch):
+    data = make_data(tmp_path)
+    a = build(tmp_path, data, milestones=(3, 7))
+    real_step = a.train_step
+
+    def crash_at_9():
+        if a.step == 9:
+            raise RuntimeError("power blip")
+        return real_step()
+
+    monkeypatch.setattr(a, "train_step", crash_at_9)
+    with pytest.raises(RuntimeError, match="power blip"):
+        a.run()
+    # Last checkpoint is step 5, so the resume re-runs step 7 (a milestone).
+    m7 = tmp_path / "ckpt" / "milestones" / "step_000007.pt"
+    before = (m7.stat().st_mtime_ns, hashlib.sha256(m7.read_bytes()).hexdigest())
+
+    b = build(tmp_path, data, resume=True, milestones=(3, 7))
+    b.resume_from_latest()
+    assert b.step == 5
+    b.run()
+    assert (m7.stat().st_mtime_ns, hashlib.sha256(m7.read_bytes()).hexdigest()) == before
+    assert milestone_names(tmp_path) == ["step_000003.pt", "step_000007.pt", "step_000020.pt"]
+    assert b.save_milestone() is None      # the final one exists now too
+
+
+def test_a_milestone_on_a_checkpoint_step_is_written_before_the_checkpoint(tmp_path, monkeypatch):
+    # If the checkpoint at step 10 landed first and the run then died writing
+    # milestone 10, the resume would start after step 10 and never write it.
+    data = make_data(tmp_path)
+    a = build(tmp_path, data, milestones=(10,))
+    real_save = Trainer.save_milestone
+
+    def dies_on_10(self):
+        if self.step == 10:
+            raise OSError("disk full")
+        return real_save(self)
+
+    monkeypatch.setattr(Trainer, "save_milestone", dies_on_10)
+    with pytest.raises(OSError):
+        a.run()
+    monkeypatch.setattr(Trainer, "save_milestone", real_save)
+
+    b = build(tmp_path, data, resume=True, milestones=(10,))
+    b.resume_from_latest()
+    assert b.step == 5
+    b.run()
+    assert milestone_names(tmp_path) == ["step_000010.pt", "step_000020.pt"]
+
+# ---- keep-awake ---------------------------------------------------------------
+
+AWAKE = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+
+
+def record_keep_awake(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    monkeypatch.setattr(train_mod, "_set_thread_execution_state", calls.append)
+    return calls
+
+
+def test_keep_awake_is_set_for_the_run_and_cleared_after(tmp_path, monkeypatch):
+    calls = record_keep_awake(monkeypatch)
+    trainer = build(tmp_path, make_data(tmp_path))
+    seen_during = []
+    real_step = trainer.train_step
+
+    def step():
+        seen_during.append(list(calls))
+        return real_step()
+
+    monkeypatch.setattr(trainer, "train_step", step)
+    trainer.run()
+    assert seen_during[0] == [AWAKE]
+    assert calls == [AWAKE, ES_CONTINUOUS]
+
+
+@pytest.mark.parametrize("exc", [NonFiniteStop("x"), RuntimeError("x"), KeyboardInterrupt()])
+def test_keep_awake_is_cleared_when_run_raises(tmp_path, monkeypatch, exc):
+    calls = record_keep_awake(monkeypatch)
+    trainer = build(tmp_path, make_data(tmp_path))
+
+    def boom():
+        raise exc
+
+    monkeypatch.setattr(trainer, "train_step", boom)
+    with pytest.raises(type(exc)):
+        trainer.run()
+    assert calls == [AWAKE, ES_CONTINUOUS]
+
+
+class _FakeKernel32:
+    def __init__(self):
+        self.calls = []
+
+    def SetThreadExecutionState(self, flags):
+        self.calls.append(flags)
+        return 1
+
+
+def _fake_ctypes(kernel32):
+    windll = type("windll", (), {"kernel32": kernel32})()
+    return type("ctypes", (), {"windll": windll})()
+
+
+def test_keep_awake_calls_the_windows_api_on_windows(monkeypatch):
+    kernel32 = _FakeKernel32()
+    monkeypatch.setattr(train_mod, "ctypes", _fake_ctypes(kernel32))
+    monkeypatch.setattr(train_mod.sys, "platform", "win32")
+    train_mod._set_thread_execution_state(AWAKE)
+    train_mod._set_thread_execution_state(ES_CONTINUOUS)
+    assert kernel32.calls == [0x80000001, 0x80000000]
+
+
+def test_keep_awake_does_nothing_elsewhere(monkeypatch):
+    kernel32 = _FakeKernel32()
+    monkeypatch.setattr(train_mod, "ctypes", _fake_ctypes(kernel32))
+    monkeypatch.setattr(train_mod.sys, "platform", "linux")
+    train_mod._set_thread_execution_state(AWAKE)
+    assert kernel32.calls == []

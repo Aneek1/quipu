@@ -48,3 +48,6 @@ ckpt_every    = 100
 ckpt_keep     = 3             # ~1.4 GB each (fp32 weights + AdamW moments)
 eval_every    = 100
 eval_batches  = 20
+# bf16 weights only (~230 MB each) in <ckpt_dir>/milestones/, plus the final step.
+# Never pruned, never used for resume; they feed scripts/milestone_eval.py.
+milestones    = [100, 250, 500, 1000, 2000, 4000]

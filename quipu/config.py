@@ -69,6 +69,9 @@ class TrainConfig:
     ckpt_keep: int
     eval_every: int
     eval_batches: int
+    # Steps at which bf16 weights are kept for post-run evaluation (the final step
+    # is always kept too). Separate from ckpt_*: never pruned, never resumed from.
+    milestones: tuple[int, ...] = ()
 
     @property
     def steps(self) -> int:
@@ -133,6 +136,21 @@ def _check_str_list(name: str, value: Any) -> None:
         raise ValueError(f"{name} has duplicate entries: {value!r}")
 
 
+def _check_milestones(value: Any, steps: int) -> None:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"milestones must be a list of ints, got {value!r}")
+    for m in value:
+        if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+            raise ValueError(f"milestones must be positive ints, got {m!r} in {value!r}")
+    if any(a >= b for a, b in zip(value, value[1:])):
+        raise ValueError(f"milestones must be strictly increasing, got {list(value)!r}")
+    if value and value[-1] >= steps:
+        raise ValueError(
+            f"milestones must all be less than steps ({steps}), got {list(value)!r}; "
+            "the final step is always kept as a milestone anyway"
+        )
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     if overrides:
@@ -152,7 +170,15 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
             _check_str_list(key, data_raw[key])
             data_raw[key] = tuple(data_raw[key])  # frozen config, immutable lists
     data = DataConfig(**data_raw)
-    train = TrainConfig(context=model.context, **raw["train"])
+    train_raw = dict(raw["train"])
+    if "milestones" in train_raw:
+        # Shape/type first, so the tuple() below cannot fail on a non-list; the
+        # comparison with steps waits until steps is known to be valid.
+        milestones = train_raw["milestones"]
+        if not isinstance(milestones, (list, tuple)):
+            raise ValueError(f"milestones must be a list of ints, got {milestones!r}")
+        train_raw["milestones"] = tuple(milestones)
+    train = TrainConfig(context=model.context, **train_raw)
 
     # Type/positivity checks must run before any division below (e.g. grad_accum's
     # micro_batch * context), so a bad value raises a clear ValueError instead of a
@@ -199,5 +225,6 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
         raise ValueError(
             f"warmup_steps ({train.warmup_steps}) must be less than steps ({train.steps})"
         )
+    _check_milestones(train.milestones, train.steps)
 
     return Config(name=raw["name"], model=model, data=data, train=train)

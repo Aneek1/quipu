@@ -5,14 +5,24 @@ training is written to survive the ordinary failures of a Windows laptop: checkp
 are swapped in atomically (with retry on transient antivirus/indexer locks), a failed
 log write is a warning rather than a crash, and old checkpoints are pruned so the
 run cannot fill the disk.
+
+Milestones are separate from resumable checkpoints: bf16 model weights only, in
+<ckpt_dir>/milestones/, never pruned and never resumed from. They exist for the
+post-run evaluation to see how the model changed over the run.
+
+Exit codes of `python -m quipu.train` (the weekend launcher decides whether to retry
+from these; see run_main): 0 completed, 1 any other crash, 2 a usage/config error,
+3 the non-finite stop, 130 an interrupt.
 """
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import math
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,9 +37,61 @@ from quipu.model import Quipu
 from quipu.runlog import RunLog
 
 LATEST = "latest.pt"
+MILESTONE_DIR = "milestones"
 PRINT_EVERY = 10
 MAX_NONFINITE_STREAK = 3
 _CKPT_NAME = re.compile(r"^step_(\d+)\.pt$")
+
+EXIT_OK = 0
+EXIT_CRASH = 1
+EXIT_USAGE = 2
+EXIT_NONFINITE = 3
+EXIT_INTERRUPTED = 130
+
+# SetThreadExecutionState flags (winbase.h).
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+class NonFiniteStop(RuntimeError):
+    """The non-finite guard gave up. Retrying from the last checkpoint would replay
+    the same data into the same weights and fail the same way, so it has its own
+    exit code (3) that the launcher does not retry."""
+
+
+class UsageError(Exception):
+    """A mistake in how the trainer was invoked (config, run id, --resume). Retrying
+    cannot fix it; it exits 2 with the message and no traceback."""
+
+
+class RunLogUnreadable(ValueError):
+    """--resume found no readable run log (RunLog raises ValueError for it)."""
+
+
+def _set_thread_execution_state(flags: int) -> None:
+    """Ask Windows not to sleep while training (the request a media player makes;
+    no system setting changes). A no-op elsewhere, and never fatal: a failed
+    keep-awake request is not a reason to stop a run."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except (AttributeError, OSError) as exc:
+        print(f"warning: keep-awake request failed: {exc}", file=sys.stderr, flush=True)
+
+
+def _bf16_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """CPU bf16 copy of the model's state_dict. Tensors that share storage (the tied
+    embedding / lm_head) stay shared, so torch.save writes them once."""
+    out: dict[str, torch.Tensor] = {}
+    seen: dict[tuple[int, torch.dtype, tuple[int, ...]], torch.Tensor] = {}
+    for k, v in model.state_dict().items():
+        key = (v.data_ptr(), v.dtype, tuple(v.shape))
+        if key not in seen:
+            v = v.detach()
+            seen[key] = v.to("cpu", torch.bfloat16) if v.is_floating_point() else v.cpu()
+        out[k] = seen[key]
+    return out
 
 
 def _atomic_save(obj: Any, path: Path) -> None:
@@ -95,7 +157,10 @@ class Trainer:
             "train": dataclasses.asdict(train_cfg),
             "derived": {"steps": train_cfg.steps, "grad_accum": train_cfg.grad_accum},
         }
-        self.log = RunLog(run_dir, run_id, config, resume=resume)
+        try:
+            self.log = RunLog(run_dir, run_id, config, resume=resume)
+        except ValueError as exc:
+            raise RunLogUnreadable(str(exc)) from exc
 
     # ---- logging -------------------------------------------------------------
 
@@ -108,7 +173,7 @@ class Trainer:
             print(
                 f"warning: run log write failed at step {self.step} "
                 f"({self.log_failures} so far): {exc}",
-                file=sys.stderr,
+                file=sys.stderr, flush=True,
             )
 
     # ---- optimisation --------------------------------------------------------
@@ -166,7 +231,7 @@ class Trainer:
                     file=sys.stderr, flush=True,
                 )
                 if self.nonfinite_streak >= MAX_NONFINITE_STREAK:
-                    raise RuntimeError(
+                    raise NonFiniteStop(
                         f"non-finite loss/grad for {MAX_NONFINITE_STREAK} consecutive "
                         f"steps at step {self.step}; stopping without checkpointing "
                         "poisoned weights"
@@ -232,10 +297,12 @@ class Trainer:
     def _prune_checkpoints(self, keep_name: str) -> None:
         """Keep the newest ckpt_keep step_*.pt files (~1.4 GB each); never delete the
         one latest.pt points to."""
+        # iterdir() is not recursive and the name must match step_NNNNNN.pt, so the
+        # milestones/ subdirectory (and everything in it) is never a candidate.
         found = []
         for p in self.ckpt_dir.iterdir():
             m = _CKPT_NAME.match(p.name)
-            if m:
+            if m and p.is_file():
                 found.append((int(m.group(1)), p))
         found.sort(reverse=True)
         for _, p in found[self.train_cfg.ckpt_keep :]:
@@ -245,7 +312,22 @@ class Trainer:
                 p.unlink()
             except OSError as exc:
                 # A locked old checkpoint is disk usage, not a reason to stop.
-                print(f"warning: could not delete old checkpoint {p}: {exc}", file=sys.stderr)
+                print(f"warning: could not delete old checkpoint {p}: {exc}",
+                      file=sys.stderr, flush=True)
+
+    def milestone_path(self, step: int) -> Path:
+        return self.ckpt_dir / MILESTONE_DIR / f"step_{step:06d}.pt"
+
+    def save_milestone(self) -> Path | None:
+        """bf16 weights at the current step, for post-run evaluation. A file that is
+        already there is left alone: a resumed run re-reaching a milestone step must
+        not rewrite what the first pass wrote (returns None then)."""
+        path = self.milestone_path(self.step)
+        if path.exists():
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_save(_bf16_state_dict(self.model), path)
+        return path
 
     def load_checkpoint(self, path: str | Path | None = None) -> None:
         if path is None:
@@ -265,14 +347,33 @@ class Trainer:
 
     def resume_from_latest(self) -> None:
         """Load the latest checkpoint and drop log entries past it: those steps are
-        about to be re-run and must not appear twice in the run log."""
+        about to be re-run and must not appear twice in the run log.
+
+        A run log with no checkpoint yet (the first attempt died before its first
+        save) restarts from step 0 rather than failing: the launcher resumes any run
+        id that has a log, and a crash would otherwise repeat on every retry."""
+        if not (self.ckpt_dir / LATEST).exists():
+            print(
+                f"no checkpoint in {self.ckpt_dir} yet; starting again from step 0",
+                flush=True,
+            )
+            self.log.truncate_to(0)
+            return
         self.load_checkpoint()
         self.log.truncate_to(self.step)
 
     # ---- the loop ------------------------------------------------------------
 
     def run(self) -> None:
+        _set_thread_execution_state(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        try:
+            self._run()
+        finally:
+            _set_thread_execution_state(ES_CONTINUOUS)
+
+    def _run(self) -> None:
         cfg = self.train_cfg
+        milestones = set(cfg.milestones)
         saved_at = None
         try:
             while self.step < cfg.steps:
@@ -284,9 +385,15 @@ class Trainer:
                     val = estimate_loss(self.model, self.val_stream, cfg.eval_batches, self.device)
                     self._safe_log(self.log.log_eval, self.step, val)
                     print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}", flush=True)
+                # Milestone before checkpoint: a resume from checkpoint N starts after
+                # step N, so milestone N must already be on disk by then.
+                if self.step in milestones or self.step == cfg.steps:
+                    self.save_milestone()
                 if self.step % cfg.ckpt_every == 0:
                     self.save_checkpoint()
                     saved_at = self.step
+            if self.step == cfg.steps:
+                self.save_milestone()      # no-op if the loop already wrote it
             if saved_at != self.step:
                 self.save_checkpoint()
             self._safe_log(self.log.finish, "completed")
@@ -301,17 +408,32 @@ class Trainer:
             raise
 
 
-def main() -> None:
+def _pick_device(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    # is_available() alone is not enough: with CUDA_VISIBLE_DEVICES="" it can report
+    # True with no device, and the first .to("cuda") fails.
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return "cuda"
+    return "cpu"
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Train. Raises on failure; run_main turns the outcome into an exit code."""
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/quipu-114m.toml")
     parser.add_argument("--run-id", default="quipu-114m-001")
     parser.add_argument("--resume", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--device", default="auto", help="auto (cuda if usable), cuda or cpu")
+    args = parser.parse_args(argv)
 
-    cfg: Config = load_config(args.config)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        cfg: Config = load_config(args.config)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise UsageError(f"bad config {args.config!r}: {exc}") from exc
+    device = _pick_device(args.device)
     try:
         trainer = Trainer(
             model_cfg=cfg.model, train_cfg=cfg.train,
@@ -320,16 +442,50 @@ def main() -> None:
             device=device, run_dir="results/runs", run_id=args.run_id,
             resume=args.resume,
         )
-    except FileExistsError:
-        sys.exit(
+    except FileExistsError as exc:
+        raise UsageError(
             f"run id {args.run_id!r} already has a log in results/runs; pass --resume "
             "to continue it or choose a new --run-id"
-        )
+        ) from exc
+    except RunLogUnreadable as exc:
+        raise UsageError(
+            f"{exc}; drop --resume to start a new run, or check the run id"
+        ) from exc
     if args.resume:
         trainer.resume_from_latest()
-        print(f"resumed at step {trainer.step}, stream position {trainer.stream.position}")
+        print(
+            f"resumed at step {trainer.step}, stream position {trainer.stream.position}",
+            flush=True,
+        )
     trainer.run()
 
 
+def run_main(argv: list[str] | None = None) -> int:
+    """main() with every outcome mapped to the exit code the launcher relies on:
+    0 completed, 1 any other crash, 2 usage/config error, 3 non-finite stop,
+    130 interrupt. Codes 2, 3 and 130 are not worth retrying; 1 may be."""
+    try:
+        main(argv)
+    except NonFiniteStop as exc:
+        print(f"stopped: {exc}", file=sys.stderr, flush=True)
+        return EXIT_NONFINITE
+    except UsageError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        print("interrupted; checkpoint saved if training had started", file=sys.stderr, flush=True)
+        return EXIT_INTERRUPTED
+    except SystemExit as exc:          # argparse: --help is 0, a bad argument is 2
+        if exc.code is None or isinstance(exc.code, int):
+            return exc.code or EXIT_OK
+        print(exc.code, file=sys.stderr, flush=True)
+        return EXIT_CRASH
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+        return EXIT_CRASH
+    return EXIT_OK
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(run_main())
