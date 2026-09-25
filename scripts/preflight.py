@@ -304,7 +304,10 @@ def run_milestone_eval_check(check: Checks, cfg: Config, tmp_path: Path) -> None
         return
 
     expected_steps = expected_milestone_steps(cfg.train)
-    expected_labels = [f"step_{s:06d}" for s in expected_steps] + ["final"]
+    # No separate "final" label: the trainer always writes a milestone at the final
+    # step, and milestone_eval drops the latest.pt entry when its weights equal that
+    # milestone's, so the finished model is evaluated once, as step_<final>.
+    expected_labels = [f"step_{s:06d}" for s in expected_steps]
     check_milestone_eval_output(check, out_dir, expected_labels, me.ALL_PROMPTS)
 
 
