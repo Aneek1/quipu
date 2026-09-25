@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quipu</title>
+<meta name="description" content="A small language model trained from scratch on one 8 GB laptop GPU.">
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1b18; --muted: #6b665e; --line: #e4e0d8;
+    --accent: #b4532a; --card: #ffffff; --code: #f3f0ea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141312; --fg: #ece8e1; --muted: #9c968c; --line: #2c2a27;
+      --accent: #e0875c; --card: #1b1a18; --code: #22201e;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141312; --fg: #ece8e1; --muted: #9c968c; --line: #2c2a27;
+    --accent: #e0875c; --card: #1b1a18; --code: #22201e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 80px; }
+  h1 { font-size: 44px; line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h2 { font-size: 22px; margin: 48px 0 12px; }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 20px; color: var(--muted); margin-bottom: 28px; }
+  .status {
+    display: inline-block; font-size: 14px; padding: 4px 12px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--accent); margin-bottom: 24px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .stat b { display: block; font-size: 22px; }
+  .stat span { color: var(--muted); font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: 14px; }
+  ul { padding-left: 20px; }
+  li { margin-bottom: 8px; }
+  a { color: var(--accent); }
+  .pending { border: 1px dashed var(--line); border-radius: 10px; padding: 16px; color: var(--muted); }
+  footer { margin-top: 56px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="status">Training in progress</div>
+  <h1>Quipu</h1>
+  <p class="lede">A small language model trained from scratch on a single 8 GB laptop GPU.</p>
+  <p>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands. Information mapped onto positions, retrieved by traversing them — which is the idea behind where this project is going.</p>
+
+  <h2>quipu-114m</h2>
+  <div class="grid">
+    <div class="stat"><b>114,114,048</b><span>parameters</span></div>
+    <div class="stat"><b>3B</b><span>training tokens</span></div>
+    <div class="stat"><b>8 GB</b><span>one laptop GPU</span></div>
+    <div class="stat"><b>~50 h</b><span>projected training time</span></div>
+  </div>
+
+  <h2>Architecture</h2>
+  <p>Decoder-only transformer: RMSNorm, rotary position embeddings, SwiGLU feed-forward, grouped-query attention (12 query heads over 4 key/value heads), tied input and output embeddings, 1,024-token context. Trained in bf16 at ~16,500 tokens per second.</p>
+
+  <h2>Data</h2>
+  <p>80% <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a> and 20% permissively licensed code from <a href="https://huggingface.co/datasets/codeparrot/github-code-clean">github-code-clean</a> (MIT, Apache-2.0, BSD, ISC, CC0, Unlicense only). Minified files, vendored directories and files over 16k tokens are filtered out — which removed as many tokens as the entire code budget.</p>
+  <table>
+    <tr><th>Language</th><th>Share of code</th></tr>
+    <tr><td>Java</td><td>34.7%</td></tr>
+    <tr><td>JavaScript</td><td>17.2%</td></tr>
+    <tr><td>Python</td><td>14.5%</td></tr>
+    <tr><td>PHP</td><td>12.4%</td></tr>
+    <tr><td>HTML (capped)</td><td>10.0%</td></tr>
+    <tr><td>Go, TypeScript, CSS, Shell, SQL, Dockerfile</td><td>11.2%</td></tr>
+  </table>
+
+  <h2>Results</h2>
+  <div class="pending">Training is running now. Loss curves, what the model can do at each training milestone, and a retrieval test over 1M tokens will be published here when it finishes.</div>
+
+  <h2>The failures that don't announce themselves</h2>
+  <p>Most of the work in a long unattended run is catching things that fail silently. Each of these was found in review, before the run:</p>
+  <ul>
+    <li>Attention was silently falling back to a slow kernel. Fixing it took the projected run for the original budget from ~65 hours to ~39.</li>
+    <li>On this machine, about 1 in 130 file renames fails transiently — enough to kill a 50-hour run over a log write. Every atomic write now retries.</li>
+    <li>A resume path could restart from zero after days of training without an error. It now refuses unless nothing could have been saved.</li>
+    <li>One non-finite batch would have poisoned the weights and, through checkpoint retention, deleted every clean checkpoint. Non-finite steps are now skipped, and three in a row stop the run.</li>
+  </ul>
+
+  <h2>What it will and won't do</h2>
+  <p>quipu-114m is a base model: fluent text and code-shaped output, frequently wrong, no instruction-following. That is the expected result at this scale, and the starting point.</p>
+
+  <h2>Next</h2>
+  <ul>
+    <li>Instruction tuning, so it answers rather than continues.</li>
+    <li>A memory architecture aimed at an effective 1M-token context on the same 8 GB card: a short attention window plus a retrievable map of everything before it.</li>
+    <li>350M parameters with a code tokenizer; tool calling for coding agents.</li>
+  </ul>
+
+  <footer>
+    Models: <a href="https://huggingface.co/quipu-lm">huggingface.co/quipu-lm</a>
+  </footer>
+</main>
+</body>
+</html>
