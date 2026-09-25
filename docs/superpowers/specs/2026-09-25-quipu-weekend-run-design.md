@@ -127,3 +127,11 @@ Neither is a pretraining concern; neither changes the weekend run.
 
 - **Document upload** — ingestion (PDF/DOCX text extraction → chunks) into the same memory store approach A builds, so answers come from the uploaded document. Reuse the ingestion/retrieval/citation design from the owner's soft-robotics chatbot rather than rebuilding it.
 - **Image generation** — a text model cannot emit pixels, and training an image generator from scratch is out of reach on 8 GB. Route: Quipu calls an image model **as a tool** through the same tool-calling/MCP path — a local model that fits in 8 GB (never concurrently with training), or an external API behind an explicit opt-in because the prompt leaves the machine.
+
+### Roadmap requirements recorded 2026-09-25: Quipu-Vision and Quipu-Image
+
+The owner wants a separate Quipu image model working together with Quipu, VLM-style. Two sub-projects, each with its own design pass, neither using the GPU during the weekend run:
+
+- **Sub-project 5 — Quipu-Vision (image understanding, first):** LLaVA-style — vision encoder → trained projector → Quipu. Start with a small pretrained, permissively licensed encoder and train only the projector plus a Quipu fine-tune on image–caption pairs (fits 8 GB; days). A from-scratch tiny ViT encoder is a later option. Pairs with document upload (diagrams in uploaded PDFs).
+- **Sub-project 6 — Quipu-Image (image generation):** a small from-scratch diffusion model (~30M parameters, ~256 px) that Quipu drives through tool calls. Expect recognisable but crude images, best in a narrow domain; broad high-quality text-to-image is out of reach at this compute.
+- **Both:** every image dataset is licence- and provenance-checked before use.
