@@ -5,105 +5,275 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quipu</title>
 <meta name="description" content="A small language model trained from scratch on one 8 GB laptop GPU.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #fbfaf7; --fg: #1d1b18; --muted: #6b665e; --line: #e4e0d8;
-    --accent: #b4532a; --card: #ffffff; --code: #f3f0ea;
+    --bg: #f7f3ec; --bg2: #efe8dc; --fg: #1f1a15; --muted: #6f665b; --line: #ddd3c3;
+    --card: #fffdf9; --accent: #b4532a; --accent2: #2f6f6a; --gold: #c8962e; --plum: #7a4a6e;
+    --code: #efe8dc;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #141312; --fg: #ece8e1; --muted: #9c968c; --line: #2c2a27;
-      --accent: #e0875c; --card: #1b1a18; --code: #22201e;
+      --bg: #13110f; --bg2: #1b1815; --fg: #eee8de; --muted: #a39a8d; --line: #2e2a25;
+      --card: #1a1714; --accent: #e3875c; --accent2: #5fb3aa; --gold: #e0b454; --plum: #c58db6;
+      --code: #221e1a;
     }
   }
   :root[data-theme="dark"] {
-    --bg: #141312; --fg: #ece8e1; --muted: #9c968c; --line: #2c2a27;
-    --accent: #e0875c; --card: #1b1a18; --code: #22201e;
+    --bg: #13110f; --bg2: #1b1815; --fg: #eee8de; --muted: #a39a8d; --line: #2e2a25;
+    --card: #1a1714; --accent: #e3875c; --accent2: #5fb3aa; --gold: #e0b454; --plum: #c58db6;
+    --code: #221e1a;
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
-    font: 17px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif;
+    font: 17px/1.65 Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
   }
-  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 80px; }
-  h1 { font-size: 44px; line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
-  h2 { font-size: 22px; margin: 48px 0 12px; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+  a { color: var(--accent); text-underline-offset: 3px; }
+  .mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
+
+  /* nav */
+  nav { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; }
+  .brand { font-family: Fraunces, Georgia, serif; font-weight: 600; font-size: 20px; color: var(--fg); text-decoration: none; }
+  nav .links a { color: var(--muted); text-decoration: none; font-size: 15px; margin-left: 20px; }
+  nav .links a:hover { color: var(--fg); }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: 1.1fr 1fr; gap: 40px; align-items: center; padding: 40px 0 56px; }
+  .status { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; letter-spacing: .02em;
+    padding: 5px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); box-shadow: 0 0 0 0 var(--accent2); animation: pulse 2s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent2) 60%, transparent); } 70% { box-shadow: 0 0 0 8px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
+  h1 { font-family: Fraunces, Georgia, serif; font-weight: 600; font-size: clamp(44px, 8vw, 76px); line-height: 1; letter-spacing: -0.02em; margin: 18px 0 16px; }
+  .lede { font-size: 21px; line-height: 1.5; color: var(--fg); margin: 0 0 14px; max-width: 30ch; }
+  .sub { color: var(--muted); margin: 0 0 26px; }
+  .cta { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn { display: inline-block; padding: 10px 18px; border-radius: 10px; font-weight: 500; font-size: 15px; text-decoration: none; }
+  .btn.primary { background: var(--fg); color: var(--bg); }
+  .btn.ghost { border: 1px solid var(--line); color: var(--fg); background: var(--card); }
+
+  .quipu-fig { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px 14px 10px; }
+  .quipu-fig svg { width: 100%; height: auto; display: block; }
+  .quipu-fig figcaption { font-size: 13px; color: var(--muted); padding: 8px 6px 4px; line-height: 1.5; }
+
+  /* sections */
+  section { padding: 56px 0; border-top: 1px solid var(--line); }
+  .kicker { font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 600; margin: 0 0 8px; }
+  h2 { font-family: Fraunces, Georgia, serif; font-weight: 600; font-size: clamp(28px, 4vw, 36px); line-height: 1.15; margin: 0 0 16px; letter-spacing: -0.01em; }
   p { margin: 0 0 14px; }
-  .lede { font-size: 20px; color: var(--muted); margin-bottom: 28px; }
-  .status {
-    display: inline-block; font-size: 14px; padding: 4px 12px; border-radius: 999px;
-    border: 1px solid var(--line); color: var(--accent); margin-bottom: 24px;
-  }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
-  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
-  .stat b { display: block; font-size: 22px; }
+  .muted { color: var(--muted); }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 24px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .stat b { display: block; font-family: "JetBrains Mono", ui-monospace, monospace; font-weight: 500; font-size: 24px; letter-spacing: -0.02em; }
   .stat span { color: var(--muted); font-size: 14px; }
-  table { width: 100%; border-collapse: collapse; font-size: 15px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 600; }
-  code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: 14px; }
-  ul { padding-left: 20px; }
-  li { margin-bottom: 8px; }
-  a { color: var(--accent); }
-  .pending { border: 1px dashed var(--line); border-radius: 10px; padding: 16px; color: var(--muted); }
-  footer { margin-top: 56px; color: var(--muted); font-size: 14px; }
+
+  /* architecture stack */
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
+  .stack { display: flex; flex-direction: column; gap: 6px; }
+  .layer { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 10px 14px; display: flex; justify-content: space-between; gap: 12px; font-size: 15px; }
+  .layer small { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 12.5px; text-align: right; }
+  .layer.block { border-left: 4px solid var(--accent2); }
+  .layer.io { border-left: 4px solid var(--gold); }
+  .repeat { font-size: 13px; color: var(--muted); text-align: center; padding: 2px 0; font-family: "JetBrains Mono", monospace; }
+
+  /* data mix */
+  .mixbar { display: flex; height: 18px; border-radius: 999px; overflow: hidden; margin: 18px 0 8px; border: 1px solid var(--line); }
+  .mixbar div { height: 100%; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; color: var(--muted); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: 0; }
+  .langs { margin-top: 26px; display: grid; gap: 8px; }
+  .lang { display: grid; grid-template-columns: 170px 1fr 56px; gap: 12px; align-items: center; font-size: 14.5px; }
+  .lang .track { height: 10px; background: var(--bg2); border-radius: 999px; overflow: hidden; }
+  .lang .fill { height: 100%; border-radius: 999px; background: var(--accent); }
+  .lang .pct { font-family: "JetBrains Mono", monospace; font-size: 13.5px; text-align: right; color: var(--muted); }
+
+  /* failures */
+  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 22px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .card .n { font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--accent); }
+  .card h3 { font-size: 17px; margin: 6px 0 8px; line-height: 1.35; }
+  .card p { color: var(--muted); font-size: 15px; margin: 0; }
+
+  .pending { border: 1px dashed var(--line); border-radius: 14px; padding: 22px; background: var(--card); }
+  .pending ul { margin: 10px 0 0; padding-left: 20px; color: var(--muted); }
+
+  .roadmap { list-style: none; padding: 0; margin: 22px 0 0; display: grid; gap: 0; }
+  .roadmap li { display: grid; grid-template-columns: 28px 1fr; gap: 14px; padding-bottom: 20px; position: relative; }
+  .roadmap li::before { content: ""; position: absolute; left: 8px; top: 20px; bottom: 0; width: 2px; background: var(--line); }
+  .roadmap li:last-child::before { display: none; }
+  .roadmap .k { width: 18px; height: 18px; border-radius: 50%; border: 3px solid var(--accent2); background: var(--bg); margin-top: 4px; }
+  .roadmap li.now .k { background: var(--accent2); }
+  .roadmap b { display: block; }
+  .roadmap span { color: var(--muted); font-size: 15px; }
+
+  footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--muted); font-size: 14px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+
+  @media (max-width: 820px) {
+    .hero, .two { grid-template-columns: 1fr; gap: 28px; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .cards { grid-template-columns: 1fr; }
+    .lang { grid-template-columns: 120px 1fr 50px; }
+    nav .links a { margin-left: 14px; }
+  }
+  @media (max-width: 420px) { nav .links a:not(:last-child) { display: none; } }
 </style>
 </head>
 <body>
-<main>
-  <div class="status">Training in progress</div>
-  <h1>Quipu</h1>
-  <p class="lede">A small language model trained from scratch on a single 8 GB laptop GPU.</p>
-  <p>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands. Information mapped onto positions, retrieved by traversing them — which is the idea behind where this project is going.</p>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="#">quipu</a>
+    <div class="links">
+      <a href="#model">Model</a>
+      <a href="#data">Data</a>
+      <a href="#next">Next</a>
+      <a href="https://huggingface.co/quipu-lm">Hugging Face</a>
+    </div>
+  </nav>
 
-  <h2>quipu-114m</h2>
-  <div class="grid">
-    <div class="stat"><b>114,114,048</b><span>parameters</span></div>
-    <div class="stat"><b>3B</b><span>training tokens</span></div>
-    <div class="stat"><b>8 GB</b><span>one laptop GPU</span></div>
-    <div class="stat"><b>~50 h</b><span>projected training time</span></div>
-  </div>
+  <header class="hero">
+    <div>
+      <span class="status"><span class="dot"></span>First training run: 25–27 Sep 2026</span>
+      <h1>Quipu</h1>
+      <p class="lede">A small language model, trained from scratch on a single 8&nbsp;GB laptop GPU.</p>
+      <p class="sub">Own weights, own data pipeline, no fine-tuned base. The goal is a small model that pulls well above its size by remembering instead of memorising.</p>
+      <div class="cta">
+        <a class="btn primary" href="#model">See the model</a>
+        <a class="btn ghost" href="https://huggingface.co/quipu-lm">huggingface.co/quipu-lm</a>
+      </div>
+    </div>
+    <figure class="quipu-fig" style="margin:0">
+      <svg id="quipu" viewBox="0 0 440 300" role="img" aria-label="A quipu whose cords record the share of each programming language in the code data"></svg>
+      <figcaption>The code mix, recorded the Incan way: one cord per language, clusters of knots for tens (upper) and units (lower). Java's cord reads 3 and 5, for 35%.</figcaption>
+    </figure>
+  </header>
 
-  <h2>Architecture</h2>
-  <p>Decoder-only transformer: RMSNorm, rotary position embeddings, SwiGLU feed-forward, grouped-query attention (12 query heads over 4 key/value heads), tied input and output embeddings, 1,024-token context. Trained in bf16 at ~16,500 tokens per second.</p>
+  <section id="model">
+    <p class="kicker">quipu-114m</p>
+    <h2>A 114M-parameter decoder, sized for one laptop.</h2>
+    <p class="muted">Every number here is measured on the machine that trains it, an RTX 5060 Laptop GPU with 8 GB.</p>
+    <div class="stats">
+      <div class="stat"><b>114,114,048</b><span>parameters</span></div>
+      <div class="stat"><b>3B</b><span>training tokens</span></div>
+      <div class="stat"><b>~16.5k</b><span>tokens / second, bf16</span></div>
+      <div class="stat"><b>~50 h</b><span>projected training time</span></div>
+    </div>
 
-  <h2>Data</h2>
-  <p>80% <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a> and 20% permissively licensed code from <a href="https://huggingface.co/datasets/codeparrot/github-code-clean">github-code-clean</a> (MIT, Apache-2.0, BSD, ISC, CC0, Unlicense only). Minified files, vendored directories and files over 16k tokens are filtered out — which removed as many tokens as the entire code budget.</p>
-  <table>
-    <tr><th>Language</th><th>Share of code</th></tr>
-    <tr><td>Java</td><td>34.7%</td></tr>
-    <tr><td>JavaScript</td><td>17.2%</td></tr>
-    <tr><td>Python</td><td>14.5%</td></tr>
-    <tr><td>PHP</td><td>12.4%</td></tr>
-    <tr><td>HTML (capped)</td><td>10.0%</td></tr>
-    <tr><td>Go, TypeScript, CSS, Shell, SQL, Dockerfile</td><td>11.2%</td></tr>
-  </table>
+    <div class="two" style="margin-top:40px">
+      <div>
+        <h2 style="font-size:26px">Architecture</h2>
+        <p>Decoder-only transformer in the modern style: RMSNorm, rotary position embeddings, SwiGLU feed-forward, and grouped-query attention with 12 query heads sharing 4 key/value heads. Input and output embeddings are tied, and the context is 1,024 tokens.</p>
+        <p class="muted">Short context by design. Long-range recall is meant to come from memory rather than a longer attention window.</p>
+      </div>
+      <div class="stack" aria-label="Model layer stack">
+        <div class="layer io">Token embedding <small>tied with output</small></div>
+        <div class="layer block">RMSNorm → Attention <small>GQA 12q / 4kv · RoPE</small></div>
+        <div class="layer block">RMSNorm → Feed-forward <small>SwiGLU</small></div>
+        <div class="repeat">× N blocks</div>
+        <div class="layer">Final RMSNorm</div>
+        <div class="layer io">Output head <small>shares embedding weights</small></div>
+      </div>
+    </div>
+  </section>
 
-  <h2>Results</h2>
-  <div class="pending">Training is running now. Loss curves, what the model can do at each training milestone, and a retrieval test over 1M tokens will be published here when it finishes.</div>
+  <section id="data">
+    <p class="kicker">Data</p>
+    <h2>Three billion tokens: mostly text, one-fifth code.</h2>
+    <p>80% <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a>, 20% code from <a href="https://huggingface.co/datasets/codeparrot/github-code-clean">github-code-clean</a>. Only permissive licences are kept: MIT, Apache-2.0, BSD, ISC, CC0 and Unlicense. Minified files, vendored directories and files over 16k tokens are filtered out. That filter alone removed as many tokens as the entire code budget.</p>
+    <div class="mixbar" aria-hidden="true">
+      <div style="width:80%;background:var(--accent2)"></div>
+      <div style="width:20%;background:var(--accent)"></div>
+    </div>
+    <div class="legend"><span><i style="background:var(--accent2)"></i>Educational web text · 80%</span><span><i style="background:var(--accent)"></i>Code · 20%</span></div>
 
-  <h2>The failures that don't announce themselves</h2>
-  <p>Most of the work in a long unattended run is catching things that fail silently. Each of these was found in review, before the run:</p>
-  <ul>
-    <li>Attention was silently falling back to a slow kernel. Fixing it took the projected run for the original budget from ~65 hours to ~39.</li>
-    <li>On this machine, about 1 in 130 file renames fails transiently — enough to kill a 50-hour run over a log write. Every atomic write now retries.</li>
-    <li>A resume path could restart from zero after days of training without an error. It now refuses unless nothing could have been saved.</li>
-    <li>One non-finite batch would have poisoned the weights and, through checkpoint retention, deleted every clean checkpoint. Non-finite steps are now skipped, and three in a row stop the run.</li>
-  </ul>
+    <div class="langs" id="langs" aria-label="Share of code by language"></div>
+    <p class="muted" style="font-size:14px;margin-top:14px">HTML is capped at 10% so markup doesn't crowd out the languages the model should actually learn to write.</p>
+  </section>
 
-  <h2>What it will and won't do</h2>
-  <p>quipu-114m is a base model: fluent text and code-shaped output, frequently wrong, no instruction-following. That is the expected result at this scale, and the starting point.</p>
+  <section>
+    <p class="kicker">Engineering</p>
+    <h2>The failures that don't announce themselves.</h2>
+    <p class="muted">Most of the work in a long unattended run is catching things that fail silently. Each of these was found in review, before the run.</p>
+    <div class="cards">
+      <div class="card"><span class="n">01 · speed</span><h3>Attention was quietly using a slow kernel.</h3><p>Fixing the fallback took the projected run for the original budget from ~65 hours to ~39.</p></div>
+      <div class="card"><span class="n">02 · I/O</span><h3>About 1 in 130 file renames fails transiently.</h3><p>That is enough to kill a 50-hour run over a log write. Every atomic write now retries.</p></div>
+      <div class="card"><span class="n">03 · resume</span><h3>A resume could restart from zero, silently.</h3><p>After days of training, with no error. It now refuses unless nothing could have been saved.</p></div>
+      <div class="card"><span class="n">04 · numerics</span><h3>One bad batch could have deleted every clean checkpoint.</h3><p>Non-finite steps are now skipped, and three in a row stop the run before retention prunes the good ones.</p></div>
+    </div>
+  </section>
 
-  <h2>Next</h2>
-  <ul>
-    <li>Instruction tuning, so it answers rather than continues.</li>
-    <li>A memory architecture aimed at an effective 1M-token context on the same 8 GB card: a short attention window plus a retrievable map of everything before it.</li>
-    <li>350M parameters with a code tokenizer; tool calling for coding agents.</li>
-  </ul>
+  <section>
+    <p class="kicker">Results</p>
+    <h2>Pending: the run is in progress.</h2>
+    <div class="pending">
+      Published here when training finishes:
+      <ul>
+        <li>Loss curves for text and code validation</li>
+        <li>What the model writes at each milestone, from step 100 to the end</li>
+        <li>A retrieval test hiding one fact in up to 1M tokens</li>
+      </ul>
+    </div>
+    <p class="muted" style="margin-top:18px">quipu-114m is a base model. Expect fluent text and code-shaped output that is often wrong, and no instruction-following. That is the expected result at this scale, and the starting point.</p>
+  </section>
+
+  <section id="next">
+    <p class="kicker">Next</p>
+    <h2>Where it goes from here.</h2>
+    <ol class="roadmap">
+      <li class="now"><span class="k"></span><div><b>Pretraining at 114M</b><span>3B tokens, validating the whole pipeline end to end.</span></div></li>
+      <li><span class="k"></span><div><b>Memory for a 1M-token effective context</b><span>A short attention window plus a retrievable map of everything before it, on the same 8 GB card.</span></div></li>
+      <li><span class="k"></span><div><b>Instruction tuning</b><span>So it answers rather than continues.</span></div></li>
+      <li><span class="k"></span><div><b>350M with a code tokenizer and tool calling</b><span>Aimed at driving coding agents.</span></div></li>
+    </ol>
+  </section>
 
   <footer>
-    Models: <a href="https://huggingface.co/quipu-lm">huggingface.co/quipu-lm</a>
+    <span>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands.</span>
+    <span>Models: <a href="https://huggingface.co/quipu-lm">huggingface.co/quipu-lm</a></span>
   </footer>
-</main>
+</div>
+
+<script>
+  // Code-share data, from the build manifest.
+  const LANGS = [
+    ["Java", 34.69], ["JavaScript", 17.19], ["Python", 14.51], ["PHP", 12.38],
+    ["HTML (capped)", 10.00], ["Go", 4.24], ["TypeScript", 2.78], ["CSS", 2.76],
+    ["Shell", 0.84], ["SQL", 0.53], ["Dockerfile", 0.08]
+  ];
+
+  const langs = document.getElementById("langs");
+  const max = LANGS[0][1];
+  for (const [name, pct] of LANGS) {
+    const row = document.createElement("div");
+    row.className = "lang";
+    row.innerHTML = `<span>${name}</span><span class="track"><span class="fill" style="display:block;width:${Math.max(pct / max * 100, 0.8)}%"></span></span><span class="pct">${pct.toFixed(pct < 1 ? 2 : 1)}%</span>`;
+    langs.appendChild(row);
+  }
+
+  // Quipu: a main cord with pendant cords; knots encode the rounded share in tens and units.
+  const svg = document.getElementById("quipu");
+  const NS = "http://www.w3.org/2000/svg";
+  const colors = ["--accent", "--accent2", "--gold", "--plum"];
+  const el = (tag, attrs) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); svg.appendChild(n); return n; };
+
+  const cords = LANGS.slice(0, 8);
+  const x0 = 38, gap = (440 - 2 * x0) / (cords.length - 1), cordTop = 34;
+  el("path", { d: `M10 ${cordTop} Q220 ${cordTop - 16} 430 ${cordTop}`, stroke: "var(--fg)", "stroke-width": 4, fill: "none", "stroke-linecap": "round" });
+  cords.forEach(([name, pct], i) => {
+    const x = x0 + i * gap, v = Math.round(pct), tens = Math.floor(v / 10), units = v % 10;
+    const color = `var(${colors[i % colors.length]})`;
+    const sway = (i % 2 ? 1 : -1) * 3;
+    el("path", { d: `M${x} ${cordTop - 2} C${x + sway} 110 ${x - sway} 200 ${x} 262`, stroke: color, "stroke-width": 3, fill: "none", "stroke-linecap": "round" });
+    for (let k = 0; k < tens; k++) el("circle", { cx: x, cy: 78 + k * 11, r: 5, fill: color });
+    for (let k = 0; k < units; k++) el("ellipse", { cx: x, cy: 150 + k * 10, rx: 4.2, ry: 3.4, fill: color });
+    const t = el("text", { x, y: 284, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": "Inter, sans-serif" });
+    t.textContent = name.replace(" (capped)", "").replace("JavaScript", "JS").replace("TypeScript", "TS");
+  });
+</script>
 </body>
 </html>
