@@ -171,6 +171,24 @@ def test_check_milestones_fails_when_load_state_dict_would_break_the_tie(tmp_pat
     assert check.failed >= 1
 
 
+def test_check_milestones_fails_on_empty_milestones_dir(tmp_path, capsys):
+    """No milestones/ directory at all (the loop over `found` never runs) must not
+    leave bf16_ok/load_ok at their initial True -- both must fail. Asserted on the
+    printed PASS/FAIL lines for those two specific checks (not just the aggregate
+    failure count), since the "milestone files exist" and pruning checks also fail
+    here and would otherwise mask a bf16_ok/load_ok mutation that stayed True."""
+    cfg = build_cfg(tmp_path, milestones=(2, 4), ckpt_keep=2)
+    ckpt_dir = Path(cfg.train.ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)  # ckpt_dir exists; milestones/ does not
+
+    check = preflight.Checks()
+    preflight.check_milestones(check, cfg, ckpt_dir)
+    out = capsys.readouterr().out
+
+    assert "FAIL  milestones are bf16" in out
+    assert "FAIL  milestones load into Quipu(cfg.model) strict=True with tie intact" in out
+
+
 def test_check_milestones_fails_when_nothing_was_pruned():
     """If ckpt_keep is generous enough that every milestone step's resumable
     checkpoint is still on disk, the pruning-survival check can't demonstrate
@@ -270,6 +288,19 @@ def test_check_milestone_eval_output_fails_on_non_finite_loss(tmp_path):
     preflight.check_milestone_eval_output(check, out_dir, labels, ["def fibonacci(n):"])
 
     assert check.failed >= 1
+
+
+def test_check_milestone_eval_output_fails_on_empty_checkpoints_list(tmp_path):
+    """An empty but well-formed `checkpoints: []` must not leave the finite-loss
+    checks unexercised and passing -- there is nothing to have verified."""
+    out_dir = tmp_path / "out"
+    _write_metrics(out_dir, [])
+    _write_samples(out_dir, ["def fibonacci(n):"])
+
+    check = preflight.Checks()
+    preflight.check_milestone_eval_output(check, out_dir, [], ["def fibonacci(n):"])
+
+    assert check.failed >= 2, "both finite-loss checks must fail on zero checkpoints"
 
 
 def test_check_milestone_eval_output_skips_finite_check_for_a_failed_checkpoint(tmp_path):

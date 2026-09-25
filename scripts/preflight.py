@@ -126,8 +126,12 @@ def check_milestones(check: Checks, cfg: Config, ckpt_dir: Path) -> None:
         f"expected {expected}" + (f", missing {missing}" if missing else ", all present"),
     )
 
-    bf16_ok, bf16_detail = True, []
-    load_ok, load_detail = True, []
+    # Zero milestones found (e.g. the "milestone files exist" check above already
+    # failed) must not read as "verified bf16/tie for all zero of them" -- an
+    # empty loop below would otherwise leave both flags at their initial True and
+    # pass vacuously, so seed them as already-failed in that case.
+    bf16_ok, bf16_detail = (True, []) if found else (False, ["no milestones found"])
+    load_ok, load_detail = (True, []) if found else (False, ["no milestones found"])
     for step, path in found.items():
         try:
             state = torch.load(path, map_location="cpu", weights_only=True)
@@ -235,10 +239,18 @@ def check_milestone_eval_output(
         )
 
         def _finite_check(name: str, key: str) -> None:
+            successful = [m for m in metrics if "error" not in m]
+            if not successful:
+                # Zero successful checkpoints (an empty checkpoints list, or every
+                # entry failed) must not read as "verified finite for all zero of
+                # them" -- filtering an empty/all-error list leaves `bad` empty too,
+                # which would otherwise pass vacuously.
+                check(name, False, "no successful checkpoints to check")
+                return
             bad = [
                 f"{m.get('label')}: {m.get(key)!r}"
-                for m in metrics
-                if "error" not in m and not (isinstance(m.get(key), (int, float)) and math.isfinite(m[key]))
+                for m in successful
+                if not (isinstance(m.get(key), (int, float)) and math.isfinite(m[key]))
             ]
             check(name, not bad, "; ".join(bad) or "all finite")
 
