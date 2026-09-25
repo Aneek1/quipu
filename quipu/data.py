@@ -35,11 +35,24 @@ def write_shard(path: str | Path, tokens: np.ndarray) -> None:
     replace_with_retry(tmp, path)
 
 
-def read_shard(path: str | Path) -> np.ndarray:
+def shard_token_count(path: str | Path) -> int:
+    """Validate a shard's byte count and return its token count.
+
+    The single source of truth for "is this a well-formed shard": both the
+    eager reader below and the memmap-based loader route through this before
+    touching file contents, so a truncated shard is rejected the same way
+    everywhere.
+    """
     path = Path(path)
     size = path.stat().st_size
     if size % 2:
         raise ValueError(f"{path}: odd byte count, truncated shard")
+    return size // 2
+
+
+def read_shard(path: str | Path) -> np.ndarray:
+    path = Path(path)
+    shard_token_count(path)  # validates; raises ValueError on a truncated shard
     return np.fromfile(path, dtype="<u2")
 
 
