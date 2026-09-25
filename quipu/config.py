@@ -48,6 +48,9 @@ class DataConfig:
     code_val_tokens: int
     code_heldout_first_file: int
     code_files_total: int
+    # Code documents longer than this many tokens are skipped (vendored bundles,
+    # data blobs, generated files). Defaulted so configs written before it load.
+    code_max_doc_tokens: int = 16_000
 
 
 @dataclasses.dataclass(frozen=True)

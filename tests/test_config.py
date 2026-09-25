@@ -145,6 +145,7 @@ def test_code_mix_fields_are_loaded():
     assert d.code_dataset == "codeparrot/github-code-clean"
     assert d.code_share == 0.2
     assert d.html_cap == 0.1
+    assert d.code_max_doc_tokens == 16_000
     assert d.code_val_tokens == 5_000_000
     assert (d.code_heldout_first_file, d.code_files_total) == (840, 880)
     assert d.code_languages == ("Python", "JavaScript", "TypeScript", "HTML", "CSS",
@@ -229,3 +230,17 @@ def test_milestones_may_be_empty():
 def test_bad_milestones_are_rejected(milestones, match):
     with pytest.raises(ValueError, match=match):
         load_config(CONFIG, overrides={"train": {"milestones": milestones}})
+
+
+@pytest.mark.parametrize("value", [0, -1, 16_000.0, True, "16000"])
+def test_code_max_doc_tokens_must_be_a_positive_int(value):
+    with pytest.raises(ValueError, match="code_max_doc_tokens"):
+        load_config(CONFIG, overrides={"data": {"code_max_doc_tokens": value}})
+
+
+def test_code_max_doc_tokens_defaults_to_16000(tmp_path):
+    lines = CONFIG.read_text(encoding="utf-8").splitlines()
+    cfg = tmp_path / "no_max_doc.toml"
+    cfg.write_text("\n".join(l for l in lines if not l.startswith("code_max_doc_tokens")),
+                   encoding="utf-8")
+    assert load_config(cfg).data.code_max_doc_tokens == 16_000

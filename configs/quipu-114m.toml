@@ -27,6 +27,7 @@ code_languages  = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "PHP",
 code_licenses   = ["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
                    "cc0-1.0", "unlicense"]
 html_cap        = 0.1
+code_max_doc_tokens = 16_000   # longer code files are skipped (bundles, data blobs)
 code_val_tokens = 5_000_000
 code_heldout_first_file = 840   # files 840..879 are code val only; train never opens them
 code_files_total        = 880

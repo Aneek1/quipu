@@ -224,9 +224,11 @@ def code_rows(count, *, seed=1, start=0, html_every=0, langs=("Python", "JavaScr
     return rows
 
 
-def spec(train_rows, val_rows, *, share=0.2, html_cap=0.1, warmup=2_000, val_tokens=20_000):
+def spec(train_rows, val_rows, *, share=0.2, html_cap=0.1, warmup=2_000, val_tokens=20_000,
+         max_doc_tokens=10_000):
     return bs.CodeSpec(share=share, languages=KEPT_LANGS, licenses=KEPT_LICENSES,
-                       html_cap=html_cap, val_tokens=val_tokens, train_rows=train_rows,
+                       html_cap=html_cap, max_doc_tokens=max_doc_tokens,
+                       val_tokens=val_tokens, train_rows=train_rows,
                        val_rows=lambda: iter(val_rows), heldout_first_file=8,
                        files_total=10, html_warmup=warmup)
 
@@ -293,7 +295,7 @@ def test_html_cap_holds_in_train_and_code_val(tmp_path):
 def test_html_is_admitted_during_the_warmup():
     rows = [{"code": f"C{i}:100", "language": "HTML", "license": "mit"} for i in range(30)]
     docs = bs.CodeDocs(iter(rows), MixTok(), languages=KEPT_LANGS, licenses=KEPT_LICENSES,
-                       html_cap=0.1, html_warmup=1_000)
+                       html_cap=0.1, max_doc_tokens=10_000, html_warmup=1_000)
     got = list(docs)
     # 101 tokens each (with EOT): admitted until 1,000 code tokens, then capped.
     assert len(got) == 10 and docs.stats["skipped_html_cap"] == 20
@@ -313,7 +315,7 @@ def test_language_and_license_filters():
         {"code": "C9:5", "language": "JavaScript", "license": "apache-2.0"},  # kept
     ]
     docs = bs.CodeDocs(iter(rows), MixTok(), languages=KEPT_LANGS, licenses=KEPT_LICENSES,
-                       html_cap=0.1)
+                       html_cap=0.1, max_doc_tokens=10_000)
     got = [(int(a[0]) - CODE_BASE, label) for a, label in docs]
     assert got == [(0, "code:Python"), (4, "code:GO"), (9, "code:JavaScript")]
     assert docs.stats == {"rows_scanned": 10, "dropped_language": 3, "dropped_license": 3,
@@ -458,3 +460,114 @@ def test_lower_priority_sets_below_normal():
 
     assert bs.lower_priority(K32()) is True
     assert calls == [("me", 0x4000)]
+
+
+# ------------------------------------------------- vendored / minified / too long
+
+@pytest.mark.parametrize("path, reason", [
+    ("static/js/app.min.js", "minified"),
+    ("static/css/Site.MIN.CSS", "minified"),
+    ("assets/app.js.map", "minified"),
+    ("styles/main.css.map", "minified"),
+    ("lib/vendor/jquery.js", "vendored"),
+    ("web/node_modules/react/index.js", "vendored"),
+    ("Node_Modules/x.js", "vendored"),
+    ("dist/app.js", "vendored"),
+    ("a/build/gen.py", "vendored"),
+    ("public/bower_components/ng/ng.js", "vendored"),
+    ("src/third_party/zlib.go", "vendored"),
+    ("external/lib.php", "vendored"),
+    ("vendor\\autoload.php", "vendored"),          # Windows separators
+    ("js/webpack.bundle.js", "vendored"),
+    ("js/AppBundle.ts", "vendored"),
+    ("js/jquery.pack.js", "vendored"),
+    # Kept: segment match, not substring; file names only for .min/.map/bundle/.pack.
+    ("src/vendor_utils.py", None),
+    ("src/vendors/x.py", None),
+    ("src/builder/x.py", None),
+    ("mybuild/x.py", None),
+    ("distance/metric.py", None),
+    ("tools/build", None),                         # a FILE named build is kept
+    ("app/minify.js", None),
+    ("app.min.jsx", None),
+    ("sitemap.xml", None),
+    ("src/package.json", None),
+    ("", None),
+    (None, None),
+])
+def test_path_skip_rules(path, reason):
+    assert bs.path_skip_reason(path) == reason
+
+
+def _code_docs(rows, **kw):
+    kw = {"html_cap": 1.0, "max_doc_tokens": 100, **kw}
+    return bs.CodeDocs(iter(rows), MixTok(), languages=KEPT_LANGS, licenses=KEPT_LICENSES, **kw)
+
+
+def test_each_skip_reason_drops_what_it_should_and_nothing_else():
+    rows = [
+        {"code": "C0:10", "language": "Python", "license": "mit", "path": "src/vendor_utils.py"},
+        {"code": "C1:10", "language": "JavaScript", "license": "mit", "path": "js/a.min.js"},
+        {"code": "C2:10", "language": "JavaScript", "license": "mit", "path": "node_modules/x.js"},
+        {"code": "C3:99", "language": "Python", "license": "mit", "path": "src/ok.py"},  # 100 w/ EOT
+        {"code": "C4:100", "language": "Python", "license": "mit", "path": "src/big.py"},  # 101
+        {"code": "C5:500", "language": "CSS", "license": "mit", "path": "dist/huge.css"},
+        {"code": "C6:10", "language": "CSS", "license": "mit", "path": "x.css.map"},
+        {"code": "C7:10", "language": "JavaScript", "license": "mit", "path": "app.bundle.js"},
+        {"code": "C8:10", "language": "GO", "license": "mit"},                          # no path
+    ]
+    docs = _code_docs(rows)
+    kept = [int(a[0]) - CODE_BASE for a, _ in docs]
+    assert kept == [0, 3, 8]
+    # Path reasons win over length: C5 is long but counted as vendored.
+    assert docs.skipped == {"minified": {"documents": 2, "tokens": 22},
+                            "vendored": {"documents": 3, "tokens": 11 + 501 + 11},
+                            "too_long": {"documents": 1, "tokens": 101}}
+
+
+def test_too_long_documents_are_skipped_at_the_cap():
+    rows = [{"code": f"C{i}:{n}", "language": "Python", "license": "mit", "path": f"s/{i}.py"}
+            for i, n in enumerate([15_999, 16_000, 20_000, 5])]
+    docs = _code_docs(rows, max_doc_tokens=16_000)
+    assert [len(a) for a, _ in docs] == [16_000, 6]  # length counts the EOT
+    assert docs.skipped["too_long"] == {"documents": 2, "tokens": 16_001 + 20_001}
+
+
+def test_skips_apply_to_code_val_and_are_recorded_in_the_manifest(tmp_path):
+    def tag(rows, every, path):
+        for j, r in enumerate(rows):
+            r["path"] = path if j % every == 0 else f"src/f{j}.py"
+        return rows
+
+    train_rows = tag(code_rows(4_000), 7, "lib/vendor/x.js")
+    for r in train_rows[3::11]:
+        r["path"] = "static/app.min.js"
+    val_rows = tag(code_rows(400, start=20_000, seed=3), 5, "dist/app.js")
+    m = run_mix(tmp_path, spec(train_rows, val_rows, max_doc_tokens=400))
+    by_id = {int(r["code"][1:].split(":")[0]): r for r in train_rows + val_rows}
+    for split in ("train", "code_val"):
+        t = split_tokens(tmp_path / split)
+        ids = {int(x) - CODE_BASE for x in t[t >= CODE_BASE]}
+        assert ids
+        assert all(bs.path_skip_reason(by_id[i]["path"]) is None for i in ids)
+        # No written document exceeds the cap (docs are runs of one repeated id).
+        runs = np.split(t, np.flatnonzero(t == EOT) + 1)
+        assert max(len(r) for r in runs) <= 400
+    tr = m["splits"]["train"]["sources"]["code"]
+    cv = m["splits"]["code_val"]
+    for summary in (tr, cv):
+        assert summary["skipped"]["vendored"]["documents"] > 0
+        assert summary["skipped"]["too_long"]["documents"] > 0
+    assert tr["skipped"]["minified"]["documents"] > 0
+    assert m["code"]["skipped_train"] == tr["skipped"]
+    assert m["code"]["skipped_code_val"] == cv["skipped"]
+    assert m["code"]["max_doc_tokens"] == 400
+    assert m["code"]["path_skip_rules"] == bs.CODE_PATH_SKIP_RULES
+    assert sum(tr["tokens_by_doc_length"].values()) >= tr["tokens"]
+    assert tr["tokens_by_doc_length"][">16000"] == 0
+
+
+def test_html_must_be_a_kept_language():
+    with pytest.raises(ValueError, match="HTML"):
+        bs.CodeDocs(iter([]), MixTok(), languages=("Python", "html"), licenses=KEPT_LICENSES,
+                    html_cap=0.1, max_doc_tokens=100)

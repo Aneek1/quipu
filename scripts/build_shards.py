@@ -65,6 +65,51 @@ BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 CODE_STAT_KEYS = ("rows_scanned", "dropped_language", "dropped_license",
                   "dropped_as_duplicate", "skipped_blank", "skipped_html_cap")
 
+# Generated, vendored and bundled code: third-party libraries, minified builds and
+# data blobs teach the model nothing about writing code and, at hundreds of
+# thousands of tokens each, would crowd out real source. A document is skipped for
+# the first rule its path matches (case-insensitive; "/" or "\" separators):
+#   minified  the file name ends .min.js / .min.css, or it is a source map (.map)
+#   vendored  a DIRECTORY segment is exactly one of VENDORED_DIRS (a segment match,
+#             so src/vendor_utils.py is kept), or the file name contains "bundle"
+#             or ".pack."
+# Separately, any document longer than code_max_doc_tokens is skipped as too_long.
+CODE_PATH_SKIP_RULES = {
+    "minified": {"file_name_patterns": [r"\.min\.(js|css)$", r"\.map$"]},
+    "vendored": {"directory_segments": ["vendor", "node_modules", "dist", "build",
+                                        "bower_components", "third_party", "external"],
+                 "file_name_contains": ["bundle", ".pack."]},
+}
+_MINIFIED_RE = re.compile("|".join(CODE_PATH_SKIP_RULES["minified"]["file_name_patterns"]),
+                          re.IGNORECASE)
+_VENDORED_DIRS = frozenset(CODE_PATH_SKIP_RULES["vendored"]["directory_segments"])
+_VENDORED_NAME_PARTS = tuple(CODE_PATH_SKIP_RULES["vendored"]["file_name_contains"])
+SKIP_REASONS = ("minified", "vendored", "too_long")
+# Code tokens are also bucketed by document length, to show how much sits in long files.
+DOC_LENGTH_BUCKETS = (1_000, 4_000, 8_000, 16_000)
+
+
+def path_skip_reason(path: str | None) -> str | None:
+    """"minified", "vendored" or None for a code file's repository path."""
+    if not path:
+        return None
+    parts = [p for p in path.replace("\\", "/").lower().split("/") if p]
+    if not parts:
+        return None
+    name = parts[-1]
+    if _MINIFIED_RE.search(name):
+        return "minified"
+    if _VENDORED_DIRS.intersection(parts[:-1]) or any(k in name for k in _VENDORED_NAME_PARTS):
+        return "vendored"
+    return None
+
+
+def _length_bucket(n: int) -> str:
+    for edge in DOC_LENGTH_BUCKETS:
+        if n <= edge:
+            return f"<={edge}"
+    return f">{DOC_LENGTH_BUCKETS[-1]}"
+
 
 def clear_split_dir(out_dir: Path) -> None:
     """Remove shards and temp files left by an earlier (possibly longer) build."""
@@ -186,11 +231,15 @@ def content_hash(code: str) -> int:
 
 
 class CodeDocs:
-    """Code rows {"code", "language", "license"[, "file"]} -> (ids, "code:<language>").
+    """Code rows {"code", "language", "license"[, "path", "file"]} -> (ids, "code:<language>").
 
     A row is dropped, in this order, if its language is not kept; if its licence is
-    not kept; (code val) if its content hash is in `exclude`; if it is blank; or if
-    it is HTML over the cap. The HTML cap: once at least `html_warmup` code tokens
+    not kept; (code val) if its content hash is in `exclude`; if it is blank; if its
+    path is minified or vendored/bundled (CODE_PATH_SKIP_RULES); if it is longer than
+    max_doc_tokens tokens (counting its EOT); or if it is HTML over the cap. Skipped
+    documents are still tokenized, so .skipped records the tokens each reason
+    removed. The HTML cap is hard-coded to the language name "HTML", so that name
+    must be among the kept languages. The HTML cap: once at least `html_warmup` code tokens
     have been yielded, an HTML document of n tokens is skipped when
     html + n > html_cap * (code + n), i.e. when yielding it would take HTML above
     html_cap of the code tokens yielded. The consumer writes every yielded
@@ -202,13 +251,19 @@ class CodeDocs:
     """
 
     def __init__(self, rows: Iterator[dict], tok: Tokenizer, *, languages: Iterable[str],
-                 licenses: Iterable[str], html_cap: float,
+                 licenses: Iterable[str], html_cap: float, max_doc_tokens: int,
                  html_warmup: int = HTML_CAP_WARMUP_TOKENS,
                  exclude: set[int] | frozenset[int] = frozenset(),
                  record_hashes: bool = False) -> None:
         self._rows = rows
         self._tok = tok
         self.languages = frozenset(languages)
+        if "HTML" not in self.languages:
+            raise ValueError("code_languages must include 'HTML': the HTML cap is keyed on "
+                             "that exact name, so a renamed or missing entry disables it")
+        self.max_doc_tokens = max_doc_tokens
+        self.skipped = {r: {"documents": 0, "tokens": 0} for r in SKIP_REASONS}
+        self.length_buckets: Counter[str] = Counter()
         self.licenses = frozenset(licenses)
         self.html_cap = html_cap
         self.html_warmup = html_warmup
@@ -245,6 +300,13 @@ class CodeDocs:
                 stats["skipped_blank"] += 1
                 continue
             n = len(ids)
+            reason = path_skip_reason(row.get("path"))
+            if reason is None and n > self.max_doc_tokens:
+                reason = "too_long"
+            if reason is not None:
+                self.skipped[reason]["documents"] += 1
+                self.skipped[reason]["tokens"] += n
+                continue
             if language == "HTML":
                 if (self.tokens >= self.html_warmup
                         and self.html_tokens + n > self.html_cap * (self.tokens + n)):
@@ -252,6 +314,7 @@ class CodeDocs:
                     continue
                 self.html_tokens += n
             self.tokens += n
+            self.length_buckets[_length_bucket(n)] += n
             if self.record_hashes:
                 self.hashes.add(h)
             if "file" in row:
@@ -366,6 +429,7 @@ class CodeSpec(NamedTuple):
     languages: tuple[str, ...]
     licenses: tuple[str, ...]
     html_cap: float
+    max_doc_tokens: int
     val_tokens: int
     train_rows: Iterable[dict]
     val_rows: Callable[[], Iterable[dict]]
@@ -394,6 +458,12 @@ def _code_summary(split: dict[str, Any], docs: CodeDocs) -> dict[str, Any]:
                                                                       tokens)}
                         for lang in sorted(langs)},
         **{k: docs.stats.get(k, 0) for k in CODE_STAT_KEYS},
+        "skipped": docs.skipped,
+        # Tokens per document-length bucket, counted as yielded (a truncated final
+        # document counts in full), so these sum to within one document of "tokens".
+        "tokens_by_doc_length": {b: docs.length_buckets.get(b, 0) for b in
+                                 [f"<={e}" for e in DOC_LENGTH_BUCKETS]
+                                 + [f">{DOC_LENGTH_BUCKETS[-1]}"]},
         "last_file_read": docs.last_file,
     }
 
@@ -404,7 +474,8 @@ def _build_code(root: Path, it: Iterator[dict], *, train_tokens: int, shard_toke
     text_docs = TextDocs(it, tok)
     code_docs = CodeDocs(iter(code.train_rows), tok, languages=code.languages,
                          licenses=code.licenses, html_cap=code.html_cap,
-                         html_warmup=code.html_warmup, record_hashes=True)
+                         max_doc_tokens=code.max_doc_tokens, html_warmup=code.html_warmup,
+                         record_hashes=True)
     mixed = write_split(root / "train", train_tokens, shard_tokens,
                         interleave(text_docs, code_docs, code.share))
     text_counts = mixed["by_label"].get(TEXT, {"tokens": 0, "documents": 0})
@@ -425,7 +496,8 @@ def _build_code(root: Path, it: Iterator[dict], *, train_tokens: int, shard_toke
     # Code val strictly after code train: every train hash is known by now.
     val_docs = CodeDocs(iter(code.val_rows()), tok, languages=code.languages,
                         licenses=code.licenses, html_cap=code.html_cap,
-                        html_warmup=code.html_warmup, exclude=code_docs.hashes)
+                        max_doc_tokens=code.max_doc_tokens, html_warmup=code.html_warmup,
+                        exclude=code_docs.hashes)
     cv = write_split(root / "code_val", code.val_tokens, shard_tokens, val_docs,
                      allow_short=True)
     if cv["tokens"] == 0:
@@ -486,6 +558,10 @@ def build_all(root: Path, stream: Iterable[dict], *, val_tokens: int, train_toke
             "licenses": list(code.licenses),
             "html_cap": code.html_cap,
             "html_cap_warmup_tokens": code.html_warmup,
+            "max_doc_tokens": code.max_doc_tokens,
+            "path_skip_rules": CODE_PATH_SKIP_RULES,
+            "skipped_train": train["sources"]["code"]["skipped"],
+            "skipped_code_val": splits["code_val"]["skipped"],
             "files_total": code.files_total,
             "train_files": None if held is None else [0, held - 1],
             "heldout_files": None if held is None else [held, code.files_total - 1],
@@ -513,7 +589,7 @@ def code_file_path(repo: str, revision: str, index: int, total: int) -> str:
 
 
 def iter_code_row_groups(fs: Any, repo: str, revision: str, files: range, total: int,
-                         columns: tuple[str, ...] = ("code", "language", "license"),
+                         columns: tuple[str, ...] = ("code", "language", "license", "path"),
                          retries: int = 5) -> Iterator[list[dict]]:
     """The rows of each parquet row group, in file order, one row group at a time.
 
@@ -606,7 +682,8 @@ def main() -> None:
 
     code = CodeSpec(
         share=d.code_share, languages=d.code_languages, licenses=d.code_licenses,
-        html_cap=d.html_cap, val_tokens=d.code_val_tokens,
+        html_cap=d.html_cap, max_doc_tokens=d.code_max_doc_tokens,
+        val_tokens=d.code_val_tokens,
         train_rows=rows(range(0, d.code_heldout_first_file)),
         val_rows=lambda: rows(range(d.code_heldout_first_file, d.code_files_total)),
         dataset=d.code_dataset, revision=code_rev,
