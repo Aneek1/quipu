@@ -135,3 +135,9 @@ The owner wants a separate Quipu image model working together with Quipu, VLM-st
 - **Sub-project 5 — Quipu-Vision (image understanding, first):** LLaVA-style — vision encoder → trained projector → Quipu. Start with a small pretrained, permissively licensed encoder and train only the projector plus a Quipu fine-tune on image–caption pairs (fits 8 GB; days). A from-scratch tiny ViT encoder is a later option. Pairs with document upload (diagrams in uploaded PDFs).
 - **Sub-project 6 — Quipu-Image (image generation):** a small from-scratch diffusion model (~30M parameters, ~256 px) that Quipu drives through tool calls. Expect recognisable but crude images, best in a narrow domain; broad high-quality text-to-image is out of reach at this compute.
 - **Both:** every image dataset is licence- and provenance-checked before use.
+
+### Roadmap requirement recorded 2026-09-25: Apple silicon (Metal) + CI
+
+- **MPS backend:** device selection cuda → mps → cpu; bf16 autocast on MPS; MPS equivalents (or guarded skips) for `torch.cuda.synchronize`, memory stats and CUDA RNG state. The model uses standard ops; loader and checkpointing are platform-neutral.
+- **CI:** a macOS/arm64 job on GitHub-hosted Apple-silicon runners. **Verify first** whether those runners expose Metal — they are believed to be VMs without GPU access, in which case CI proves macOS/arm64 correctness on CPU and real Metal training/inference is measured on the owner's 24 GB Mac.
+- **On-device:** export the trained model to Core ML (and/or an MLX port) with the same reference discipline as the chatbot's conversion — max logit drift and prediction flips against a committed reference, checked on Apple-silicon CI.
