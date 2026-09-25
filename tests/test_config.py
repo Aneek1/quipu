@@ -19,8 +19,9 @@ def test_loads_the_shipped_config():
 
 def test_derives_step_count_from_token_budget():
     cfg = load_config(CONFIG)
-    # 1,500,000,000 / 524,288 = 2861 (floor)
-    assert cfg.train.steps == 2861
+    # 3,000,000,000 / 524,288 = 5722 (floor); 5722 x 524,288 = 2,999,975,936
+    assert cfg.train.steps == 5722
+    assert cfg.train.total_tokens - cfg.train.steps * cfg.train.batch_tokens == 24_064
 
 
 def test_derives_gradient_accumulation():
@@ -137,3 +138,64 @@ def test_ckpt_keep_is_loaded_and_must_be_positive():
     assert load_config(CONFIG).train.ckpt_keep == 3
     with pytest.raises(ValueError, match="ckpt_keep"):
         load_config(CONFIG, overrides={"train": {"ckpt_keep": 0}})
+
+
+def test_code_mix_fields_are_loaded():
+    d = load_config(CONFIG).data
+    assert d.code_dataset == "codeparrot/github-code-clean"
+    assert d.code_share == 0.2
+    assert d.html_cap == 0.1
+    assert d.code_val_tokens == 5_000_000
+    assert (d.code_heldout_first_file, d.code_files_total) == (840, 880)
+    assert d.code_languages == ("Python", "JavaScript", "TypeScript", "HTML", "CSS",
+                                "PHP", "Java", "GO", "SQL", "Shell", "Dockerfile")
+    assert d.code_licenses == ("mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause",
+                               "isc", "cc0-1.0", "unlicense")
+    # Lists become tuples so the frozen config can't be mutated through them.
+    assert isinstance(d.code_languages, tuple) and isinstance(d.code_licenses, tuple)
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 1, 1.0, -0.2, 1.5, True, "0.2"])
+def test_code_share_must_be_strictly_between_0_and_1(value):
+    with pytest.raises(ValueError, match="code_share"):
+        load_config(CONFIG, overrides={"data": {"code_share": value}})
+
+
+@pytest.mark.parametrize("value", [0, 0.0, -0.1, 1.01, False, "0.1"])
+def test_html_cap_must_be_in_0_exclusive_1_inclusive(value):
+    with pytest.raises(ValueError, match="html_cap"):
+        load_config(CONFIG, overrides={"data": {"html_cap": value}})
+
+
+def test_html_cap_of_one_means_uncapped_and_is_allowed():
+    assert load_config(CONFIG, overrides={"data": {"html_cap": 1.0}}).data.html_cap == 1.0
+
+
+@pytest.mark.parametrize("key", ["code_languages", "code_licenses"])
+@pytest.mark.parametrize("value", [[], "Python", ["Python", ""], ["mit", 3], ["mit", "mit"]])
+def test_code_filter_lists_must_be_non_empty_lists_of_strings(key, value):
+    with pytest.raises(ValueError, match=key):
+        load_config(CONFIG, overrides={"data": {key: value}})
+
+
+@pytest.mark.parametrize("overrides, match", [
+    ({"code_heldout_first_file": 880}, "code_heldout_first_file"),
+    ({"code_heldout_first_file": 900}, "code_heldout_first_file"),
+    ({"code_heldout_first_file": 0}, "code_heldout_first_file"),
+    ({"code_files_total": 0}, "code_files_total"),
+    ({"code_val_tokens": 0}, "code_val_tokens"),
+    ({"code_val_tokens": 5e6}, "code_val_tokens"),
+])
+def test_held_out_range_and_code_val_budget_are_sane(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        load_config(CONFIG, overrides={"data": overrides})
+
+
+def test_a_missing_code_field_is_an_error(tmp_path):
+    # Every run must state its mix; a missing field is not silently text-only.
+    lines = CONFIG.read_text(encoding="utf-8").splitlines()
+    cfg = tmp_path / "missing_code_share.toml"
+    cfg.write_text("\n".join(l for l in lines if not l.startswith("code_share")),
+                   encoding="utf-8")
+    with pytest.raises(TypeError, match="code_share"):
+        load_config(cfg)

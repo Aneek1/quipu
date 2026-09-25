@@ -17,9 +17,22 @@ subset       = "sample-10BT"
 shard_dir    = "data/shards"
 shard_tokens = 100_000_000   # ~200 MB per shard as uint16
 val_tokens   = 10_000_000
+# Code mix: 20% of train tokens from permissive full-stack code, interleaved
+# deterministically with FineWeb-Edu. Names are exactly as they appear in the data
+# (note uppercase GO). HTML is capped at html_cap of code tokens.
+code_dataset    = "codeparrot/github-code-clean"
+code_share      = 0.2
+code_languages  = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "PHP",
+                   "Java", "GO", "SQL", "Shell", "Dockerfile"]
+code_licenses   = ["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
+                   "cc0-1.0", "unlicense"]
+html_cap        = 0.1
+code_val_tokens = 5_000_000
+code_heldout_first_file = 840   # files 840..879 are code val only; train never opens them
+code_files_total        = 880
 
 [train]
-total_tokens  = 1_500_000_000
+total_tokens  = 3_000_000_000 # 5,722 steps
 batch_tokens  = 524_288       # 512 sequences x 1024 tokens
 micro_batch   = 4             # measured in Task 12; 8 spills VRAM to shared RAM
 lr            = 6e-4

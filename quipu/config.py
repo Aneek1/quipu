@@ -2,7 +2,7 @@
 so no two call sites can disagree about how many steps there are.
 
 steps floors total_tokens / batch_tokens, so up to batch_tokens-1 tokens are unused
-(12,032 for the shipped config)."""
+(24,064 for the shipped config: 3,000,000,000 - 5,722 x 524,288)."""
 from __future__ import annotations
 
 import dataclasses
@@ -37,6 +37,17 @@ class DataConfig:
     shard_dir: str
     shard_tokens: int
     val_tokens: int
+    # Code mix (weekend-run spec section 3). Train reads code parquet files
+    # [0, code_heldout_first_file); code val reads [code_heldout_first_file,
+    # code_files_total), which train never opens.
+    code_dataset: str
+    code_share: float
+    code_languages: tuple[str, ...]
+    code_licenses: tuple[str, ...]
+    html_cap: float
+    code_val_tokens: int
+    code_heldout_first_file: int
+    code_files_total: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +114,25 @@ def _validate_int_fields(instance: Any, allow_zero: frozenset[str] = frozenset()
             raise ValueError(f"{f.name} must be positive, got {value!r}")
 
 
+def _check_fraction(name: str, value: Any, *, allow_one: bool) -> None:
+    """A share strictly inside (0, 1), or (0, 1] when allow_one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    upper_ok = value <= 1 if allow_one else value < 1
+    if not (value > 0 and upper_ok):
+        interval = "(0, 1]" if allow_one else "(0, 1)"
+        raise ValueError(f"{name} must be in {interval}, got {value!r}")
+
+
+def _check_str_list(name: str, value: Any) -> None:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} must be a non-empty list, got {value!r}")
+    if not all(isinstance(v, str) and v.strip() for v in value):
+        raise ValueError(f"{name} entries must be non-empty strings, got {value!r}")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{name} has duplicate entries: {value!r}")
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     if overrides:
@@ -116,7 +146,12 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
         raise ValueError("context belongs in [model]; [train] inherits it")
 
     model = ModelConfig(**raw["model"])
-    data = DataConfig(**raw["data"])
+    data_raw = dict(raw["data"])
+    for key in ("code_languages", "code_licenses"):
+        if key in data_raw:
+            _check_str_list(key, data_raw[key])
+            data_raw[key] = tuple(data_raw[key])  # frozen config, immutable lists
+    data = DataConfig(**data_raw)
     train = TrainConfig(context=model.context, **raw["train"])
 
     # Type/positivity checks must run before any division below (e.g. grad_accum's
@@ -127,6 +162,15 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     _validate_int_fields(model)
     _validate_int_fields(data)
     _validate_int_fields(train, allow_zero=frozenset({"seed"}))
+
+    _check_fraction("code_share", data.code_share, allow_one=False)
+    _check_fraction("html_cap", data.html_cap, allow_one=True)
+    if not data.code_heldout_first_file < data.code_files_total:
+        raise ValueError(
+            f"code_heldout_first_file ({data.code_heldout_first_file}) must be less than "
+            f"code_files_total ({data.code_files_total}): train needs files 0..first-1 "
+            f"and code val needs at least one held-out file"
+        )
 
     if model.d_model % model.n_head != 0:
         raise ValueError("d_model must divide evenly by n_head")
