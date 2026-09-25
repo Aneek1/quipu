@@ -25,7 +25,7 @@ def test_derives_step_count_from_token_budget():
 
 def test_derives_gradient_accumulation():
     cfg = load_config(CONFIG)
-    assert cfg.train.grad_accum == 64
+    assert cfg.train.grad_accum == 128   # micro_batch 4
     cfg2 = load_config(CONFIG, overrides={"train": {"micro_batch": 16}})
     assert cfg2.train.grad_accum == 32
     assert cfg.train.context == cfg.model.context

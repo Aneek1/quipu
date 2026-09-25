@@ -7,6 +7,10 @@ import time
 
 import torch
 
+from quipu.config import load_config
+from quipu.model import Quipu
+
+CONFIG = "configs/quipu-114m.toml"
 WINDOW_SECONDS = 5.0
 TOTAL_SECONDS = 60.0
 
@@ -46,7 +50,11 @@ def main() -> None:
     total = torch.cuda.get_device_properties(0).total_memory / 2**30
     print(f"vram:       {total:.1f} GiB")
 
-    print(f"\nmeasuring sustained dense bf16 matmul over {TOTAL_SECONDS:.0f}s in {WINDOW_SECONDS:.0f}s windows:")
+    # Each window stops queueing matmuls after WINDOW_SECONDS and then waits for the
+    # queue to drain, so on this card a window really lasts ~9.5 s. TFLOPS divides by
+    # the real elapsed time, so the figure is unaffected.
+    print(f"\nmeasuring sustained dense bf16 matmul for ~{TOTAL_SECONDS:.0f}s; each window queues "
+          f"{WINDOW_SECONDS:.0f}s of work and runs longer while the queue drains:")
     windows = measure_sustained_tflops()
     minimum = min(windows)
     print(f"\nminimum sustained window: {minimum:.1f} TFLOPS (of {len(windows)} windows)")
@@ -55,8 +63,11 @@ def main() -> None:
     # figure for a well-implemented loop; the real number lands in Task 14.
     # Base the planning figure on the thermally-throttled minimum, not a burst.
     planning = minimum * 0.40
-    tokens, params = 2.5e9, 114_114_048
-    L, T, d = 12, 1024, 768
+    cfg = load_config(CONFIG)
+    with torch.device("meta"):     # count parameters without allocating them
+        params = sum(p.numel() for p in Quipu(cfg.model).parameters())
+    tokens = cfg.train.total_tokens
+    L, T, d = cfg.model.n_layer, cfg.model.context, cfg.model.d_model
 
     flops_params_only = 6 * params
     flops_with_attn = 6 * params + 12 * L * T * d
@@ -65,8 +76,9 @@ def main() -> None:
     hours_with_attn = (flops_with_attn * tokens) / (planning * 1e12) / 3600
 
     print(f"\nat 40% of the minimum sustained window ({planning:.1f} TFLOPS effective):")
-    print(f"  2.5B tokens at 114M params, param-only 6N          -> {hours_params_only:.1f} hours")
-    print(f"  2.5B tokens at 114M params, 6N + 12*L*T*d attention -> {hours_with_attn:.1f} hours")
+    label = f"{tokens / 1e9:.1f}B tokens at {params / 1e6:.0f}M params"
+    print(f"  {label}, param-only 6N          -> {hours_params_only:.1f} hours")
+    print(f"  {label}, 6N + 12*L*T*d attention -> {hours_with_attn:.1f} hours")
 
 
 if __name__ == "__main__":

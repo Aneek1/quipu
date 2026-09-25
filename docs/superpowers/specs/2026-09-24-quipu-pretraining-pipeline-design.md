@@ -111,13 +111,16 @@ alternative (padding to document length) wastes a large fraction of the budget.
 | warmup | 200 steps (7.0% of the run) |
 | grad clip | 1.0 |
 | total batch | ~0.5M tokens per step |
-| micro-batch | tuned to fit 8 GB; gradient accumulation makes up the rest |
+| micro-batch | 4 (grad_accum 128): 6.25 GiB allocated / 6.67 GiB reserved of the 8 GB card, the largest measured under the 7.0 GiB budget |
 | steps | 2,861 (1,500,000,000 / 524,288) |
-| estimated wall clock | ~23 hours (measured ~18k tok/s at micro_batch 4) |
+| estimated wall clock | 23.7–26.0 hours: `scripts/measure_throughput.py` measured 29.8–32.6 s/step (16.1k–17.6k tok/s) at micro_batch 4 on the real loop and data; eval and checkpoints add under 0.1 h |
 
-The wall-clock estimate comes from 6 × params × tokens FLOPs at an assumed ~20 TFLOPS effective.
-**That assumption is unverified and Task 1 measures it.** If the real figure is half that, the run
-is two days and the budget is re-decided before starting, not during.
+The wall-clock estimate is measured, not derived: timed training steps of the real model on the
+real shards (Task 12), plus the measured cost of one eval and one checkpoint save at their cadence.
+Micro-batch 8 is not an option on this laptop: the Windows driver never raises CUDA OOM, it spills
+VRAM into shared system RAM and the step becomes tens of times slower, so micro-batch is chosen by
+peak reserved memory against a 7.0 GiB budget. Micro-batch 2 measured the same throughput within
+noise (16.1k–16.8k tok/s), so it is the fallback if other GPU apps crowd the card.
 
 ### Resumability is a first-class requirement, not a nicety
 

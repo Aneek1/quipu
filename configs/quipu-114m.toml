@@ -21,7 +21,7 @@ val_tokens   = 10_000_000
 [train]
 total_tokens  = 1_500_000_000
 batch_tokens  = 524_288       # 512 sequences x 1024 tokens
-micro_batch   = 8             # tuned in Task 14; grad_accum absorbs any change
+micro_batch   = 4             # measured in Task 12; 8 spills VRAM to shared RAM
 lr            = 6e-4
 lr_min        = 6e-5
 warmup_steps  = 200
