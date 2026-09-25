@@ -114,6 +114,7 @@ def dataset_revision(stream: Any) -> str | None:
     (hf://datasets/<repo>@<sha>/...). Anything unexpected yields None.
     """
     try:
+        # Private datasets attribute: a library upgrade can silently make this null.
         files = stream._ex_iterable.kwargs["files"]
         m = re.search(r"@([0-9a-f]{40})/", str(files[0]))
         return m.group(1) if m else None

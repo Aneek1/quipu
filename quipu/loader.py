@@ -23,9 +23,9 @@ class TokenStream:
         paths = sorted(self.shard_dir.glob("shard_*.bin"))
         if not paths:
             raise FileNotFoundError(f"no shards in {self.shard_dir}")
-        # Concatenating keeps the boundary logic in one place. At 2.5B tokens this
-        # is 5 GB, which fits in 31.7 GB of RAM; if it ever does not, this becomes
-        # a memmap and nothing else changes.
+        # Concatenating keeps the boundary logic in one place. At 1.5B tokens this
+        # is 3 GB (peak ~6 GB while concatenating), which fits in 31.7 GB of RAM;
+        # if it ever does not, this becomes a memmap and nothing else changes.
         self.tokens = np.concatenate([read_shard(p) for p in paths])
         self.position = 0
         # Wrapping means the stream is about to re-serve tokens the model has

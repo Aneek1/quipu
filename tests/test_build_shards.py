@@ -149,3 +149,35 @@ def test_dataset_revision_parsing():
 
     assert bs.dataset_revision(S()) == "a" * 40
     assert bs.dataset_revision(object()) is None
+
+
+class WideTok:
+    """Like FakeTok but with room for documents up to 999 tokens; ids stay < 65536."""
+    eot = EOT
+
+    def encode(self, text):
+        i, n = text[1:].split(":")
+        base = 1 + int(i) * 1000
+        return list(range(base, base + int(n)))
+
+
+def _expected(lens, target):
+    out = []
+    for i, n in enumerate(lens):
+        out += list(range(1 + i * 1000, 1 + i * 1000 + n)) + [EOT]
+    return out[:target]
+
+
+@pytest.mark.parametrize("lens,target,shard", [
+    ([250, 3, 7, 400, 1, 60], 537, 64),  # docs longer than a shard, straddles, ragged target
+    ([5] * 50, 299, 7),
+    ([999], 500, 100),
+    ([1] * 60, 120, 120),                 # target == shard size
+    ([33, 2, 90], 10, 3),                 # tiny shards
+])
+def test_content_survives_shard_boundaries(tmp_path, lens, target, shard):
+    rows = [{"text": f"d{i}:{n}"} for i, n in enumerate(lens)]
+    res = bs.build(tmp_path / "s", target, shard, iter(rows), WideTok())
+    assert split_tokens(tmp_path / "s").tolist() == _expected(lens, target)
+    sizes = [s["tokens"] for s in res["shards"]]
+    assert all(s == shard for s in sizes[:-1]) and sum(sizes) == target
