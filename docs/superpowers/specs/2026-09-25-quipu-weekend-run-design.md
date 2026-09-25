@@ -1,7 +1,7 @@
 # Quipu weekend run — 3B tokens, full-stack code, milestones, 1M-token retrieval memory
 
 **Date:** 2026-09-25
-**Status:** design approved in brainstorming; awaiting owner review of this document
+**Status:** design approved in brainstorming, additions 1–4 and the HTML cap approved 2026-09-25; awaiting owner review of this document
 **Builds on:** `2026-09-24-quipu-pretraining-pipeline-design.md` (sub-project 1, Tasks 1–13 done)
 **Changes the run:** yes — this supersedes that spec's data mix and token budget for the weekend run
 
@@ -36,10 +36,12 @@
 
 `github-code-clean` is ungated and carries `language` and `license` per file. Keep only:
 
-- **Languages (full stack):** Python, JavaScript, TypeScript, HTML, CSS, PHP, Java, GO, SQL, Shell, Dockerfile — in their natural proportions within that set (not re-balanced).
+- **Languages (full stack):** Python, JavaScript, TypeScript, HTML, CSS, PHP, Java, GO, SQL, Shell, Dockerfile — in their natural proportions within that set, **except HTML, capped at 10% of code tokens** (measured natural share ≈24%, much of it generated boilerplate). Once HTML reaches 10% of the code tokens written so far, further HTML documents are skipped.
 - **Licences (permissive):** mit, apache-2.0, bsd-2-clause, bsd-3-clause, isc, cc0-1.0, unlicense. GPL and others are dropped.
 
 The held-out code files are a fixed range of parquet shard indices (e.g. the last 40 of 880) that the train builder never opens. The exact range is recorded in the manifest.
+
+**The code val is deduplicated against train.** GitHub is full of forks and copied files, so held-out files will still contain code seen in training. Code train is built first; every code train document's content hash is kept; any code val document whose hash is in that set is dropped. The number dropped is recorded in the manifest. (Exact-content dedup only — near-duplicates remain; stated as a limit.)
 
 ### 3.2 Mixing
 
@@ -88,9 +90,13 @@ Tokens and document counts **per source and per language**, the licence filter, 
 
 Loss on the FineWeb val and on the code val for every milestone snapshot, so the run records *when* code began to be learned.
 
+**Samples at every milestone:** generate from a fixed set of prompts — a few text openings and a few code openings (Python function, JS function, HTML page, SQL query) — greedy, plus one sampled continuation with a fixed seed. Same prompts at every milestone, saved to `results/milestones/samples.md`, so the stages of learning can be read side by side.
+
 ## 6. The launcher (`scripts/weekend.py`)
 
+0. **Start guards** — refuse to start, with a message saying exactly what to fix, if: other processes hold more than 1.5 GB of GPU memory (Task 12 measured 2.8 GB held by desktop apps); the laptop is on battery; or fewer than 40 GB are free on the drive. `--force` overrides, for the owner only.
 1. Run `quipu.train` (resuming automatically if a run log for the run id exists).
+   **Auto-resume:** if training exits with a failure, relaunch it with `--resume` after a 2-minute pause, at most 3 times. Two exits are never retried: the non-finite stop (it would fail identically) and a user interrupt (Ctrl+C means stop). `train.py` gives these distinct exit codes — **3** for the non-finite stop, **130** for an interrupt — so the launcher can tell them apart from other crashes. Every attempt and its exit code is recorded in the weekend summary.
 2. If training completed: run `milestone_eval.py`, then `needle_eval.py` if it exists, then `results_table.py --out RESULTS.md`. Each step is a separate process; a failure is logged and the next step still runs. **No evaluation step can modify checkpoints.**
 3. Write a one-page `results/weekend_summary.md` with what ran, what passed, and where the outputs are.
 
