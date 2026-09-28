@@ -1,0 +1,58 @@
+=== FILE: backend/app.py ===
+"""Flask API for the todo app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_todo
+
+FIELDS = ("title", "done")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/todos")
+    def list_todos():
+        return jsonify(store.list_items())
+
+    @app.post("/api/todos")
+    def create_todo():
+        data = request.get_json(silent=True)
+        errors = validate_todo(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        todo = store.create({"title": data["title"], "done": data.get("done", False)})
+        return jsonify(todo), 201
+
+    @app.get("/api/todos/<int:todo_id>")
+    def get_todo(todo_id):
+        todo = store.get(todo_id)
+        if todo is None:
+            return error("todo not found", 404)
+        return jsonify(todo)
+
+    @app.put("/api/todos/<int:todo_id>")
+    def update_todo(todo_id):
+        todo = store.get(todo_id)
+        if todo is None:
+            return error("todo not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_todo({**todo, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(todo_id, changes))
+
+    @app.delete("/api/todos/<int:todo_id>")
+    def delete_todo(todo_id):
+        if not store.delete(todo_id):
+            return error("todo not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

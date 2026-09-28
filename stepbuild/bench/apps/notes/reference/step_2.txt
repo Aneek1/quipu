@@ -1,0 +1,58 @@
+=== FILE: backend/app.py ===
+"""Flask API for the notes app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_note
+
+FIELDS = ("title", "body")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/notes")
+    def list_notes():
+        return jsonify(store.list_items())
+
+    @app.post("/api/notes")
+    def create_note():
+        data = request.get_json(silent=True)
+        errors = validate_note(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        note = store.create({"title": data["title"], "body": data.get("body", "")})
+        return jsonify(note), 201
+
+    @app.get("/api/notes/<int:note_id>")
+    def get_note(note_id):
+        note = store.get(note_id)
+        if note is None:
+            return error("note not found", 404)
+        return jsonify(note)
+
+    @app.put("/api/notes/<int:note_id>")
+    def update_note(note_id):
+        note = store.get(note_id)
+        if note is None:
+            return error("note not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_note({**note, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(note_id, changes))
+
+    @app.delete("/api/notes/<int:note_id>")
+    def delete_note(note_id):
+        if not store.delete(note_id):
+            return error("note not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

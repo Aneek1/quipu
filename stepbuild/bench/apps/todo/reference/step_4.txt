@@ -1,0 +1,57 @@
+=== FILE: frontend/src/components/List.jsx ===
+export default function List({ items, onDelete }) {
+  if (items.length === 0) {
+    return <p>No todos yet.</p>
+  }
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item.id}>
+          <input type="checkbox" checked={item.done} readOnly aria-label="done" />
+          <span>{item.title}</span>
+          <button type="button" onClick={() => onDelete(item.id)}>
+            Delete
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+=== END FILE ===
+=== FILE: frontend/src/components/Form.jsx ===
+import { useState } from 'react'
+
+export default function Form({ onSubmit }) {
+  const [title, setTitle] = useState('')
+  const [done, setDone] = useState(false)
+
+  function handleSubmit(event) {
+    event.preventDefault()
+    if (!title.trim()) {
+      return
+    }
+    onSubmit({ title: title.trim(), done })
+    setTitle('')
+    setDone(false)
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        placeholder="What needs doing?"
+      />
+      <label>
+        <input
+          type="checkbox"
+          checked={done}
+          onChange={(event) => setDone(event.target.checked)}
+        />
+        Done
+      </label>
+      <button type="submit">Add</button>
+    </form>
+  )
+}
+=== END FILE ===

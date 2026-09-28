@@ -1,0 +1,72 @@
+=== FILE: backend/tests/test_api.py ===
+"""API tests for the notes app, using the client fixture from conftest.py."""
+
+
+def create(client, **body):
+    response = client.post("/api/notes", json=body)
+    assert response.status_code == 201
+    return response.get_json()
+
+
+def test_create_returns_201_and_the_note(client):
+    note = create(client, title="Groceries", body="eggs")
+    assert isinstance(note["id"], int)
+    assert note["title"] == "Groceries"
+    assert note["body"] == "eggs"
+
+
+def test_body_defaults_to_empty(client):
+    assert create(client, title="Groceries")["body"] == ""
+
+
+def test_list_returns_a_json_array(client):
+    assert client.get("/api/notes").get_json() == []
+    note = create(client, title="Groceries")
+    response = client.get("/api/notes")
+    assert response.status_code == 200
+    assert response.get_json() == [note]
+
+
+def test_get_one(client):
+    note = create(client, title="Groceries")
+    response = client.get(f"/api/notes/{note['id']}")
+    assert response.status_code == 200
+    assert response.get_json() == note
+
+
+def test_update(client):
+    note = create(client, title="Groceries")
+    response = client.put(f"/api/notes/{note['id']}", json={"body": "eggs, milk"})
+    assert response.status_code == 200
+    assert response.get_json() == {"id": note["id"], "title": "Groceries", "body": "eggs, milk"}
+
+
+def test_update_rejects_an_empty_title(client):
+    note = create(client, title="Groceries")
+    response = client.put(f"/api/notes/{note['id']}", json={"title": ""})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_delete_then_404(client):
+    note = create(client, title="Groceries")
+    assert client.delete(f"/api/notes/{note['id']}").status_code == 204
+    assert client.get(f"/api/notes/{note['id']}").status_code == 404
+    assert client.delete(f"/api/notes/{note['id']}").status_code == 404
+
+
+def test_missing_title_is_400(client):
+    response = client.post("/api/notes", json={"body": "no title"})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_non_string_body_is_400(client):
+    response = client.post("/api/notes", json={"title": "Groceries", "body": 42})
+    assert response.status_code == 400
+
+
+def test_missing_note_is_404(client):
+    assert client.get("/api/notes/999").status_code == 404
+    assert client.put("/api/notes/999", json={"title": "x"}).status_code == 404
+=== END FILE ===
