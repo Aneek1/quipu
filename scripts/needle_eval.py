@@ -463,12 +463,12 @@ def write_summary(out_dir: Path) -> None:
         "are both resident). Index build is per (haystack, size).",
         "",
         "| haystack | size | condition | trials | hit | copy\\|hit | accuracy "
-        "| acc by depth 0/25/50/75/100 | latency ms | peak VRAM MB | index build s |",
+        "| accuracy by depth % | latency ms | peak VRAM MB | index build s |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for d in results:
         for cond, a in d["aggregates"].items():
-            by_depth = "/".join(_pct(v["accuracy"]) for v in a["by_depth"].values())
+            by_depth = " ".join(f"{k}:{_pct(v['accuracy'])}" for k, v in a["by_depth"].items())
             lines.append(
                 f"| {d['haystack']} | {d['size_label']} | {cond} | {a['trials']} "
                 f"| {_pct(a['hit_rate'])} | {_pct(a['copy_given_hit'])} | {_pct(a['accuracy'])} "
