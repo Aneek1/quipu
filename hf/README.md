@@ -24,7 +24,7 @@ answer questions. At this size it writes fluent, on-topic prose that is often
 factually wrong. It is published as a baseline and as a record of what one
 laptop can train in a weekend, not as something to rely on.
 
-Project page: <https://quipu-lm.vercel.app>
+Project page: <https://quipu-lm.vercel.app> · Code: <https://github.com/Aneek1/quipu>
 
 ## Architecture
 
