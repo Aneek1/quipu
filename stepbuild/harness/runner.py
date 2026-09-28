@@ -83,6 +83,9 @@ class Attempt:
     reply: str                       # "" for step 6 and when the model was never called
     parse_error: str | None          # the BlockError message when the reply did not parse
     checks: tuple[CheckResult, ...]  # the step's checks, or one failed pseudo-check
+    # Indices (into library.examples) of the examples shown in this attempt's
+    # prompt, best first; () for step 6 and when nothing was retrieved.
+    examples: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,11 +144,15 @@ def _run_model_step(
     max_tokens: int,
 ) -> StepTrace:
     examples = library.top(step.title, k=N_EXAMPLES, prefer_paths=step.allowed_files)
+    # By identity, so two equal examples keep their own indices. A library without
+    # an `examples` sequence (a test double) records nothing.
+    position = {id(e): i for i, e in enumerate(getattr(library, "examples", ()))}
+    shown = tuple(position[id(e)] for e in examples if id(e) in position)
     files = project_files(sandbox.root)
     try:
         base = build_messages(plan, step, files, examples, max_tokens=max_tokens)
     except PromptTooLong as e:
-        attempt = Attempt("", None, _failed("prompt_too_long", str(e)))
+        attempt = Attempt("", None, _failed("prompt_too_long", str(e)), shown)
         return StepTrace(step.number, step.key, (attempt,), False)
 
     attempts: list[Attempt] = []
@@ -154,7 +161,9 @@ def _run_model_step(
         try:
             reply = model.complete(messages)
         except Exception as e:  # any backend failure; KeyboardInterrupt still stops the run
-            attempts.append(Attempt("", None, _failed("model_error", f"{type(e).__name__}: {e}")))
+            attempts.append(
+                Attempt("", None, _failed("model_error", f"{type(e).__name__}: {e}"), shown)
+            )
             return StepTrace(step.number, step.key, tuple(attempts), False)
         try:
             blocks = parse_blocks(reply, allowed=step.allowed_files)
@@ -165,11 +174,11 @@ def _run_model_step(
             write_blocks(sandbox, blocks)  # ValueError = refused before writing anything
         except ValueError as e:  # BlockError is a ValueError; OSError propagates
             checks = _failed("format", str(e))
-            attempts.append(Attempt(reply, str(e), checks))
+            attempts.append(Attempt(reply, str(e), checks, shown))
             messages = feedback_messages(base, reply, checks)
             continue
         checks = tuple(run_checks(sandbox, step.checks, step_key=step.key))
-        attempts.append(Attempt(reply, None, checks))
+        attempts.append(Attempt(reply, None, checks, shown))
         if all(c.passed for c in checks):
             return StepTrace(step.number, step.key, tuple(attempts), True)
         messages = feedback_messages(base, reply, [c for c in checks if not c.passed])
@@ -233,6 +242,7 @@ def result_to_dict(result: AppResult) -> dict[str, Any]:
                     {
                         "reply": a.reply,
                         "parse_error": a.parse_error,
+                        "examples": list(a.examples),
                         "checks": [dataclasses.asdict(c) for c in a.checks],
                     }
                     for a in s.attempts

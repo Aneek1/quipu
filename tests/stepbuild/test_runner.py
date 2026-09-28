@@ -377,14 +377,14 @@ def test_write_trace_round_trips_as_json(tmp_path):
             {
                 "number": 1, "key": "model", "passed": True,
                 "attempts": [{
-                    "reply": "reply one", "parse_error": None,
+                    "reply": "reply one", "parse_error": None, "examples": [],
                     "checks": [{"name": "pyflakes", "passed": True, "output": "", "seconds": 0.25}],
                 }],
             },
             {
                 "number": 2, "key": "routes", "passed": False,
                 "attempts": [{
-                    "reply": "chatter", "parse_error": "no FILE block found",
+                    "reply": "chatter", "parse_error": "no FILE block found", "examples": [],
                     "checks": [{
                         "name": "format", "passed": False,
                         "output": "no FILE block found", "seconds": 0.0,
@@ -393,6 +393,33 @@ def test_write_trace_round_trips_as_json(tmp_path):
             },
         ],
     }
+
+
+def test_attempts_record_the_retrieved_example_indices(sandbox):
+    """Each model-step attempt records which library examples were in its prompt
+    (their indices in library.examples), so a trace shows what the model saw."""
+    library = ExampleLibrary([
+        Example("Add a Store class to models",
+                "=== FILE: backend/models.py ===\nclass Store: pass\n=== END FILE ===\n"),
+        Example("unrelated zzz", "=== FILE: README.md ===\nqqq\n=== END FILE ===\n"),
+        Example("Write the Flask routes in app.py",
+                "=== FILE: backend/app.py ===\nx = 1\n=== END FILE ===\n"),
+    ])
+    bad = _break_python(REF[1])
+    model = ScriptedModel([REF[0], bad, *REF[1:]])
+    result = run_app(model, _backend_plan(), sandbox, library)
+    assert result.status == "passed_steps"
+    step1, step2 = result.steps[0], result.steps[1]
+    expected1 = tuple(library.examples.index(e) for e in library.top(
+        _backend_plan().steps[0].title, k=runner.N_EXAMPLES,
+        prefer_paths=_backend_plan().steps[0].allowed_files))
+    assert expected1 and step1.attempts[0].examples == expected1
+    assert len(step2.attempts) == 2
+    assert step2.attempts[0].examples == step2.attempts[1].examples != ()
+    assert all(i in range(3) for i in step2.attempts[0].examples)
+    assert result.steps[5].attempts[0].examples == ()
+    data = runner.result_to_dict(result)
+    assert data["steps"][0]["attempts"][0]["examples"] == list(expected1)
 
 
 def test_write_trace_is_atomic(tmp_path, monkeypatch):
