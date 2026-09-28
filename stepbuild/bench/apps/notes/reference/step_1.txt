@@ -3,7 +3,12 @@
 
 
 class Store:
-    """Keeps items in a dict keyed by an integer id assigned on create."""
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    """
 
     def __init__(self):
         self._items = {}

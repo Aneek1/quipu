@@ -80,6 +80,34 @@ def test_titles_state_the_cross_task_contract():
     assert "import Form from './components/Form.jsx'" in steps["wiring"]
 
 
+def test_titles_state_the_task4_review_decisions():
+    """Decisions D1-D5 from the Task 4 review: things a model otherwise has to guess."""
+    steps = {s.key: s.title for s in make_plan("todo", SPEC).steps}
+    # D2: what the Store returns for a missing id.
+    assert (
+        "`get` and `update` return None and `delete` returns False when the id does not "
+        "exist; `delete` returns True when it removed the item." in steps["model"]
+    )
+    # D5: which rules the validate function checks.
+    assert "one for each rule the spec states" in steps["model"]
+    assert "a missing or empty required field, a field of the wrong type, and any range rule" in steps["model"]
+    # D4: defaults are filled in on create.
+    assert (
+        "When creating, fill in the spec's default values for optional fields that were "
+        "left out." in steps["routes"]
+    )
+    # D1: PUT is a partial update validated after merging.
+    assert (
+        "For PUT, merge the sent fields into the existing item and validate the merged item "
+        "with the same validate function." in steps["routes"]
+    )
+    # D3: api.js must cover list, create and delete; more is allowed.
+    assert (
+        "exports async functions to list, create and delete items (it may export others)"
+        in steps["wiring"]
+    )
+
+
 def test_app_name_substitution_is_literal():
     # Titles are filled with str.replace, not str.format: braces in a title must
     # never be interpreted, whatever the table grows to contain.

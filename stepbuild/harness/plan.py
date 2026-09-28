@@ -98,9 +98,13 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
         "Write backend/models.py for the {app} app: a `Store` class that keeps items "
         "in a dict and assigns each new item an integer `id`, with methods "
         "create(data), list_items(), get(id), update(id, data) and delete(id); items "
-        "are plain dicts that include their `id`. Also write a validate_<entity>(data) "
-        "function for each entity created through the API, returning a list of error "
-        "strings for missing or invalid required fields (empty list when valid). "
+        "are plain dicts that include their `id`. `get` and `update` return None and "
+        "`delete` returns False when the id does not exist; `delete` returns True when "
+        "it removed the item. Also write a validate_<entity>(data) function for each "
+        "entity created through the API: validate_<entity>(data) returns a list of "
+        "error strings, one for each rule the spec states: a missing or empty required "
+        "field, a field of the wrong type, and any range rule (for example a negative "
+        "amount); the list is empty when the data is valid. "
         "Standard library only; no Flask imports in this file.",
     ),
     (
@@ -111,7 +115,10 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
         "creates a new Store() for each call and uses it in the routes; import from "
         "models with `from models import Store, ...`. Expose the REST endpoints described "
         "in the spec, all under /api/. Every item has the integer `id` assigned by the "
-        "store, and the list endpoint returns a JSON array of items. Return JSON and "
+        "store, and the list endpoint returns a JSON array of items. When creating, "
+        "fill in the spec's default values for optional fields that were left out. "
+        "For PUT, merge the sent fields into the existing item and validate the merged "
+        "item with the same validate function. Return JSON and "
         "proper status codes: 201 create, 200 read/update, 200 or 204 delete, 400 with "
         "an {\"error\": ...} body on validation errors, 404 missing, plus any other "
         "status codes the spec names (e.g. 401, 409). If the spec includes login, set "
@@ -146,7 +153,8 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
         ("frontend/src/api.js", "frontend/src/App.jsx"),
         ("npm_build",),
         "Wire up the {app} app frontend: frontend/src/api.js exports async functions "
-        "that call the backend endpoints from the spec with fetch (api.js calls "
+        "to list, create and delete items (it may export others) that call the "
+        "backend endpoints from the spec with fetch (api.js calls "
         "relative URLs under /api/, sends JSON bodies, throws on a non-2xx response), "
         "and frontend/src/App.jsx (default export App) does "
         "import List from './components/List.jsx' and "

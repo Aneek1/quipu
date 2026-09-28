@@ -176,6 +176,10 @@ def run_acceptance(app: str, project_root: Path, timeout_s: int = 180) -> CheckR
 **Files:** `stepbuild/bench/apps/{bookmarks,recipes,expenses,reading_list,habits,contacts,inventory,todo_auth}/**`.
 
 Same structure as Task 4. Specific requirements beyond CRUD: `expenses` rejects negative amounts (400); `habits` has a check-in endpoint that is idempotent per day; `inventory` rejects stock below zero on decrement (409); `todo_auth` uses Flask session login (register, login, logout; todos are per user; 401 when logged out). Keep every app small enough that each reference file is under 150 lines.
+Lessons from the Task 4 review (binding for Task 5):
+- Apply the D1–D5 wording (see the contract below): every spec states the partial-PUT rule, "ids are never reused, even after a delete", "every new app instance starts with no items", and names each of its 400 rules (required, type, range) explicitly.
+- `isinstance(True, int)` is True in Python. Acceptance tests for `expenses`/`inventory` (or any numeric field) must not send a bool and expect 400 unless that app's spec.md says booleans are rejected as numbers.
+- Acceptance tests must include the partial-PUT, PUT-validation and id-reuse cases, and must fail on the breakage mutations in `test_bench_reference.py`.
 - [ ] The Task 4 gate test must now cover all 10 apps and pass. Commit: "Add the remaining eight benchmark apps with acceptance tests and reference solutions".
 
 ### Task 6: Model interface, prompt and retrieval
@@ -303,13 +307,16 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 **`backend/models.py` (step 1).**
 - A `Store` class keeps items in a dict and gives each new item an integer `id`.
 - Its methods are `create(data)`, `list_items()`, `get(id)`, `update(id, data)` and `delete(id)`. Items are plain dicts that include their `id`.
-- There is one `validate_<entity>(data)` function for each entity created through the API. It returns a list of error strings, empty when the data is valid.
+- `get` and `update` return None and `delete` returns False when the id does not exist; `delete` returns True when it removed the item. (D2, Task 4 review.)
+- There is one `validate_<entity>(data)` function for each entity created through the API. It returns a list of error strings, one for each rule the spec states: a missing or empty required field, a field of the wrong type, and any range rule (for example a negative amount). The list is empty when the data is valid. (D5.)
 - Standard library only, no Flask imports.
 
 **`backend/app.py` (step 2).**
 - `create_app()` creates a new `Store()` on every call and uses it in the routes, so each app and each test starts empty.
 - It imports with `from models import Store, ...`.
 - Every endpoint is under `/api/` and returns JSON. The list endpoint returns a JSON array of items.
+- When creating, it fills in the spec's default values for optional fields that were left out. (D4.)
+- For PUT, it merges the sent fields into the existing item and validates the merged item with the same validate function, so PUT is a partial update. (D1.)
 - Status codes: 201 create, 200 read/update, 200 or 204 delete, 400 with an `{"error": ...}` body on validation errors, 404 missing, plus any code the spec names (401, 409).
 - Apps with login set `app.secret_key` inside `create_app()`.
 - Step 2 runs the `pyflakes` and `pytest` checks.
@@ -329,11 +336,13 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 **Frontend (steps 4–5).**
 - `List({items, onDelete})` renders the items, calls `onDelete(item.id)` and uses `item.id` as the React key.
 - `Form({onSubmit})` has controlled inputs for the fields of the app's main entity and clears itself after submit. Neither component makes network calls.
-- `api.js` has async fetch functions that call relative URLs under `/api/`, send JSON and throw on a non-2xx response.
+- `api.js` exports async functions to list, create and delete items (it may export others). They call relative URLs under `/api/`, send JSON and throw on a non-2xx response. (D3.)
 - `App.jsx` has a default export, loads the items on mount, and imports `List` and `Form` by explicit paths: `import List from './components/List.jsx'` and `import Form from './components/Form.jsx'`.
 
 **Benchmark `spec.md` (Tasks 4–5).**
 - Each spec names every endpoint (method plus `/api/` path), the required fields, the id field, the shape of the list response and any extra status codes.
+- Each spec also states, in these words: "ids are never reused, even after a delete"; "every new app instance starts with no items"; and "PUT accepts any subset of the fields; fields left out keep their values; a field that is sent follows the same rules as on create (so an empty `title` is 400)" (adapt the example field for apps without a `title`). `tests/stepbuild/test_bench_reference.py` checks for these phrases.
+- Each spec lists every 400 rule explicitly (missing/empty required fields, wrong types, range rules) with its default values, e.g. "a string that is not empty after trimming whitespace".
 - App-specific rules:
   - expenses: 400 on a negative amount.
   - inventory: 409 when stock would go below zero.
@@ -344,6 +353,7 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 - They define their own client and do not rely on the template's conftest.
 - They accept 200 or 204 on delete, and assert only that an `error` key exists (not its text).
 - They rely on the integer `id` and on the list endpoint returning a JSON array.
+- They cover, besides CRUD: a partial PUT keeps the fields left out; a PUT that breaks a create rule is 400; ids are not reused after a delete; each new app starts empty. The gate test `test_acceptance_catches_plausible_breakages` mutates each reference backend (full-replace PUT, unvalidated PUT, `len + 1` ids) and requires acceptance to fail; its patterns match the todo/notes reference code, so later references should keep the same shapes (`changes = {key: data[key] for key in FIELDS if key in data}`, `errors = validate_<entity>({**item, **changes})`, `item["id"] = self._next_id`) or extend the table.
 
 **Reference solutions.**
 - `reference/step_N.txt` writes exactly that step's allowed files: no more, no fewer.

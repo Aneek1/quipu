@@ -7,6 +7,7 @@ acceptance tests against a copy of the backend only; the npm-marked gate replays
 all five reference steps into a real sandbox, with every step's checks, the
 final step-6 checks and the acceptance run.
 """
+import re
 import shutil
 from pathlib import Path
 
@@ -64,6 +65,14 @@ def test_spec_is_one_paragraph_naming_api_endpoints(app):
     for method in ("GET", "POST", "PUT", "DELETE"):
         assert method in spec
     assert "400" in spec and "404" in spec and "error" in spec
+    assert "`id`" in spec and "JSON array" in spec
+    assert "ids are never reused, even after a delete" in spec
+    assert "every new app instance starts with no items" in spec.lower()
+    # D1: the partial-update rule, word for word.
+    assert (
+        "PUT accepts any subset of the fields; fields left out keep their values; a field "
+        "that is sent follows the same rules as on create (so an empty `title` is 400)" in spec
+    )
 
 
 @pytest.mark.parametrize("app", APPS)
@@ -117,6 +126,44 @@ def test_acceptance_passes_on_the_reference_backend(app, tmp_path):
     result = run_acceptance(app, root)
     assert result.passed, result.output
     assert "passed" in result.output
+
+
+# Plausible model mistakes the acceptance tests must catch: (file, pattern, replacement).
+BREAKAGES = {
+    # PUT replaces the whole item, so a partial PUT loses (or fails on) the other fields.
+    "full_replace_put": (
+        "backend/app.py",
+        r"changes = \{key: data\[key\] for key in FIELDS if key in data\}",
+        "changes = {key: data.get(key) for key in FIELDS}",
+    ),
+    # PUT skips validation.
+    "unvalidated_put": (
+        "backend/app.py",
+        r"errors = validate_\w+\(\{\*\*\w+, \*\*changes\}\)",
+        "errors = []",
+    ),
+    # ids from len + 1, so a delete lets a later create reuse an id.
+    "reused_ids": (
+        "backend/models.py",
+        r'item\["id"\] = self\._next_id',
+        'item["id"] = len(self._items) + 1',
+    ),
+}
+
+
+@pytest.mark.parametrize("breakage", sorted(BREAKAGES))
+@pytest.mark.parametrize("app", APPS)
+def test_acceptance_catches_plausible_breakages(app, breakage, tmp_path):
+    root = _backend_only(tmp_path)
+    _write_backend_steps(app, root)
+    rel, pattern, replacement = BREAKAGES[breakage]
+    path = root / rel
+    text = path.read_text(encoding="utf-8")
+    broken, count = re.subn(pattern, lambda _: replacement, text)
+    assert count == 1, f"{breakage}: pattern not found once in the {app} reference {rel}"
+    path.write_text(broken, encoding="utf-8")
+    result = run_acceptance(app, root)
+    assert not result.passed, f"{breakage} went unnoticed by the {app} acceptance tests"
 
 
 def test_acceptance_ignores_a_stray_pytest_config_above_its_temp_dir(tmp_path, monkeypatch):

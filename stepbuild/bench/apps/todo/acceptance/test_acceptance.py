@@ -72,6 +72,32 @@ def test_update(client):
     assert again["title"] == "Final" and again["done"] is True
 
 
+def test_partial_update_keeps_the_fields_left_out(client):
+    todo = create(client, title="Keep me")
+    response = client.put(f"/api/todos/{todo['id']}", json={"done": True})
+    assert response.status_code == 200
+    assert response.get_json()["title"] == "Keep me"
+    assert response.get_json()["done"] is True
+    again = client.get(f"/api/todos/{todo['id']}").get_json()
+    assert again["title"] == "Keep me" and again["done"] is True
+
+
+def test_update_with_an_empty_title_is_400(client):
+    todo = create(client, title="Valid")
+    response = client.put(f"/api/todos/{todo['id']}", json={"title": ""})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+    assert client.get(f"/api/todos/{todo['id']}").get_json()["title"] == "Valid"
+
+
+def test_ids_are_never_reused(client):
+    create(client, title="A")
+    b = create(client, title="B")
+    assert client.delete(f"/api/todos/{b['id']}").status_code in (200, 204)
+    c = create(client, title="C")
+    assert c["id"] != b["id"]
+
+
 def test_delete_then_404(client):
     todo = create(client, title="Temporary")
     response = client.delete(f"/api/todos/{todo['id']}")
@@ -92,8 +118,9 @@ def test_missing_title_is_400_with_an_error(client):
     assert "error" in response.get_json()
 
 
-def test_empty_title_is_400(client):
-    response = client.post("/api/todos", json={"title": ""})
+@pytest.mark.parametrize("title", ["", "   "])
+def test_empty_title_is_400(client, title):
+    response = client.post("/api/todos", json={"title": title})
     assert response.status_code == 400
     assert "error" in response.get_json()
 

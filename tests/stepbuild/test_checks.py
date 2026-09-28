@@ -164,6 +164,38 @@ def test_checks_see_an_unreachable_proxy(py_box):
     assert r.passed, r.output
 
 
+def test_check_env_is_public_and_strips_pythonpath(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "somewhere")
+    env = checks.check_env()
+    assert "PYTHONPATH" not in env
+    assert env["HTTP_PROXY"] == checks.UNREACHABLE_PROXY
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_run_command_check_passes_fails_and_trims_output(tmp_path):
+    env = checks.check_env()
+    ok = checks.run_command_check(
+        "demo", [sys.executable, "-c", "print('\\n'.join(str(i) for i in range(100)))"],
+        tmp_path, env, 30,
+    )
+    assert isinstance(ok, CheckResult)
+    assert ok.name == "demo" and ok.passed
+    assert ok.output.split("\n") == [str(i) for i in range(40, 100)]
+    bad = checks.run_command_check(
+        "demo", [sys.executable, "-c", "import sys; print('boom'); sys.exit(3)"], tmp_path, env, 30
+    )
+    assert not bad.passed and bad.output == "boom"
+
+
+def test_run_command_check_timeout_message(tmp_path):
+    r = checks.run_command_check(
+        "demo", [sys.executable, "-c", "import time; time.sleep(30)"], tmp_path,
+        checks.check_env(), 1,
+    )
+    assert not r.passed
+    assert r.output == "timed out after 1s"
+
+
 def _process_exited(pid: int, wait_ms: int) -> bool:
     import ctypes
     from ctypes import wintypes

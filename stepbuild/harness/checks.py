@@ -223,7 +223,11 @@ def run_with_timeout(
             job.close()  # kills detached grandchildren the check left behind
 
 
-def _check_env() -> dict[str, str]:
+def check_env() -> dict[str, str]:
+    """The environment every check runs in: no reachable network proxy, no npm
+    network access, UTF-8 output, no bytecode written into the project, no colour
+    codes, and no PYTHONPATH. A caller that needs PYTHONPATH (the acceptance run)
+    adds it back to the returned dict."""
     env = os.environ.copy()
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         env[var] = env[var.lower()] = UNREACHABLE_PROXY
@@ -254,6 +258,21 @@ def _tail(text: str, lines: int = OUTPUT_LINES) -> str:
     return "\n".join(text.replace("\r\n", "\n").rstrip("\n").split("\n")[-lines:])
 
 
+def run_command_check(
+    name: str, cmd: Sequence[str], cwd: Path, env: dict[str, str], timeout_s: float
+) -> CheckResult:
+    """Run one command as a check named `name`: passed means exit code 0, output is
+    the last 60 lines, and a timeout is a failed check whose output is exactly
+    "timed out after Ns" (its process tree killed). Every check, including the
+    benchmark's acceptance run, goes through here so they all report alike."""
+    start = time.monotonic()
+    code, output = run_with_timeout(cmd, cwd, env, timeout_s)
+    seconds = time.monotonic() - start
+    if code is None:
+        return CheckResult(name, False, f"timed out after {timeout_s}s", seconds)
+    return CheckResult(name, code == 0, _tail(output), seconds)
+
+
 def run_checks(
     sandbox: "Sandbox", names: Sequence[str], timeout_s: int = 180
 ) -> list[CheckResult]:
@@ -265,19 +284,13 @@ def run_checks(
     if unknown:
         raise ValueError(f"unknown check(s) {unknown}; expected some of {list(CHECK_NAMES)}")
     root = Path(sandbox.root)
-    env = _check_env()
+    env = check_env()
     results = []
     for name in names:
-        start = time.monotonic()
         command = _command(name, root)
         if isinstance(command, str):
             results.append(CheckResult(name, False, command, 0.0))
             continue
         cmd, cwd = command
-        code, output = run_with_timeout(cmd, cwd, env, timeout_s)
-        seconds = time.monotonic() - start
-        if code is None:
-            results.append(CheckResult(name, False, f"timed out after {timeout_s}s", seconds))
-        else:
-            results.append(CheckResult(name, code == 0, _tail(output), seconds))
+        results.append(run_command_check(name, cmd, cwd, env, timeout_s))
     return results

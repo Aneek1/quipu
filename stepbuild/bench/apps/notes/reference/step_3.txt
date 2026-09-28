@@ -69,4 +69,15 @@ def test_non_string_body_is_400(client):
 def test_missing_note_is_404(client):
     assert client.get("/api/notes/999").status_code == 404
     assert client.put("/api/notes/999", json={"title": "x"}).status_code == 404
+
+
+def test_ids_are_never_reused(client):
+    create(client, title="A")
+    b = create(client, title="B")
+    client.delete(f"/api/notes/{b['id']}")
+    assert create(client, title="C")["id"] != b["id"]
+
+
+def test_blank_title_is_400(client):
+    assert client.post("/api/notes", json={"title": "   "}).status_code == 400
 === END FILE ===

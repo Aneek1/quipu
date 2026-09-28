@@ -26,7 +26,8 @@ Two details keep the run honest:
   building the rest of the environment with the same helper the checks use (no
   network proxies, no bytecode written into the sandbox, UTF-8 output).
 
-The process is run with the checks' timeout helper, so a hung app (a server
+The run goes through the checks' `run_command_check`, so it reports exactly
+like the other checks: the last 60 lines of output, and a hung app (a server
 started at import time, an infinite loop) fails with "timed out after Ns" and
 its whole process tree is killed.
 """
@@ -36,11 +37,9 @@ import re
 import shutil
 import sys
 import tempfile
-import time
 from pathlib import Path
 
-from stepbuild.harness import checks
-from stepbuild.harness.checks import CheckResult, run_with_timeout
+from stepbuild.harness.checks import CheckResult, check_env, run_command_check
 
 APPS_DIR = Path(__file__).resolve().parent / "apps"
 N_REFERENCE_STEPS = 5
@@ -91,7 +90,6 @@ def run_acceptance(app: str, project_root: Path, timeout_s: int = 180) -> CheckR
     """Run the app's hidden acceptance tests against `project_root`/backend."""
     source = _app_dir(app) / "acceptance"
     backend = Path(project_root).resolve() / "backend"
-    start = time.monotonic()
     if not (backend / "app.py").is_file():
         return CheckResult(CHECK_NAME, False, f"no backend/app.py under {project_root}", 0.0)
     with tempfile.TemporaryDirectory(prefix=f"accept-{app}-", ignore_cleanup_errors=True) as tmp:
@@ -101,14 +99,10 @@ def run_acceptance(app: str, project_root: Path, timeout_s: int = 180) -> CheckR
         )
         ini = workdir / "pytest.ini"
         ini.write_text(_PYTEST_INI, encoding="utf-8")
-        env = checks._check_env()
+        env = check_env()
         env["PYTHONPATH"] = str(backend)
         cmd = [
             sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
             "-c", str(ini), "--rootdir", str(workdir), str(workdir),
         ]
-        code, output = run_with_timeout(cmd, workdir, env, timeout_s)
-    seconds = time.monotonic() - start
-    if code is None:
-        return CheckResult(CHECK_NAME, False, f"timed out after {timeout_s}s", seconds)
-    return CheckResult(CHECK_NAME, code == 0, checks._tail(output), seconds)
+        return run_command_check(CHECK_NAME, cmd, workdir, env, timeout_s)
