@@ -31,6 +31,7 @@ Run: uv run python scripts/needle_eval.py            (full default run)
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import random
@@ -45,7 +46,7 @@ import torch
 
 from quipu.config import Config, load_config
 from quipu.data import read_shard
-from quipu.fsio import replace_with_retry
+from quipu.fsio import write_text_atomic
 from quipu.memory.bm25 import BM25Index
 from quipu.memory.chunker import CHUNK_TOKENS, Chunk, chunk_spans
 from quipu.memory.dense import DenseIndex, E5Embedder, Embedder
@@ -130,13 +131,15 @@ def plant(base: np.ndarray, needle_ids: Sequence[int], depth: int) -> tuple[np.n
 
 def needle_chunk_index(pos: int, spans: Sequence[Chunk]) -> int:
     """The chunk the needle joins: the one containing base position `pos`, or the
-    last chunk when the needle goes after the final token."""
-    for c in spans:
-        if c.start <= pos < c.end:
-            return c.index
-    if pos == spans[-1].end:
-        return spans[-1].index
-    raise ValueError(f"position {pos} is outside the haystack [0, {spans[-1].end}]")
+    last chunk when the needle goes after the final token. O(1): every chunk but the
+    last is exactly as long as the first."""
+    if not spans:
+        raise ValueError("no chunks")
+    if not 0 <= pos <= spans[-1].end:
+        raise ValueError(f"position {pos} is outside the haystack [0, {spans[-1].end}]")
+    i = min(pos // len(spans[0]), len(spans) - 1)
+    assert spans[i].start <= pos <= spans[i].end, (pos, spans[i])
+    return spans[i].index
 
 
 def planted_chunk(base: np.ndarray, span: Chunk, pos: int, needle_ids: Sequence[int]) -> list[int]:
@@ -294,51 +297,151 @@ def aggregate(records: list[dict]) -> dict[str, dict]:
 
 # --------------------------------------------------------------------------
 # the run
+#
+# TODO (deliberately deferred after review): CSR postings for BM25 instead of dicts;
+# a lazy plant() that never materialises the 1M-token planted array; sharing the
+# greedy-decode / checkpoint-resolve helpers with milestone_eval; making
+# transformers an optional extra.
 # --------------------------------------------------------------------------
-
-
-def _write_text_atomic(path: Path, payload: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    replace_with_retry(tmp, path)
 
 
 def _cuda(device: str) -> bool:
     return str(device).startswith("cuda") and torch.cuda.is_available()
 
 
-def run_one(
-    *, model: Quipu, tok: Tokenizer, kind: str, haystack: np.ndarray, size: int,
-    depths: Sequence[int], trials: int, conditions: Sequence[str], device: str,
-    seed: int, embedder: Embedder | None, chunk_tokens: int, log: Callable[[str], None],
-    orders: Sequence[str] = ("document",),
-) -> dict:
-    budget = model.cfg.context - MAX_NEW_TOKENS
+@dataclasses.dataclass
+class Indexes:
+    """What a (haystack, size) builds once and every trial patches and restores."""
+
+    base_chunks: list[list[int]]
+    base_texts: list[str]
+    bm25: BM25Index | None
+    dense: DenseIndex | None
+    build_s: dict[str, float | None]
+    truncated_at_build: int | None = None
+
+
+def prepare_base(haystack: np.ndarray, size: int, chunk_tokens: int
+                 ) -> tuple[np.ndarray, list[Chunk], list[list[int]]]:
     base = haystack[: size - NEEDLE_RESERVE]
     spans = chunk_spans(len(base), chunk_tokens)
-    base_chunks = [base[c.start:c.end].tolist() for c in spans]
-    sep = tok.encode("\n")
-    is_break = newline_predicate(tok)
-    labels = condition_labels(conditions, orders)
+    return base, spans, [base[c.start:c.end].tolist() for c in spans]
 
+
+def build_indexes(base_chunks: list[list[int]], tok: Tokenizer, conditions: Sequence[str],
+                  embedder: Embedder | None) -> Indexes:
     build_s: dict[str, float | None] = {"bm25": None, "dense": None}
     bm25 = dense = None
     base_texts: list[str] = []
+    truncated = None
     if {"bm25", "fused"} & set(conditions):
         t0 = time.perf_counter()
         bm25 = BM25Index(base_chunks)
         build_s["bm25"] = time.perf_counter() - t0
     if {"dense", "fused"} & set(conditions):
+        if embedder is None:
+            raise ValueError("dense/fused conditions need an embedder")
+        before = getattr(embedder, "truncated", None)
         t0 = time.perf_counter()
         base_texts = [tok.decode(c) for c in base_chunks]
         dense = DenseIndex(base_texts, embedder)
         build_s["dense"] = time.perf_counter() - t0
-    log(f"  {kind} {format_size(size)}: {len(spans)} chunks, index build "
-        f"bm25={build_s['bm25'] if build_s['bm25'] is None else round(build_s['bm25'], 2)}s "
-        f"dense={build_s['dense'] if build_s['dense'] is None else round(build_s['dense'], 2)}s")
+        if before is not None:
+            truncated = embedder.truncated - before
+    return Indexes(base_chunks=base_chunks, base_texts=base_texts, bm25=bm25, dense=dense,
+                   build_s=build_s, truncated_at_build=truncated)
 
-    records: list[dict] = []
+
+@contextlib.contextmanager
+def patched(indexes: Indexes, ci: int, chunk: list[int], chunk_text: str):
+    """Swap the needle's chunk into both indexes for one trial, and always put the
+    originals back, even if a patch or anything inside the block fails. Only what
+    was actually patched is restored: BM25 from the base tokens (integer counts, so
+    exact), dense from the row saved beforehand (never re-embedded, see set_row)."""
+    bm25_patched = False
+    saved_row = None
+    try:
+        if indexes.bm25 is not None:
+            indexes.bm25.patch(ci, chunk)
+            bm25_patched = True
+        if indexes.dense is not None:
+            saved_row = indexes.dense.row(ci)
+            indexes.dense.patch(ci, chunk_text)
+        yield
+    finally:
+        if saved_row is not None:
+            indexes.dense.set_row(ci, saved_row)
+        if bm25_patched:
+            indexes.bm25.patch(ci, indexes.base_chunks[ci])
+
+
+def retrieve(cond: str, indexes: Indexes, prompt_ids: Sequence[int], prompt_text: str) -> list[int]:
+    """Chunk ids, best first. BM25 matches the prompt's token ids; dense embeds the
+    prompt text as an e5 query."""
+    if cond == "bm25":
+        return indexes.bm25.search(prompt_ids, RETRIEVE_K)
+    if cond == "dense":
+        return indexes.dense.search(prompt_text, RETRIEVE_K)
+    if cond == "fused":
+        return reciprocal_rank_fusion([
+            indexes.bm25.search(prompt_ids, RETRIEVE_K),
+            indexes.dense.search(prompt_text, RETRIEVE_K),
+        ])
+    raise ValueError(f"unknown retrieval condition {cond!r}")
+
+
+@dataclasses.dataclass(frozen=True)
+class TrialRecord:
+    haystack: str
+    size: int
+    depth: int
+    trial: int
+    condition: str
+    order: str
+    adjective: str
+    value: str
+    needle_pos: int
+    needle_chunk: int
+    needle_rank: int | None
+    ranking: list[int]
+    window_chunks: list[int]
+    window_tokens: int
+    hit: bool
+    passed: bool
+    continuation: str
+    latency_ms: float | None
+
+    def to_json(self) -> dict:
+        d = dataclasses.asdict(self)
+        d["pass"] = d.pop("passed")   # "pass" in the files; a keyword can't be a field
+        return d
+
+
+def run_one(
+    *, model: Quipu, tok: Tokenizer, kind: str, haystack: np.ndarray, size: int,
+    depths: Sequence[int], trials: int, conditions: Sequence[str], device: str,
+    seed: int, embedder: Embedder | None, chunk_tokens: int, log: Callable[[str], None],
+    orders: Sequence[str] = ("document",), indexes: Indexes | None = None,
+) -> dict:
+    """One (haystack, size). `indexes` may be passed in prebuilt (tests do, to check
+    that a whole run leaves them exactly as they were); otherwise built here."""
+    budget = model.cfg.context - MAX_NEW_TOKENS
+    base, spans, base_chunks = prepare_base(haystack, size, chunk_tokens)
+    if indexes is None:
+        indexes = build_indexes(base_chunks, tok, conditions, embedder)
+    elif indexes.base_chunks != base_chunks:
+        raise ValueError("prebuilt indexes were built on a different base haystack")
+    build_s = indexes.build_s
+    sep = tok.encode("\n")
+    is_break = newline_predicate(tok)
+    labels = condition_labels(conditions, orders)
+    fmt = lambda x: "n/a" if x is None else f"{x:.2f}s"
+    log(f"  {kind} {format_size(size)}: {len(spans)} chunks, index build "
+        f"bm25={fmt(build_s['bm25'])} dense={fmt(build_s['dense'])}")
+
+    emb = indexes.dense.embedder if indexes.dense is not None else None
+    trunc_before = getattr(emb, "truncated", None)
+    records: list[TrialRecord] = []
     peak: dict[str, float | None] = {label: None for _, _, label in labels}
     for depth in depths:
         for trial in range(trials):
@@ -351,12 +454,8 @@ def run_one(
             ci = needle_chunk_index(pos, spans)
             chunks = list(base_chunks)
             chunks[ci] = planted_chunk(base, spans[ci], pos, ids)
-            if bm25 is not None:
-                bm25.patch(ci, chunks[ci])
-            if dense is not None:
-                dense.patch(ci, tok.decode(chunks[ci]))
-
-            try:
+            chunk_text = tok.decode(chunks[ci]) if indexes.dense is not None else ""
+            with patched(indexes, ci, chunks[ci], chunk_text):
                 for cond, order, label in labels:
                     if _cuda(device):
                         torch.cuda.reset_peak_memory_stats()
@@ -367,57 +466,52 @@ def run_one(
                         window_chunks: list[int] = []
                     else:
                         t0 = time.perf_counter()
-                        if cond == "bm25":
-                            ranking = bm25.search(prompt, RETRIEVE_K)
-                        elif cond == "dense":
-                            ranking = dense.search(needle.prompt, RETRIEVE_K)
-                        elif cond == "fused":
-                            ranking = reciprocal_rank_fusion([
-                                bm25.search(prompt, RETRIEVE_K),
-                                dense.search(needle.prompt, RETRIEVE_K),
-                            ])
-                        else:
-                            raise ValueError(f"unknown condition {cond!r}")
+                        ranking = retrieve(cond, indexes, prompt, needle.prompt)
                         latency = (time.perf_counter() - t0) * 1000.0
                         packed = pack_window(ranking, chunks, prompt, budget, separator=sep,
                                              order=order, ends_with_break=is_break)
                         window = list(packed.tokens)
                         window_chunks = list(packed.chunk_ids)
                         hit = ci in packed.chunk_ids
-                    cont_ids = greedy_continue(model, window, MAX_NEW_TOKENS, device)
-                    cont = tok.decode(cont_ids)
+                    cont = tok.decode(greedy_continue(model, window, MAX_NEW_TOKENS, device))
                     if _cuda(device):
                         mb = torch.cuda.max_memory_allocated() / 2**20
                         peak[label] = mb if peak[label] is None else max(peak[label], mb)
-                    records.append({
-                        "haystack": kind, "size": size, "depth": depth, "trial": trial,
-                        "condition": label, "order": order, "adjective": needle.adjective, "value": needle.value,
-                        "needle_pos": pos, "needle_chunk": ci,
-                        "needle_rank": ranking.index(ci) if ci in ranking else None,
-                        "window_chunks": window_chunks, "window_tokens": len(window),
-                        "hit": bool(hit), "pass": needle.value in cont,
-                        "continuation": cont, "latency_ms": latency,
-                    })
-            finally:
-                # Restore the base chunk so the next trial starts from the clean index.
-                if bm25 is not None:
-                    bm25.patch(ci, base_chunks[ci])
-                if dense is not None:
-                    dense.patch(ci, base_texts[ci])
+                    records.append(TrialRecord(
+                        haystack=kind, size=size, depth=depth, trial=trial, condition=label,
+                        order=order, adjective=needle.adjective, value=needle.value,
+                        needle_pos=pos, needle_chunk=ci,
+                        needle_rank=ranking.index(ci) if ci in ranking else None,
+                        ranking=ranking, window_chunks=window_chunks, window_tokens=len(window),
+                        hit=bool(hit), passed=needle.value in cont, continuation=cont,
+                        latency_ms=latency,
+                    ))
 
-    aggregates = aggregate(records)
+    rows = [r.to_json() for r in records]
+    aggregates = aggregate(rows)
+    fused_build = (build_s["bm25"] + build_s["dense"]
+                   if build_s["bm25"] is not None and build_s["dense"] is not None else None)
+    build_for = {"off": None, "bm25": build_s["bm25"], "dense": build_s["dense"], "fused": fused_build}
     for cond, _, label in labels:
         aggregates[label]["peak_vram_mb"] = peak[label]
-        aggregates[label]["index_build_s"] = {
-            "off": None, "bm25": build_s["bm25"], "dense": build_s["dense"],
-            "fused": (build_s["bm25"] or 0.0) + (build_s["dense"] or 0.0)
-            if build_s["bm25"] is not None and build_s["dense"] is not None else None,
-        }[cond]
+        aggregates[label]["index_build_s"] = build_for[cond]
+    embedder_info = None
+    if emb is not None:
+        embedder_info = {
+            "model": getattr(emb, "model_name", type(emb).__name__),
+            "revision": getattr(emb, "revision", None),
+            # Passages longer than e5's max_length lose their tail: at index build,
+            # and among the per-trial re-embeds of the needle's chunk.
+            "truncated_passages": indexes.truncated_at_build,
+            "truncated_needle_chunks": (emb.truncated - trunc_before
+                                        if trunc_before is not None else None),
+        }
     return {
         "haystack": kind, "size": size, "size_label": format_size(size),
         "base_tokens": len(base), "chunks": len(spans), "chunk_tokens": chunk_tokens,
         "window_budget": budget, "depths": list(depths), "trials_per_depth": trials,
-        "seed": seed, "orders": list(orders), "index_build_s": build_s, "aggregates": aggregates, "trials": records,
+        "seed": seed, "orders": list(orders), "index_build_s": build_s,
+        "embedder": embedder_info, "aggregates": aggregates, "trials": rows,
     }
 
 
@@ -463,15 +557,15 @@ def run(
                 embedder=embedder, chunk_tokens=chunk_tokens, log=log, orders=orders,
             )
             res["seconds"] = time.perf_counter() - t0
-            _write_text_atomic(out_dir / f"{kind}_{format_size(size)}.json",
-                               json.dumps(res, indent=1))
+            write_text_atomic(out_dir / f"{kind}_{format_size(size)}.json",
+                              json.dumps(res, indent=1))
             line = ", ".join(
                 f"{c}: hit {a['hit_rate']:.2f} acc {a['accuracy']:.2f}"
                 for c, a in res["aggregates"].items()
             )
             log(f"  {kind} {format_size(size)} done in {res['seconds']:.1f}s -- {line}")
             results.append(res)
-    write_summary(out_dir)
+    write_summary(out_dir, log=log)
     return results
 
 
@@ -483,18 +577,26 @@ def _num(x: float | None, fmt: str) -> str:
     return "n/a" if x is None else format(x, fmt)
 
 
-def write_summary(out_dir: Path) -> None:
+SUMMARY_SETTINGS = ("chunk_tokens", "window_budget", "seed", "trials_per_depth")
+
+
+def write_summary(out_dir: Path, log: Callable[[str], None] = print) -> None:
     """One table over every result file in out_dir, so runs of different haystacks
-    or sizes into the same directory add up rather than overwrite each other."""
+    or sizes into the same directory add up rather than overwrite each other. Files
+    that can't be read are logged and skipped; if the files disagree on a setting
+    (chunk size, seed, ...) the table says so instead of implying one setting."""
     out_dir = Path(out_dir)
     results = []
-    for p in out_dir.glob("*.json"):
+    for p in sorted(out_dir.glob("*.json")):
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            log(f"  write_summary: skipped unreadable {p.name}: {type(exc).__name__}: {exc}")
             continue
-        if isinstance(data, dict) and "aggregates" in data and "haystack" in data:
-            results.append(data)
+        if not (isinstance(data, dict) and "aggregates" in data and "haystack" in data):
+            log(f"  write_summary: skipped {p.name}: not a needle_eval result file")
+            continue
+        results.append(data)
     results.sort(key=lambda d: (d["haystack"], d["size"]))
     lines = [
         "# Needle-in-a-haystack: approach A (retrieval memory)",
@@ -520,14 +622,25 @@ def write_summary(out_dir: Path) -> None:
                 f"| {_num(a.get('peak_vram_mb'), '.0f')} | {_num(a.get('index_build_s'), '.2f')} |"
             )
     if results:
-        r = results[0]
-        lines += [
-            "",
-            f"Chunks of {r['chunk_tokens']} tokens; window budget {r['window_budget']} tokens "
-            f"(context minus the {MAX_NEW_TOKENS} generated); seed {r['seed']}; "
-            f"{r['trials_per_depth']} trials per depth.",
-        ]
-    _write_text_atomic(out_dir / "summary.md", "\n".join(lines) + "\n")
+        settings = {k: sorted({json.dumps(d.get(k)) for d in results}) for k in SUMMARY_SETTINGS}
+        mixed = {k: v for k, v in settings.items() if len(v) > 1}
+        lines.append("")
+        if mixed:
+            detail = "; ".join(f"{k} = {', '.join(v)}" for k, v in mixed.items())
+            lines.append(f"**Warning: mixed settings across result files** ({detail}). "
+                         "Rows are not all comparable; see each JSON file.")
+            log(f"  write_summary: mixed settings across result files: {detail}")
+        else:
+            r = results[0]
+            lines.append(
+                f"Chunks of {r['chunk_tokens']} tokens; window budget {r['window_budget']} "
+                f"tokens (context minus the {MAX_NEW_TOKENS} generated); seed {r['seed']}; "
+                f"{r['trials_per_depth']} trials per depth."
+            )
+        emb = next((d["embedder"] for d in results if d.get("embedder")), None)
+        if emb:
+            lines.append(f"Dense embedder: {emb['model']} @ {emb['revision']}.")
+    write_text_atomic(out_dir / "summary.md", "\n".join(lines) + "\n")
 
 
 # --------------------------------------------------------------------------

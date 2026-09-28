@@ -62,3 +62,13 @@ def test_non_permission_error_is_not_retried(tmp_path, monkeypatch):
         replace_with_retry(src, dst)
 
     assert calls["n"] == 1
+
+
+def test_write_text_atomic(tmp_path):
+    from quipu.fsio import write_text_atomic
+    target = tmp_path / "sub" / "out.md"
+    write_text_atomic(target, "hello\n")
+    assert target.read_text(encoding="utf-8") == "hello\n"
+    write_text_atomic(target, "again\n")
+    assert target.read_text(encoding="utf-8") == "again\n"
+    assert not list(target.parent.glob("*.tmp"))

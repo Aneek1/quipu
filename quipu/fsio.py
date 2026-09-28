@@ -25,3 +25,17 @@ def replace_with_retry(
             if i == attempts - 1:
                 raise
             time.sleep(base_delay * 2**i)
+
+
+def write_text_atomic(path: str | Path, payload: str) -> None:
+    """Write UTF-8 text to a temp name beside `path`, then swap it in, so a reader (or a
+    crash) never sees a half-written file. Creates the parent directory."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    replace_with_retry(tmp, path)

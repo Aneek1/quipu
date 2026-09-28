@@ -407,3 +407,194 @@ def test_end_to_end_with_both_orders(tmp_path, tok):
         assert rec["window_tokens"] <= 128 - needle_eval.MAX_NEW_TOKENS
     summary = (out / "summary.md").read_text(encoding="utf-8")
     assert "| bm25+rank |" in summary
+
+
+# -------------------------------------------------- review follow-ups
+
+
+class BatchSensitiveEmbedder(HashEmbedder):
+    """Output depends on batch composition, as a padded GPU batch does in practice:
+    re-embedding one text alone never reproduces the row it got inside a batch."""
+
+    def embed_passages(self, texts):
+        return super().embed_passages(texts) + 1e-4 * len(texts)
+
+
+class FailingPatchEmbedder(HashEmbedder):
+    """Builds fine (many texts at once) but fails whenever a single chunk is patched."""
+
+    def embed_passages(self, texts):
+        if len(texts) == 1:
+            raise RuntimeError("embedder exploded mid-trial")
+        return super().embed_passages(texts)
+
+
+def _bm25_state(bm25):
+    return ({t: dict(p) for t, p in bm25._postings.items()}, bm25._len.copy().tolist(),
+            [dict(tf) for tf in bm25._tf])
+
+
+def _prepared(tok, embedder, size=200, chunk_tokens=16, conditions=("bm25", "dense")):
+    rng = np.random.RandomState(0)
+    hay = rng.randint(0, 50000, 300).astype(np.uint16)
+    base, spans, base_chunks = needle_eval.prepare_base(hay, size, chunk_tokens)
+    indexes = needle_eval.build_indexes(base_chunks, tok, list(conditions), embedder)
+    return hay, indexes
+
+
+def test_run_one_leaves_both_indexes_bit_identical(tok):
+    hay, indexes = _prepared(tok, BatchSensitiveEmbedder())
+    dense_before = indexes.dense.matrix()
+    bm25_before = _bm25_state(indexes.bm25)
+    needle_eval.run_one(
+        model=_tiny_model(), tok=tok, kind="code", haystack=hay, size=200,
+        depths=[0, 50, 100], trials=2, conditions=list(needle_eval.CONDITIONS),
+        device="cpu", seed=0, embedder=indexes.dense.embedder, chunk_tokens=16,
+        log=lambda m: None, indexes=indexes,
+    )
+    assert np.array_equal(indexes.dense.matrix(), dense_before)
+    assert _bm25_state(indexes.bm25) == bm25_before
+
+
+def test_failed_patch_leaves_no_index_patched(tok):
+    hay, indexes = _prepared(tok, FailingPatchEmbedder())
+    dense_before = indexes.dense.matrix()
+    bm25_before = _bm25_state(indexes.bm25)
+    with pytest.raises(RuntimeError, match="exploded"):
+        needle_eval.run_one(
+            model=_tiny_model(), tok=tok, kind="code", haystack=hay, size=200,
+            depths=[50], trials=1, conditions=["bm25", "dense"], device="cpu", seed=0,
+            embedder=indexes.dense.embedder, chunk_tokens=16, log=lambda m: None,
+            indexes=indexes,
+        )
+    assert _bm25_state(indexes.bm25) == bm25_before
+    assert np.array_equal(indexes.dense.matrix(), dense_before)
+
+
+def test_needle_on_a_chunk_boundary_and_at_the_end(tok):
+    base = np.arange(1000, 1064, dtype=np.uint16)            # 64 tokens = 4 chunks of 16
+    spans = chunk_spans(len(base), 16)
+    ids = needle_eval.needle_token_ids(needle_eval.make_needle("text", random.Random(3)), tok)
+    for depth, want_chunk in ((25, 1), (50, 2), (75, 3), (100, 3), (0, 0)):
+        planted, pos = needle_eval.plant(base, ids, depth)
+        assert pos % 16 == 0
+        ci = needle_eval.needle_chunk_index(pos, spans)
+        assert ci == want_chunk
+        chunks = [base[s.start:s.end].tolist() for s in spans]
+        chunks[ci] = needle_eval.planted_chunk(base, spans[ci], pos, ids)
+        assert sum(chunks, []) == planted.tolist()
+    with pytest.raises(ValueError):
+        needle_eval.needle_chunk_index(65, spans)
+    with pytest.raises(ValueError):
+        needle_eval.needle_chunk_index(-1, spans)
+
+
+class NeedleLastEmbedder:
+    """Dense retrieval that is wrong on purpose: any passage mentioning VAULT points
+    away from the query, so the needle chunk ranks last."""
+
+    def _vec(self, text: str) -> np.ndarray:
+        if "VAULT" in text and not text.startswith("__query__"):
+            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        h = (sum(text.encode()) % 97) / 1000.0
+        return np.array([1.0, 0.0, h], dtype=np.float32)
+
+    def embed_passages(self, texts):
+        return np.stack([self._vec(t) for t in texts])
+
+    def embed_queries(self, texts):
+        return np.stack([self._vec("__query__" + t) for t in texts])
+
+
+def test_fused_ranking_is_the_rrf_of_the_recorded_rankings(tmp_path, tok):
+    from quipu.memory.fusion import reciprocal_rank_fusion
+    shard_dir = tmp_path / "shards"
+    _write_haystacks(shard_dir)
+    out = tmp_path / "needle"
+    needle_eval.run(
+        model=_tiny_model(), tok=tok,
+        haystacks={"code": needle_eval.load_haystack(shard_dir, "code")},
+        sizes=[200], depths=[0, 50, 100], trials=2, conditions=["bm25", "dense", "fused"],
+        device="cpu", out_dir=out, seed=0, embedder_factory=NeedleLastEmbedder,
+        chunk_tokens=16,
+    )
+    data = json.loads((out / "code_200.json").read_text(encoding="utf-8"))
+    by = {}
+    for r in data["trials"]:
+        by.setdefault((r["depth"], r["trial"]), {})[r["condition"]] = r
+    n_chunks = data["chunks"]
+    for trial in by.values():
+        assert trial["bm25"]["needle_rank"] == 0
+        assert trial["dense"]["needle_rank"] == n_chunks - 1
+        expected = reciprocal_rank_fusion([trial["bm25"]["ranking"], trial["dense"]["ranking"]])
+        assert trial["fused"]["ranking"] == expected
+        assert trial["fused"]["needle_rank"] == expected.index(trial["fused"]["needle_chunk"])
+
+
+class ReportingEmbedder(HashEmbedder):
+    model_name = "fake/e5"
+    revision = "abc123"
+
+    def __init__(self):
+        self.truncated = 0
+
+    def embed_passages(self, texts):
+        self.truncated += 1
+        return super().embed_passages(texts)
+
+
+def test_embedder_identity_and_truncations_are_recorded(tmp_path, tok):
+    shard_dir = tmp_path / "shards"
+    _write_haystacks(shard_dir)
+    out = tmp_path / "needle"
+    needle_eval.run(
+        model=_tiny_model(), tok=tok,
+        haystacks={"text": needle_eval.load_haystack(shard_dir, "text")},
+        sizes=[64], depths=[0], trials=1, conditions=["dense"], device="cpu", out_dir=out,
+        seed=0, embedder_factory=ReportingEmbedder, chunk_tokens=16,
+    )
+    info = json.loads((out / "text_64.json").read_text(encoding="utf-8"))["embedder"]
+    assert info["model"] == "fake/e5" and info["revision"] == "abc123"
+    assert info["truncated_passages"] >= 1
+
+
+def test_e5_embed_empty_input_returns_empty_matrix():
+    from quipu.memory.dense import E5Embedder
+    e = E5Embedder.__new__(E5Embedder)       # no model load: the empty path never needs it
+    e.dim = 384
+    assert e._embed([]).shape == (0, 384)
+
+
+def test_e5_revision_is_pinned():
+    from quipu.memory import dense
+    assert len(dense.E5_REVISION) == 40
+    assert all(c in "0123456789abcdef" for c in dense.E5_REVISION)
+
+
+def _fake_result(**over):
+    d = {"haystack": "text", "size": 1000, "size_label": "1k", "chunk_tokens": 256,
+         "window_budget": 1016, "seed": 1, "trials_per_depth": 2,
+         "aggregates": {"off": {"trials": 2, "hit_rate": 1.0, "copy_given_hit": 0.5,
+                                "accuracy": 0.5, "by_depth": {"0": {"accuracy": 0.5}},
+                                "latency_ms_median": None}}}
+    d.update(over)
+    return d
+
+
+def test_summary_warns_on_mixed_settings_and_logs_skipped_files(tmp_path):
+    (tmp_path / "text_1k.json").write_text(json.dumps(_fake_result()), encoding="utf-8")
+    (tmp_path / "code_1k.json").write_text(
+        json.dumps(_fake_result(haystack="code", chunk_tokens=128, seed=2)), encoding="utf-8")
+    (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+    logged = []
+    needle_eval.write_summary(tmp_path, log=logged.append)
+    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "mixed settings" in summary.lower()
+    assert "chunk_tokens" in summary and "128" in summary
+    assert any("broken.json" in m for m in logged)
+
+
+def test_summary_single_settings_has_no_warning(tmp_path):
+    (tmp_path / "text_1k.json").write_text(json.dumps(_fake_result()), encoding="utf-8")
+    needle_eval.write_summary(tmp_path, log=lambda m: None)
+    assert "mixed settings" not in (tmp_path / "summary.md").read_text(encoding="utf-8").lower()

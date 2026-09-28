@@ -289,3 +289,39 @@ def test_window_rank_order_respects_budget_and_keeps_prompt_last():
 def test_window_rejects_unknown_order():
     with pytest.raises(ValueError):
         pack_window([0], _chunks(), [1], budget=50, order="random")
+
+
+# -------------------------------------------------- review follow-ups
+
+
+def test_bm25_zero_length_chunk_is_harmless():
+    index = BM25Index([[1, 2], [], [3, 1]])
+    assert index.search([1], k=5) == [0, 2] or index.search([1], k=5) == [2, 0]
+    assert index.search([99], k=5) == []
+    index.patch(0, [])
+    assert index.search([2], k=5) == []
+    assert np.all(np.isfinite(index.scores([1, 2, 3])))
+
+
+def test_bm25_ties_go_to_the_earlier_chunk():
+    index = BM25Index([[5, 6], [1, 2], [1, 2], [1, 2]])
+    assert index.search([1], k=3) == [1, 2, 3]
+
+
+def test_dense_row_and_set_row_restore_exactly():
+    emb = FakeEmbedder({"a": [1, 0, 0], "b": [0, 1, 0], "c": [0.3, 0.3, 0.9]})
+    index = DenseIndex(["a", "b", "c"], emb)
+    before = index.matrix()
+    saved = index.row(1)
+    index.patch(1, "c")
+    assert not np.array_equal(index.matrix(), before)
+    index.set_row(1, saved)
+    assert np.array_equal(index.matrix(), before)
+    # row() is a copy: mutating it must not touch the index
+    r = index.row(0)
+    r[:] = 7
+    assert np.array_equal(index.matrix(), before)
+    with pytest.raises(ValueError):
+        index.set_row(0, np.zeros(5, dtype=np.float32))
+    with pytest.raises(IndexError):
+        index.set_row(9, saved)
