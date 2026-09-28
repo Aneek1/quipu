@@ -1,0 +1,62 @@
+=== FILE: backend/app.py ===
+"""Flask API for the reading_list app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_book
+
+FIELDS = ("title", "author", "status")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/books")
+    def list_books():
+        return jsonify(store.list_items())
+
+    @app.post("/api/books")
+    def create_book():
+        data = request.get_json(silent=True)
+        errors = validate_book(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        book = store.create({
+            "title": data["title"],
+            "author": data["author"],
+            "status": data.get("status", "to-read"),
+        })
+        return jsonify(book), 201
+
+    @app.get("/api/books/<int:book_id>")
+    def get_book(book_id):
+        book = store.get(book_id)
+        if book is None:
+            return error("book not found", 404)
+        return jsonify(book)
+
+    @app.put("/api/books/<int:book_id>")
+    def update_book(book_id):
+        book = store.get(book_id)
+        if book is None:
+            return error("book not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_book({**book, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(book_id, changes))
+
+    @app.delete("/api/books/<int:book_id>")
+    def delete_book(book_id):
+        if not store.delete(book_id):
+            return error("book not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

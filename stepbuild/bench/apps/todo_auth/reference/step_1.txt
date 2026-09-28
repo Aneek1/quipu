@@ -1,0 +1,69 @@
+=== FILE: backend/models.py ===
+"""In-memory storage and validation for the todo_auth app."""
+
+
+class Store:
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    Todos are stored with an `owner` (the username); the routes filter on it.
+    """
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def create(self, data):
+        item = dict(data)
+        item["id"] = self._next_id
+        self._items[item["id"]] = item
+        self._next_id += 1
+        return dict(item)
+
+    def list_items(self):
+        return [dict(item) for item in self._items.values()]
+
+    def get(self, id):
+        item = self._items.get(id)
+        return dict(item) if item is not None else None
+
+    def update(self, id, data):
+        item = self._items.get(id)
+        if item is None:
+            return None
+        item.update(data)
+        item["id"] = id
+        return dict(item)
+
+    def delete(self, id):
+        return self._items.pop(id, None) is not None
+
+
+def validate_user(data):
+    """Return a list of error strings; empty when `data` can register a user."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    username = data.get("username")
+    if not isinstance(username, str) or not username.strip():
+        errors.append("username is required and must be a non-empty string")
+    password = data.get("password")
+    if not isinstance(password, str) or not password:
+        errors.append("password is required and must be a non-empty string")
+    return errors
+
+
+def validate_todo(data):
+    """Return a list of error strings; empty when `data` is a valid todo."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip():
+        errors.append("title is required and must be a non-empty string")
+    if "done" in data and not isinstance(data["done"], bool):
+        errors.append("done must be true or false")
+    return errors
+=== END FILE ===

@@ -1,0 +1,89 @@
+=== FILE: backend/tests/test_api.py ===
+"""API tests for the inventory app, using the client fixture from conftest.py."""
+
+
+def create(client, **body):
+    response = client.post("/api/items", json=body)
+    assert response.status_code == 201
+    return response.get_json()
+
+
+def test_create_returns_201_and_the_item(client):
+    item = create(client, name="Bolts")
+    assert isinstance(item["id"], int)
+    assert item["name"] == "Bolts"
+    assert item["quantity"] == 0
+
+
+def test_list_returns_a_json_array(client):
+    assert client.get("/api/items").get_json() == []
+    item = create(client, name="Bolts", quantity=10)
+    response = client.get("/api/items")
+    assert response.status_code == 200
+    assert response.get_json() == [item]
+
+
+def test_get_one(client):
+    item = create(client, name="Bolts")
+    response = client.get(f"/api/items/{item['id']}")
+    assert response.status_code == 200
+    assert response.get_json() == item
+
+
+def test_update(client):
+    item = create(client, name="Bolts")
+    response = client.put(f"/api/items/{item['id']}", json={"quantity": 7})
+    assert response.status_code == 200
+    assert response.get_json() == {**item, "quantity": 7}
+
+
+def test_update_rejects_a_negative_quantity(client):
+    item = create(client, name="Bolts")
+    response = client.put(f"/api/items/{item['id']}", json={"quantity": -1})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_delete_then_404(client):
+    item = create(client, name="Bolts")
+    assert client.delete(f"/api/items/{item['id']}").status_code == 204
+    assert client.get(f"/api/items/{item['id']}").status_code == 404
+    assert client.delete(f"/api/items/{item['id']}").status_code == 404
+
+
+def test_missing_name_is_400(client):
+    response = client.post("/api/items", json={"quantity": 1})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_bad_quantities_are_400(client):
+    for quantity in (-1, 1.5, "3", True):
+        body = {"name": "x", "quantity": quantity}
+        assert client.post("/api/items", json=body).status_code == 400, quantity
+
+
+def test_decrement(client):
+    item = create(client, name="Bolts", quantity=5)
+    url = f"/api/items/{item['id']}/decrement"
+    response = client.post(url, json={"amount": 3})
+    assert response.status_code == 200
+    assert response.get_json()["quantity"] == 2
+    assert client.post(url, json={"amount": 3}).status_code == 409
+    assert client.get(f"/api/items/{item['id']}").get_json()["quantity"] == 2
+    assert client.post(url, json={"amount": 2}).get_json()["quantity"] == 0
+
+
+def test_bad_decrement_amounts_are_400(client):
+    item = create(client, name="Bolts", quantity=5)
+    for amount in (None, 0, -1, 1.5, True):
+        body = {"amount": amount}
+        assert client.post(f"/api/items/{item['id']}/decrement", json=body).status_code == 400
+
+
+def test_ids_are_never_reused(client):
+    create(client, name="A")
+    b = create(client, name="B")
+    client.delete(f"/api/items/{b['id']}")
+    assert create(client, name="C")["id"] != b["id"]
+=== END FILE ===

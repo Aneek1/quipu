@@ -1,0 +1,63 @@
+=== FILE: backend/models.py ===
+"""In-memory storage and validation for the contacts app."""
+
+
+class Store:
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    """
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def create(self, data):
+        item = dict(data)
+        item["id"] = self._next_id
+        self._items[item["id"]] = item
+        self._next_id += 1
+        return dict(item)
+
+    def list_items(self):
+        return [dict(item) for item in self._items.values()]
+
+    def get(self, id):
+        item = self._items.get(id)
+        return dict(item) if item is not None else None
+
+    def update(self, id, data):
+        item = self._items.get(id)
+        if item is None:
+            return None
+        item.update(data)
+        item["id"] = id
+        return dict(item)
+
+    def delete(self, id):
+        return self._items.pop(id, None) is not None
+
+
+def _is_email(value):
+    if not isinstance(value, str) or value.count("@") != 1:
+        return False
+    local, domain = value.split("@")
+    return bool(local) and bool(domain)
+
+
+def validate_contact(data):
+    """Return a list of error strings; empty when `data` is a valid contact."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("name is required and must be a non-empty string")
+    if not _is_email(data.get("email")):
+        errors.append("email is required and must look like someone@example.com")
+    if "phone" in data and not isinstance(data["phone"], str):
+        errors.append("phone must be a string")
+    return errors
+=== END FILE ===

@@ -1,0 +1,77 @@
+=== FILE: frontend/src/api.js ===
+async function request(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { 'Content-Type': 'application/json' },
+  })
+  if (!response.ok) {
+    throw new Error(`${options.method || 'GET'} ${path} failed with status ${response.status}`)
+  }
+  if (response.status === 204) {
+    return null
+  }
+  return response.json()
+}
+
+export async function listItems() {
+  return request('/api/items')
+}
+
+export async function createItem(item) {
+  return request('/api/items', { method: 'POST', body: JSON.stringify(item) })
+}
+
+export async function deleteItem(id) {
+  return request(`/api/items/${id}`, { method: 'DELETE' })
+}
+
+export async function decrementItem(id, amount) {
+  return request(`/api/items/${id}/decrement`, { method: 'POST', body: JSON.stringify({ amount }) })
+}
+=== END FILE ===
+=== FILE: frontend/src/App.jsx ===
+import { useEffect, useState } from 'react'
+import List from './components/List.jsx'
+import Form from './components/Form.jsx'
+import { createItem, deleteItem, listItems } from './api.js'
+
+export default function App() {
+  const [items, setItems] = useState([])
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    listItems()
+      .then(setItems)
+      .catch((err) => setError(err.message))
+  }, [])
+
+  async function handleCreate(values) {
+    try {
+      const item = await createItem(values)
+      setItems((current) => [...current, item])
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  async function handleDelete(id) {
+    try {
+      await deleteItem(id)
+      setItems((current) => current.filter((item) => item.id !== id))
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  return (
+    <main>
+      <h1>Inventory</h1>
+      {error && <p role="alert">{error}</p>}
+      <Form onSubmit={handleCreate} />
+      <List items={items} onDelete={handleDelete} />
+    </main>
+  )
+}
+=== END FILE ===

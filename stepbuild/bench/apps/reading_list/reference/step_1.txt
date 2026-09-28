@@ -1,0 +1,57 @@
+=== FILE: backend/models.py ===
+"""In-memory storage and validation for the reading_list app."""
+
+STATUSES = ("to-read", "reading", "done")
+
+
+class Store:
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    """
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def create(self, data):
+        item = dict(data)
+        item["id"] = self._next_id
+        self._items[item["id"]] = item
+        self._next_id += 1
+        return dict(item)
+
+    def list_items(self):
+        return [dict(item) for item in self._items.values()]
+
+    def get(self, id):
+        item = self._items.get(id)
+        return dict(item) if item is not None else None
+
+    def update(self, id, data):
+        item = self._items.get(id)
+        if item is None:
+            return None
+        item.update(data)
+        item["id"] = id
+        return dict(item)
+
+    def delete(self, id):
+        return self._items.pop(id, None) is not None
+
+
+def validate_book(data):
+    """Return a list of error strings; empty when `data` is a valid book."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    for field in ("title", "author"):
+        value = data.get(field)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{field} is required and must be a non-empty string")
+    if "status" in data and data["status"] not in STATUSES:
+        errors.append("status must be one of " + ", ".join(STATUSES))
+    return errors
+=== END FILE ===

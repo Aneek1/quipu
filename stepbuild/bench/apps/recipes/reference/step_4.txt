@@ -1,0 +1,70 @@
+=== FILE: frontend/src/components/List.jsx ===
+export default function List({ items, onDelete }) {
+  if (items.length === 0) {
+    return <p>No recipes yet.</p>
+  }
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item.id}>
+          <strong>{item.title}</strong> <span>({item.minutes} min)</span>
+          {item.ingredients.length > 0 && <p>{item.ingredients.join(', ')}</p>}
+          <button type="button" onClick={() => onDelete(item.id)}>
+            Delete
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+=== END FILE ===
+=== FILE: frontend/src/components/Form.jsx ===
+import { useState } from 'react'
+
+export default function Form({ onSubmit }) {
+  const [title, setTitle] = useState('')
+  const [ingredients, setIngredients] = useState('')
+  const [minutes, setMinutes] = useState('0')
+
+  function handleSubmit(event) {
+    event.preventDefault()
+    if (!title.trim()) {
+      return
+    }
+    onSubmit({
+      title: title.trim(),
+      ingredients: ingredients
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean),
+      minutes: Math.max(0, parseInt(minutes, 10) || 0),
+    })
+    setTitle('')
+    setIngredients('')
+    setMinutes('0')
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        placeholder="Recipe title"
+      />
+      <input
+        value={ingredients}
+        onChange={(event) => setIngredients(event.target.value)}
+        placeholder="flour, eggs, milk"
+      />
+      <input
+        type="number"
+        min="0"
+        value={minutes}
+        onChange={(event) => setMinutes(event.target.value)}
+        aria-label="minutes"
+      />
+      <button type="submit">Add</button>
+    </form>
+  )
+}
+=== END FILE ===

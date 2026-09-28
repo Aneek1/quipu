@@ -1,0 +1,74 @@
+=== FILE: backend/models.py ===
+"""In-memory storage and validation for the inventory app."""
+
+
+class Store:
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    """
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def create(self, data):
+        item = dict(data)
+        item["id"] = self._next_id
+        self._items[item["id"]] = item
+        self._next_id += 1
+        return dict(item)
+
+    def list_items(self):
+        return [dict(item) for item in self._items.values()]
+
+    def get(self, id):
+        item = self._items.get(id)
+        return dict(item) if item is not None else None
+
+    def update(self, id, data):
+        item = self._items.get(id)
+        if item is None:
+            return None
+        item.update(data)
+        item["id"] = id
+        return dict(item)
+
+    def delete(self, id):
+        return self._items.pop(id, None) is not None
+
+
+def _is_int(value):
+    # bool is a subclass of int in Python, so booleans are rejected explicitly.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_item(data):
+    """Return a list of error strings; empty when `data` is a valid stock item."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("name is required and must be a non-empty string")
+    if "quantity" in data:
+        if not _is_int(data["quantity"]):
+            errors.append("quantity must be an integer")
+        elif data["quantity"] < 0:
+            errors.append("quantity must be 0 or more")
+    return errors
+
+
+def validate_decrement(data):
+    """Return a list of error strings; empty when `data` holds a valid amount."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    amount = data.get("amount")
+    if not _is_int(amount):
+        return ["amount is required and must be an integer"]
+    if amount < 1:
+        return ["amount must be 1 or more"]
+    return []
+=== END FILE ===

@@ -1,0 +1,106 @@
+=== FILE: backend/app.py ===
+"""Flask API for the todo_auth app: session login and per-user todos."""
+import secrets
+
+from flask import Flask, jsonify, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from models import Store, validate_todo, validate_user
+
+FIELDS = ("title", "done")
+
+
+def create_app():
+    app = Flask(__name__)
+    app.secret_key = secrets.token_hex(32)
+    store = Store()
+    users = {}  # username -> password hash, in memory only
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    def public(todo):
+        return {key: value for key, value in todo.items() if key != "owner"}
+
+    def own(todo_id):
+        """The logged-in user's todo, or None (someone else's todo counts as missing)."""
+        todo = store.get(todo_id)
+        if todo is None or todo["owner"] != session.get("username"):
+            return None
+        return todo
+
+    @app.before_request
+    def require_login():
+        if request.path.startswith("/api/todos") and session.get("username") not in users:
+            return error("log in first", 401)
+
+    @app.post("/api/auth/register")
+    def register():
+        data = request.get_json(silent=True)
+        errors = validate_user(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        if data["username"] in users:
+            return error("that username is taken", 409)
+        users[data["username"]] = generate_password_hash(data["password"])
+        return jsonify({"username": data["username"]}), 201
+
+    @app.post("/api/auth/login")
+    def login():
+        data = request.get_json(silent=True) or {}
+        username, password = data.get("username"), data.get("password")
+        stored = users.get(username) if isinstance(username, str) else None
+        if stored is None or not isinstance(password, str) or not check_password_hash(stored, password):
+            return error("wrong username or password", 401)
+        session["username"] = username
+        return jsonify({"username": username})
+
+    @app.post("/api/auth/logout")
+    def logout():
+        session.pop("username", None)
+        return jsonify({"ok": True})
+
+    @app.get("/api/todos")
+    def list_todos():
+        return jsonify([public(t) for t in store.list_items() if t["owner"] == session["username"]])
+
+    @app.post("/api/todos")
+    def create_todo():
+        data = request.get_json(silent=True)
+        errors = validate_todo(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        todo = store.create(
+            {"title": data["title"], "done": data.get("done", False), "owner": session["username"]}
+        )
+        return jsonify(public(todo)), 201
+
+    @app.get("/api/todos/<int:todo_id>")
+    def get_todo(todo_id):
+        todo = own(todo_id)
+        if todo is None:
+            return error("todo not found", 404)
+        return jsonify(public(todo))
+
+    @app.put("/api/todos/<int:todo_id>")
+    def update_todo(todo_id):
+        todo = own(todo_id)
+        if todo is None:
+            return error("todo not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_todo({**todo, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(public(store.update(todo_id, changes)))
+
+    @app.delete("/api/todos/<int:todo_id>")
+    def delete_todo(todo_id):
+        if own(todo_id) is None or not store.delete(todo_id):
+            return error("todo not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

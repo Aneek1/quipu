@@ -1,0 +1,62 @@
+=== FILE: backend/models.py ===
+"""In-memory storage and validation for the expenses app."""
+
+
+class Store:
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    """
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def create(self, data):
+        item = dict(data)
+        item["id"] = self._next_id
+        self._items[item["id"]] = item
+        self._next_id += 1
+        return dict(item)
+
+    def list_items(self):
+        return [dict(item) for item in self._items.values()]
+
+    def get(self, id):
+        item = self._items.get(id)
+        return dict(item) if item is not None else None
+
+    def update(self, id, data):
+        item = self._items.get(id)
+        if item is None:
+            return None
+        item.update(data)
+        item["id"] = id
+        return dict(item)
+
+    def delete(self, id):
+        return self._items.pop(id, None) is not None
+
+
+def validate_expense(data):
+    """Return a list of error strings; empty when `data` is a valid expense.
+
+    bool is a subclass of int in Python, so `amount` rejects booleans explicitly.
+    """
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    description = data.get("description")
+    if not isinstance(description, str) or not description.strip():
+        errors.append("description is required and must be a non-empty string")
+    amount = data.get("amount")
+    if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+        errors.append("amount is required and must be a number")
+    elif amount <= 0:
+        errors.append("amount must be greater than zero")
+    if "category" in data and not isinstance(data["category"], str):
+        errors.append("category must be a string")
+    return errors
+=== END FILE ===

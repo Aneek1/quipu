@@ -1,0 +1,76 @@
+=== FILE: backend/tests/test_api.py ===
+"""API tests for the bookmarks app, using the client fixture from conftest.py."""
+
+
+def create(client, **body):
+    body.setdefault("url", "https://example.com")
+    response = client.post("/api/bookmarks", json=body)
+    assert response.status_code == 201
+    return response.get_json()
+
+
+def test_create_returns_201_and_the_bookmark(client):
+    bookmark = create(client, title="Example")
+    assert isinstance(bookmark["id"], int)
+    assert bookmark["title"] == "Example"
+    assert bookmark["url"] == "https://example.com"
+    assert bookmark["note"] == ""
+
+
+def test_list_returns_a_json_array(client):
+    assert client.get("/api/bookmarks").get_json() == []
+    bookmark = create(client, title="Example")
+    response = client.get("/api/bookmarks")
+    assert response.status_code == 200
+    assert response.get_json() == [bookmark]
+
+
+def test_get_one(client):
+    bookmark = create(client, title="Example")
+    response = client.get(f"/api/bookmarks/{bookmark['id']}")
+    assert response.status_code == 200
+    assert response.get_json() == bookmark
+
+
+def test_update(client):
+    bookmark = create(client, title="Example")
+    response = client.put(f"/api/bookmarks/{bookmark['id']}", json={"note": "read later"})
+    assert response.status_code == 200
+    assert response.get_json() == {**bookmark, "note": "read later"}
+
+
+def test_update_rejects_a_bad_url(client):
+    bookmark = create(client, title="Example")
+    response = client.put(f"/api/bookmarks/{bookmark['id']}", json={"url": "example.com"})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_delete_then_404(client):
+    bookmark = create(client, title="Example")
+    assert client.delete(f"/api/bookmarks/{bookmark['id']}").status_code == 204
+    assert client.get(f"/api/bookmarks/{bookmark['id']}").status_code == 404
+    assert client.delete(f"/api/bookmarks/{bookmark['id']}").status_code == 404
+
+
+def test_missing_title_is_400(client):
+    response = client.post("/api/bookmarks", json={"url": "https://example.com"})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_missing_url_is_400(client):
+    assert client.post("/api/bookmarks", json={"title": "x"}).status_code == 400
+
+
+def test_non_string_note_is_400(client):
+    body = {"title": "x", "url": "https://example.com", "note": 3}
+    assert client.post("/api/bookmarks", json=body).status_code == 400
+
+
+def test_ids_are_never_reused(client):
+    create(client, title="A")
+    b = create(client, title="B")
+    client.delete(f"/api/bookmarks/{b['id']}")
+    assert create(client, title="C")["id"] != b["id"]
+=== END FILE ===

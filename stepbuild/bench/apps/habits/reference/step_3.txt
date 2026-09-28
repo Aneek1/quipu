@@ -1,0 +1,89 @@
+=== FILE: backend/tests/test_api.py ===
+"""API tests for the habits app, using the client fixture from conftest.py."""
+
+
+def create(client, **body):
+    response = client.post("/api/habits", json=body)
+    assert response.status_code == 201
+    return response.get_json()
+
+
+def test_create_returns_201_and_the_habit(client):
+    habit = create(client, name="Stretch")
+    assert isinstance(habit["id"], int)
+    assert habit["name"] == "Stretch"
+    assert habit["description"] == ""
+
+
+def test_list_returns_a_json_array(client):
+    assert client.get("/api/habits").get_json() == []
+    habit = create(client, name="Stretch", description="10 minutes")
+    response = client.get("/api/habits")
+    assert response.status_code == 200
+    assert response.get_json() == [habit]
+
+
+def test_get_one(client):
+    habit = create(client, name="Stretch")
+    response = client.get(f"/api/habits/{habit['id']}")
+    assert response.status_code == 200
+    assert response.get_json() == habit
+
+
+def test_update(client):
+    habit = create(client, name="Stretch")
+    response = client.put(f"/api/habits/{habit['id']}", json={"description": "daily"})
+    assert response.status_code == 200
+    assert response.get_json() == {**habit, "description": "daily"}
+
+
+def test_update_rejects_an_empty_name(client):
+    habit = create(client, name="Stretch")
+    response = client.put(f"/api/habits/{habit['id']}", json={"name": " "})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_delete_then_404(client):
+    habit = create(client, name="Stretch")
+    assert client.delete(f"/api/habits/{habit['id']}").status_code == 204
+    assert client.get(f"/api/habits/{habit['id']}").status_code == 404
+    assert client.delete(f"/api/habits/{habit['id']}").status_code == 404
+
+
+def test_missing_name_is_400(client):
+    response = client.post("/api/habits", json={"description": "x"})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_checkin_is_idempotent_per_day(client):
+    habit = create(client, name="Stretch")
+    url = f"/api/habits/{habit['id']}/checkins"
+    first = client.post(url, json={"date": "2026-09-28"})
+    assert first.status_code == 201
+    again = client.post(url, json={"date": "2026-09-28"})
+    assert again.status_code == 200
+    assert again.get_json() == first.get_json()
+    assert client.post(url, json={"date": "2026-09-29"}).status_code == 201
+    assert [c["date"] for c in client.get(url).get_json()] == ["2026-09-28", "2026-09-29"]
+
+
+def test_bad_checkin_dates_are_400(client):
+    habit = create(client, name="Stretch")
+    url = f"/api/habits/{habit['id']}/checkins"
+    for date in (None, "", "28/09/2026", "2026-02-30"):
+        assert client.post(url, json={"date": date}).status_code == 400, date
+
+
+def test_checkins_for_a_missing_habit_are_404(client):
+    assert client.get("/api/habits/999/checkins").status_code == 404
+    assert client.post("/api/habits/999/checkins", json={"date": "2026-09-28"}).status_code == 404
+
+
+def test_ids_are_never_reused(client):
+    create(client, name="A")
+    b = create(client, name="B")
+    client.delete(f"/api/habits/{b['id']}")
+    assert create(client, name="C")["id"] != b["id"]
+=== END FILE ===

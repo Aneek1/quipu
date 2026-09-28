@@ -1,0 +1,80 @@
+=== FILE: frontend/src/api.js ===
+async function request(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: { 'Content-Type': 'application/json' },
+  })
+  if (!response.ok) {
+    throw new Error(`${options.method || 'GET'} ${path} failed with status ${response.status}`)
+  }
+  if (response.status === 204) {
+    return null
+  }
+  return response.json()
+}
+
+export async function listExpenses() {
+  return request('/api/expenses')
+}
+
+export async function createExpense(expense) {
+  return request('/api/expenses', { method: 'POST', body: JSON.stringify(expense) })
+}
+
+export async function updateExpense(id, changes) {
+  return request(`/api/expenses/${id}`, { method: 'PUT', body: JSON.stringify(changes) })
+}
+
+export async function deleteExpense(id) {
+  return request(`/api/expenses/${id}`, { method: 'DELETE' })
+}
+=== END FILE ===
+=== FILE: frontend/src/App.jsx ===
+import { useEffect, useState } from 'react'
+import List from './components/List.jsx'
+import Form from './components/Form.jsx'
+import { createExpense, deleteExpense, listExpenses } from './api.js'
+
+export default function App() {
+  const [items, setItems] = useState([])
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    listExpenses()
+      .then(setItems)
+      .catch((err) => setError(err.message))
+  }, [])
+
+  async function handleCreate(values) {
+    try {
+      const expense = await createExpense(values)
+      setItems((current) => [...current, expense])
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  async function handleDelete(id) {
+    try {
+      await deleteExpense(id)
+      setItems((current) => current.filter((item) => item.id !== id))
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  const total = items.reduce((sum, item) => sum + item.amount, 0)
+
+  return (
+    <main>
+      <h1>Expenses</h1>
+      {error && <p role="alert">{error}</p>}
+      <Form onSubmit={handleCreate} />
+      <List items={items} onDelete={handleDelete} />
+      <p>Total: {total.toFixed(2)}</p>
+    </main>
+  )
+}
+=== END FILE ===

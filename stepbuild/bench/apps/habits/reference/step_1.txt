@@ -1,0 +1,75 @@
+=== FILE: backend/models.py ===
+"""In-memory storage and validation for the habits app."""
+import datetime
+import re
+
+
+class Store:
+    """Keeps items in a dict keyed by an integer id assigned on create.
+
+    Ids come from a counter, never from the number of items, so an id is never
+    reused after a delete. get and update return None and delete returns False
+    for an id that does not exist; delete returns True when it removed the item.
+    The app uses one Store for habits and another for check-ins.
+    """
+
+    def __init__(self):
+        self._items = {}
+        self._next_id = 1
+
+    def create(self, data):
+        item = dict(data)
+        item["id"] = self._next_id
+        self._items[item["id"]] = item
+        self._next_id += 1
+        return dict(item)
+
+    def list_items(self):
+        return [dict(item) for item in self._items.values()]
+
+    def get(self, id):
+        item = self._items.get(id)
+        return dict(item) if item is not None else None
+
+    def update(self, id, data):
+        item = self._items.get(id)
+        if item is None:
+            return None
+        item.update(data)
+        item["id"] = id
+        return dict(item)
+
+    def delete(self, id):
+        return self._items.pop(id, None) is not None
+
+
+def validate_habit(data):
+    """Return a list of error strings; empty when `data` is a valid habit."""
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    errors = []
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("name is required and must be a non-empty string")
+    if "description" in data and not isinstance(data["description"], str):
+        errors.append("description must be a string")
+    return errors
+
+
+def validate_checkin(data):
+    """Return a list of error strings; empty when `data` holds a valid date.
+
+    date.fromisoformat alone also accepts forms like "20260928", so the shape is
+    checked with a pattern first and the calendar with fromisoformat.
+    """
+    if not isinstance(data, dict):
+        return ["the request body must be a JSON object"]
+    date = data.get("date")
+    if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return ["date is required and must look like YYYY-MM-DD"]
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        return ["date must be a real calendar date"]
+    return []
+=== END FILE ===

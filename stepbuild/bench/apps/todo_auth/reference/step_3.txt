@@ -1,0 +1,79 @@
+=== FILE: backend/tests/test_api.py ===
+"""API tests for the todo_auth app, using the client fixture from conftest.py."""
+
+
+def sign_in(client, username="ada", password="secret"):
+    client.post("/api/auth/register", json={"username": username, "password": password})
+    response = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200
+
+
+def create(client, **body):
+    response = client.post("/api/todos", json=body)
+    assert response.status_code == 201
+    return response.get_json()
+
+
+def test_register_login_logout(client):
+    body = {"username": "ada", "password": "secret"}
+    assert client.post("/api/auth/register", json=body).status_code == 201
+    assert client.post("/api/auth/register", json=body).status_code == 409
+    wrong = {"username": "ada", "password": "nope"}
+    assert client.post("/api/auth/login", json=wrong).status_code == 401
+    assert client.post("/api/auth/login", json=body).get_json() == {"username": "ada"}
+    assert client.get("/api/todos").status_code == 200
+    assert client.post("/api/auth/logout").status_code == 200
+    assert client.get("/api/todos").status_code == 401
+
+
+def test_register_needs_a_username_and_password(client):
+    assert client.post("/api/auth/register", json={"password": "x"}).status_code == 400
+    assert client.post("/api/auth/register", json={"username": "ada"}).status_code == 400
+
+
+def test_todos_need_a_login(client):
+    assert client.get("/api/todos").status_code == 401
+    assert client.post("/api/todos", json={"title": "x"}).status_code == 401
+
+
+def test_create_list_get(client):
+    sign_in(client)
+    todo = create(client, title="Buy milk")
+    assert isinstance(todo["id"], int)
+    assert todo["title"] == "Buy milk" and todo["done"] is False
+    assert client.get("/api/todos").get_json() == [todo]
+    assert client.get(f"/api/todos/{todo['id']}").get_json() == todo
+
+
+def test_update(client):
+    sign_in(client)
+    todo = create(client, title="Buy milk")
+    response = client.put(f"/api/todos/{todo['id']}", json={"done": True})
+    assert response.status_code == 200
+    assert response.get_json() == {**todo, "done": True}
+    assert client.put(f"/api/todos/{todo['id']}", json={"title": ""}).status_code == 400
+
+
+def test_delete_then_404(client):
+    sign_in(client)
+    todo = create(client, title="Buy milk")
+    assert client.delete(f"/api/todos/{todo['id']}").status_code == 204
+    assert client.get(f"/api/todos/{todo['id']}").status_code == 404
+
+
+def test_missing_title_is_400(client):
+    sign_in(client)
+    response = client.post("/api/todos", json={"done": True})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_users_only_see_their_own_todos(client):
+    sign_in(client, "ada")
+    todo = create(client, title="Ada's")
+    client.post("/api/auth/logout")
+    sign_in(client, "bob")
+    assert client.get("/api/todos").get_json() == []
+    assert client.get(f"/api/todos/{todo['id']}").status_code == 404
+    assert client.delete(f"/api/todos/{todo['id']}").status_code == 404
+=== END FILE ===

@@ -1,0 +1,72 @@
+=== FILE: backend/app.py ===
+"""Flask API for the inventory app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_decrement, validate_item
+
+FIELDS = ("name", "quantity")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/items")
+    def list_items():
+        return jsonify(store.list_items())
+
+    @app.post("/api/items")
+    def create_item():
+        data = request.get_json(silent=True)
+        errors = validate_item(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        item = store.create({"name": data["name"], "quantity": data.get("quantity", 0)})
+        return jsonify(item), 201
+
+    @app.get("/api/items/<int:item_id>")
+    def get_item(item_id):
+        item = store.get(item_id)
+        if item is None:
+            return error("item not found", 404)
+        return jsonify(item)
+
+    @app.put("/api/items/<int:item_id>")
+    def update_item(item_id):
+        item = store.get(item_id)
+        if item is None:
+            return error("item not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_item({**item, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(item_id, changes))
+
+    @app.delete("/api/items/<int:item_id>")
+    def delete_item(item_id):
+        if not store.delete(item_id):
+            return error("item not found", 404)
+        return "", 204
+
+    @app.post("/api/items/<int:item_id>/decrement")
+    def decrement_item(item_id):
+        item = store.get(item_id)
+        if item is None:
+            return error("item not found", 404)
+        data = request.get_json(silent=True)
+        errors = validate_decrement(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        remaining = item["quantity"] - data["amount"]
+        if remaining < 0:
+            return error(f"only {item['quantity']} in stock", 409)
+        return jsonify(store.update(item_id, {"quantity": remaining}))
+
+    return app
+=== END FILE ===

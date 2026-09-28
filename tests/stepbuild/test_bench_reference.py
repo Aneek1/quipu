@@ -52,9 +52,14 @@ def _write_backend_steps(app, root):
             target.write_bytes(b.content.encode("utf-8"))
 
 
-def test_the_first_two_apps_are_present():
-    assert {"todo", "notes"} <= set(APPS)
-    assert APPS == sorted(APPS)
+ALL_APPS = [
+    "bookmarks", "contacts", "expenses", "habits", "inventory",
+    "notes", "reading_list", "recipes", "todo", "todo_auth",
+]
+
+
+def test_all_ten_apps_are_present():
+    assert APPS == ALL_APPS
 
 
 @pytest.mark.parametrize("app", APPS)
@@ -68,11 +73,15 @@ def test_spec_is_one_paragraph_naming_api_endpoints(app):
     assert "`id`" in spec and "JSON array" in spec
     assert "ids are never reused, even after a delete" in spec
     assert "every new app instance starts with no items" in spec.lower()
-    # D1: the partial-update rule, word for word.
-    assert (
-        "PUT accepts any subset of the fields; fields left out keep their values; a field "
-        "that is sent follows the same rules as on create (so an empty `title` is 400)" in spec
+    # D1: the partial-update rule, word for word; the example field is the app's
+    # own required string field (`title` where the app has one, else e.g. `name`).
+    d1 = re.search(
+        r"PUT accepts any subset of the fields; fields left out keep their values; a field "
+        r"that is sent follows the same rules as on create \(so an empty `(\w+)` is 400\)",
+        spec,
     )
+    assert d1, "the D1 partial-update sentence is missing"
+    assert f"`{d1.group(1)}` missing" in spec, "the D1 example field must be a required field"
 
 
 @pytest.mark.parametrize("app", APPS)
@@ -160,6 +169,44 @@ def test_acceptance_catches_plausible_breakages(app, breakage, tmp_path):
     path = root / rel
     text = path.read_text(encoding="utf-8")
     broken, count = re.subn(pattern, lambda _: replacement, text)
+    assert count == 1, f"{breakage}: pattern not found once in the {app} reference {rel}"
+    path.write_text(broken, encoding="utf-8")
+    result = run_acceptance(app, root)
+    assert not result.passed, f"{breakage} went unnoticed by the {app} acceptance tests"
+
+
+# App-specific rules the acceptance tests must also enforce: (app, file, pattern, replacement).
+APP_BREAKAGES = {
+    # An amount of zero slips through the "greater than zero" rule.
+    "expenses_zero_amount": (
+        "expenses", "backend/models.py", r"elif amount <= 0:", "elif amount < 0:",
+    ),
+    # A second check-in on the same day adds a duplicate instead of returning the first.
+    "habits_duplicate_checkin": (
+        "habits", "backend/app.py", r'if checkin\["date"\] == data\["date"\]:', "if False:",
+    ),
+    # Decrement lets stock go below zero.
+    "inventory_negative_stock": (
+        "inventory", "backend/app.py", r"if remaining < 0:", "if False:",
+    ),
+    # One user can read and change another user's todos.
+    "todo_auth_shared_todos": (
+        "todo_auth", "backend/app.py", r'todo\["owner"\] != session\.get\("username"\)', "False",
+    ),
+    # Todo endpoints answer without a login.
+    "todo_auth_no_login_check": (
+        "todo_auth", "backend/app.py", r'return error\("log in first", 401\)', "return None",
+    ),
+}
+
+
+@pytest.mark.parametrize("breakage", sorted(APP_BREAKAGES))
+def test_acceptance_catches_app_specific_breakages(breakage, tmp_path):
+    app, rel, pattern, replacement = APP_BREAKAGES[breakage]
+    root = _backend_only(tmp_path)
+    _write_backend_steps(app, root)
+    path = root / rel
+    broken, count = re.subn(pattern, lambda _: replacement, path.read_text(encoding="utf-8"))
     assert count == 1, f"{breakage}: pattern not found once in the {app} reference {rel}"
     path.write_text(broken, encoding="utf-8")
     result = run_acceptance(app, root)

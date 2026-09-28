@@ -1,0 +1,73 @@
+=== FILE: backend/tests/test_api.py ===
+"""API tests for the expenses app, using the client fixture from conftest.py."""
+
+
+def create(client, **body):
+    body.setdefault("amount", 12.5)
+    response = client.post("/api/expenses", json=body)
+    assert response.status_code == 201
+    return response.get_json()
+
+
+def test_create_returns_201_and_the_expense(client):
+    expense = create(client, description="Lunch")
+    assert isinstance(expense["id"], int)
+    assert expense["description"] == "Lunch"
+    assert expense["amount"] == 12.5
+    assert expense["category"] == "general"
+
+
+def test_list_returns_a_json_array(client):
+    assert client.get("/api/expenses").get_json() == []
+    expense = create(client, description="Lunch", category="food")
+    response = client.get("/api/expenses")
+    assert response.status_code == 200
+    assert response.get_json() == [expense]
+
+
+def test_get_one(client):
+    expense = create(client, description="Lunch")
+    response = client.get(f"/api/expenses/{expense['id']}")
+    assert response.status_code == 200
+    assert response.get_json() == expense
+
+
+def test_update(client):
+    expense = create(client, description="Lunch")
+    response = client.put(f"/api/expenses/{expense['id']}", json={"amount": 9})
+    assert response.status_code == 200
+    assert response.get_json() == {**expense, "amount": 9}
+
+
+def test_update_rejects_a_negative_amount(client):
+    expense = create(client, description="Lunch")
+    response = client.put(f"/api/expenses/{expense['id']}", json={"amount": -1})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_delete_then_404(client):
+    expense = create(client, description="Lunch")
+    assert client.delete(f"/api/expenses/{expense['id']}").status_code == 204
+    assert client.get(f"/api/expenses/{expense['id']}").status_code == 404
+    assert client.delete(f"/api/expenses/{expense['id']}").status_code == 404
+
+
+def test_missing_description_is_400(client):
+    response = client.post("/api/expenses", json={"amount": 3})
+    assert response.status_code == 400
+    assert "error" in response.get_json()
+
+
+def test_bad_amounts_are_400(client):
+    for amount in (-5, 0, "5", True):
+        body = {"description": "x", "amount": amount}
+        assert client.post("/api/expenses", json=body).status_code == 400, amount
+
+
+def test_ids_are_never_reused(client):
+    create(client, description="A")
+    b = create(client, description="B")
+    client.delete(f"/api/expenses/{b['id']}")
+    assert create(client, description="C")["id"] != b["id"]
+=== END FILE ===

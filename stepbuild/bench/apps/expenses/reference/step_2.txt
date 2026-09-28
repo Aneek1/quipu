@@ -1,0 +1,62 @@
+=== FILE: backend/app.py ===
+"""Flask API for the expenses app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_expense
+
+FIELDS = ("description", "amount", "category")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/expenses")
+    def list_expenses():
+        return jsonify(store.list_items())
+
+    @app.post("/api/expenses")
+    def create_expense():
+        data = request.get_json(silent=True)
+        errors = validate_expense(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        expense = store.create({
+            "description": data["description"],
+            "amount": data["amount"],
+            "category": data.get("category", "general"),
+        })
+        return jsonify(expense), 201
+
+    @app.get("/api/expenses/<int:expense_id>")
+    def get_expense(expense_id):
+        expense = store.get(expense_id)
+        if expense is None:
+            return error("expense not found", 404)
+        return jsonify(expense)
+
+    @app.put("/api/expenses/<int:expense_id>")
+    def update_expense(expense_id):
+        expense = store.get(expense_id)
+        if expense is None:
+            return error("expense not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_expense({**expense, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(expense_id, changes))
+
+    @app.delete("/api/expenses/<int:expense_id>")
+    def delete_expense(expense_id):
+        if not store.delete(expense_id):
+            return error("expense not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

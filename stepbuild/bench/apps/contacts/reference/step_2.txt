@@ -1,0 +1,60 @@
+=== FILE: backend/app.py ===
+"""Flask API for the contacts app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_contact
+
+FIELDS = ("name", "email", "phone")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/contacts")
+    def list_contacts():
+        return jsonify(store.list_items())
+
+    @app.post("/api/contacts")
+    def create_contact():
+        data = request.get_json(silent=True)
+        errors = validate_contact(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        contact = store.create(
+            {"name": data["name"], "email": data["email"], "phone": data.get("phone", "")}
+        )
+        return jsonify(contact), 201
+
+    @app.get("/api/contacts/<int:contact_id>")
+    def get_contact(contact_id):
+        contact = store.get(contact_id)
+        if contact is None:
+            return error("contact not found", 404)
+        return jsonify(contact)
+
+    @app.put("/api/contacts/<int:contact_id>")
+    def update_contact(contact_id):
+        contact = store.get(contact_id)
+        if contact is None:
+            return error("contact not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_contact({**contact, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(contact_id, changes))
+
+    @app.delete("/api/contacts/<int:contact_id>")
+    def delete_contact(contact_id):
+        if not store.delete(contact_id):
+            return error("contact not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

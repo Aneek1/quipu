@@ -1,0 +1,64 @@
+=== FILE: frontend/src/components/List.jsx ===
+export default function List({ items, onDelete }) {
+  if (items.length === 0) {
+    return <p>No books yet.</p>
+  }
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item.id}>
+          <strong>{item.title}</strong> <span>by {item.author}</span> <em>({item.status})</em>
+          <button type="button" onClick={() => onDelete(item.id)}>
+            Delete
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+=== END FILE ===
+=== FILE: frontend/src/components/Form.jsx ===
+import { useState } from 'react'
+
+const STATUSES = ['to-read', 'reading', 'done']
+
+export default function Form({ onSubmit }) {
+  const [title, setTitle] = useState('')
+  const [author, setAuthor] = useState('')
+  const [status, setStatus] = useState('to-read')
+
+  function handleSubmit(event) {
+    event.preventDefault()
+    if (!title.trim() || !author.trim()) {
+      return
+    }
+    onSubmit({ title: title.trim(), author: author.trim(), status })
+    setTitle('')
+    setAuthor('')
+    setStatus('to-read')
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        placeholder="Title"
+      />
+      <input
+        value={author}
+        onChange={(event) => setAuthor(event.target.value)}
+        placeholder="Author"
+      />
+      <select value={status} onChange={(event) => setStatus(event.target.value)}>
+        {STATUSES.map((value) => (
+          <option key={value} value={value}>
+            {value}
+          </option>
+        ))}
+      </select>
+      <button type="submit">Add</button>
+    </form>
+  )
+}
+=== END FILE ===

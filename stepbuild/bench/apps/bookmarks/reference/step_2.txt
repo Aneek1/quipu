@@ -1,0 +1,60 @@
+=== FILE: backend/app.py ===
+"""Flask API for the bookmarks app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_bookmark
+
+FIELDS = ("title", "url", "note")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/bookmarks")
+    def list_bookmarks():
+        return jsonify(store.list_items())
+
+    @app.post("/api/bookmarks")
+    def create_bookmark():
+        data = request.get_json(silent=True)
+        errors = validate_bookmark(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        bookmark = store.create(
+            {"title": data["title"], "url": data["url"], "note": data.get("note", "")}
+        )
+        return jsonify(bookmark), 201
+
+    @app.get("/api/bookmarks/<int:bookmark_id>")
+    def get_bookmark(bookmark_id):
+        bookmark = store.get(bookmark_id)
+        if bookmark is None:
+            return error("bookmark not found", 404)
+        return jsonify(bookmark)
+
+    @app.put("/api/bookmarks/<int:bookmark_id>")
+    def update_bookmark(bookmark_id):
+        bookmark = store.get(bookmark_id)
+        if bookmark is None:
+            return error("bookmark not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_bookmark({**bookmark, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(bookmark_id, changes))
+
+    @app.delete("/api/bookmarks/<int:bookmark_id>")
+    def delete_bookmark(bookmark_id):
+        if not store.delete(bookmark_id):
+            return error("bookmark not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

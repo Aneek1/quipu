@@ -1,0 +1,62 @@
+=== FILE: backend/app.py ===
+"""Flask API for the recipes app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_recipe
+
+FIELDS = ("title", "ingredients", "minutes")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    @app.get("/api/recipes")
+    def list_recipes():
+        return jsonify(store.list_items())
+
+    @app.post("/api/recipes")
+    def create_recipe():
+        data = request.get_json(silent=True)
+        errors = validate_recipe(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        recipe = store.create({
+            "title": data["title"],
+            "ingredients": data.get("ingredients", []),
+            "minutes": data.get("minutes", 0),
+        })
+        return jsonify(recipe), 201
+
+    @app.get("/api/recipes/<int:recipe_id>")
+    def get_recipe(recipe_id):
+        recipe = store.get(recipe_id)
+        if recipe is None:
+            return error("recipe not found", 404)
+        return jsonify(recipe)
+
+    @app.put("/api/recipes/<int:recipe_id>")
+    def update_recipe(recipe_id):
+        recipe = store.get(recipe_id)
+        if recipe is None:
+            return error("recipe not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_recipe({**recipe, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(recipe_id, changes))
+
+    @app.delete("/api/recipes/<int:recipe_id>")
+    def delete_recipe(recipe_id):
+        if not store.delete(recipe_id):
+            return error("recipe not found", 404)
+        return "", 204
+
+    return app
+=== END FILE ===

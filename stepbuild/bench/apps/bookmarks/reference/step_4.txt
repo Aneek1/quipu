@@ -1,0 +1,63 @@
+=== FILE: frontend/src/components/List.jsx ===
+export default function List({ items, onDelete }) {
+  if (items.length === 0) {
+    return <p>No bookmarks yet.</p>
+  }
+  return (
+    <ul>
+      {items.map((item) => (
+        <li key={item.id}>
+          <a href={item.url} target="_blank" rel="noreferrer">
+            {item.title}
+          </a>
+          {item.note && <span> - {item.note}</span>}
+          <button type="button" onClick={() => onDelete(item.id)}>
+            Delete
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+=== END FILE ===
+=== FILE: frontend/src/components/Form.jsx ===
+import { useState } from 'react'
+
+export default function Form({ onSubmit }) {
+  const [title, setTitle] = useState('')
+  const [url, setUrl] = useState('')
+  const [note, setNote] = useState('')
+
+  function handleSubmit(event) {
+    event.preventDefault()
+    if (!title.trim() || !url.trim()) {
+      return
+    }
+    onSubmit({ title: title.trim(), url: url.trim(), note })
+    setTitle('')
+    setUrl('')
+    setNote('')
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        placeholder="Title"
+      />
+      <input
+        value={url}
+        onChange={(event) => setUrl(event.target.value)}
+        placeholder="https://..."
+      />
+      <input
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        placeholder="Note (optional)"
+      />
+      <button type="submit">Add</button>
+    </form>
+  )
+}
+=== END FILE ===

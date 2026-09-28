@@ -1,0 +1,84 @@
+=== FILE: backend/app.py ===
+"""Flask API for the habits app."""
+from flask import Flask, jsonify, request
+
+from models import Store, validate_checkin, validate_habit
+
+FIELDS = ("name", "description")
+
+
+def create_app():
+    app = Flask(__name__)
+    store = Store()
+    checkins = Store()
+
+    def error(message, status):
+        return jsonify({"error": message}), status
+
+    def checkins_for(habit_id):
+        return [c for c in checkins.list_items() if c["habit_id"] == habit_id]
+
+    @app.get("/api/habits")
+    def list_habits():
+        return jsonify(store.list_items())
+
+    @app.post("/api/habits")
+    def create_habit():
+        data = request.get_json(silent=True)
+        errors = validate_habit(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        habit = store.create({"name": data["name"], "description": data.get("description", "")})
+        return jsonify(habit), 201
+
+    @app.get("/api/habits/<int:habit_id>")
+    def get_habit(habit_id):
+        habit = store.get(habit_id)
+        if habit is None:
+            return error("habit not found", 404)
+        return jsonify(habit)
+
+    @app.put("/api/habits/<int:habit_id>")
+    def update_habit(habit_id):
+        habit = store.get(habit_id)
+        if habit is None:
+            return error("habit not found", 404)
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("the request body must be a JSON object", 400)
+        changes = {key: data[key] for key in FIELDS if key in data}
+        errors = validate_habit({**habit, **changes})
+        if errors:
+            return error("; ".join(errors), 400)
+        return jsonify(store.update(habit_id, changes))
+
+    @app.delete("/api/habits/<int:habit_id>")
+    def delete_habit(habit_id):
+        if not store.delete(habit_id):
+            return error("habit not found", 404)
+        for checkin in checkins_for(habit_id):
+            checkins.delete(checkin["id"])
+        return "", 204
+
+    @app.get("/api/habits/<int:habit_id>/checkins")
+    def list_checkins(habit_id):
+        if store.get(habit_id) is None:
+            return error("habit not found", 404)
+        return jsonify(checkins_for(habit_id))
+
+    @app.post("/api/habits/<int:habit_id>/checkins")
+    def check_in(habit_id):
+        if store.get(habit_id) is None:
+            return error("habit not found", 404)
+        data = request.get_json(silent=True)
+        errors = validate_checkin(data)
+        if errors:
+            return error("; ".join(errors), 400)
+        for checkin in checkins_for(habit_id):
+            if checkin["date"] == data["date"]:
+                return jsonify(checkin), 200
+        checkin = checkins.create({"habit_id": habit_id, "date": data["date"]})
+        return jsonify(checkin), 201
+
+    return app
+=== END FILE ===
