@@ -23,8 +23,11 @@ message is fed back to the model as the reason its attempt failed):
   segment Windows would silently rewrite or treat as a device (trailing dot/space,
   CON/NUL/COM1...). Validation lives in FileBlock itself, so an unsafe FileBlock
   cannot exist, whoever builds it.
-- CRLF line endings (common in model output) are read as LF; parsed content
-  always uses LF.
+- CRLF and lone CR line endings (common in model output) are read as LF, both in
+  a reply and in FileBlock content, so a CRLF FileBlock equals its LF version and
+  parsed content always uses LF.
+- Duplicate paths are detected case-insensitively: App.jsx and app.jsx are the same
+  file on NTFS, and the second would silently overwrite the first.
 - Content keeps its exact text except the end: trailing newlines are normalised to
   exactly one (an all-blank file becomes empty), so a model's stray blank lines at
   the end neither change the file nor break equality.
@@ -71,8 +74,12 @@ def _validate_path(path: str) -> None:
             raise BlockError(f"path segment {seg!r} in {path!r} is a reserved device name")
 
 
+def _to_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _normalise_content(content: str) -> str:
-    body = content.rstrip("\n")
+    body = _to_lf(content).rstrip("\n")
     return body + "\n" if body else ""
 
 
@@ -87,10 +94,10 @@ class FileBlock:
 
 
 def _start_path(line: str) -> str | None:
-    """The path if `line` is a start marker, else None."""
-    if line == END_MARKER or not line.startswith(_START) or not line.endswith(_TAIL):
-        return None
-    if len(line) < len(_START) + len(_TAIL):
+    """The path if `line` is a start marker, else None. (A line that starts with
+    `=== FILE:` and ends with `===` is always long enough for the two not to overlap,
+    and is never the END marker, so no further checks are needed.)"""
+    if not line.startswith(_START) or not line.endswith(_TAIL):
         return None
     return line[len(_START):-len(_TAIL)].strip()
 
@@ -104,9 +111,9 @@ def render_blocks(blocks: Sequence[FileBlock]) -> str:
     seen: set[str] = set()
     out: list[str] = []
     for b in blocks:
-        if b.path in seen:
-            raise BlockError(f"file {b.path!r} appears more than once")
-        seen.add(b.path)
+        if b.path.casefold() in seen:
+            raise BlockError(f"file {b.path!r} appears more than once (paths ignore case)")
+        seen.add(b.path.casefold())
         if any(_is_marker(line) for line in b.content.split("\n")):
             raise BlockError(f"content of {b.path!r} contains a FILE marker line")
         out.append(f"{_START} {b.path} {_TAIL}\n{b.content}{END_MARKER}\n")
@@ -114,7 +121,11 @@ def render_blocks(blocks: Sequence[FileBlock]) -> str:
 
 
 def parse_blocks(text: str, allowed: Collection[str] | None = None) -> list[FileBlock]:
-    lines = text.replace("\r\n", "\n").split("\n")
+    if isinstance(allowed, str):
+        # `in` on a str is a substring test: "a.py" in "backend/a.py" would pass.
+        raise TypeError("allowed must be a collection of paths, not a single str")
+    allowed_set = None if allowed is None else frozenset(allowed)
+    lines = _to_lf(text).split("\n")
     blocks: list[FileBlock] = []
     seen: set[str] = set()
     current: str | None = None
@@ -126,16 +137,23 @@ def parse_blocks(text: str, allowed: Collection[str] | None = None) -> list[File
             if start is None:
                 continue  # chatter outside blocks, including a stray END marker
             _validate_path(start)
-            if start in seen:
-                raise BlockError(f"file {start!r} appears more than once; send each file once")
-            if allowed is not None and start not in allowed:
+            if start.casefold() in seen:
+                raise BlockError(
+                    f"file {start!r} appears more than once (paths ignore case); "
+                    "send each file once"
+                )
+            if allowed_set is not None and start not in allowed_set:
+                if not allowed_set:
+                    raise BlockError(
+                        f"file {start!r} is not allowed: no files may be written in this step"
+                    )
                 raise BlockError(
                     f"file {start!r} is not allowed in this step; allowed files: "
-                    + ", ".join(sorted(allowed))
+                    + ", ".join(sorted(allowed_set))
                 )
             current, body = start, []
         elif line == END_MARKER:
-            seen.add(current)
+            seen.add(current.casefold())
             blocks.append(FileBlock(current, "\n".join(body)))
             current = None
         elif start is not None:

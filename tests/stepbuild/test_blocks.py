@@ -139,3 +139,61 @@ def test_render_rejects_marker_lines_in_content():
 def test_render_rejects_duplicates():
     with pytest.raises(BlockError, match="more than once"):
         render_blocks([FileBlock("a.py", "1"), FileBlock("a.py", "2")])
+
+
+@pytest.mark.parametrize("content", ["x\r\ny\r\n", "x\ry\r", "x\r\ny", "x\r"])
+def test_carriage_returns_normalised_so_round_trip_holds(content):
+    b = FileBlock("a.py", content)
+    assert b == FileBlock("a.py", content.replace("\r\n", "\n").replace("\r", "\n"))
+    assert parse_blocks(render_blocks([b])) == [b]
+
+
+def test_lone_cr_line_endings_in_reply():
+    assert parse_blocks("=== FILE: a.py ===\rx\r=== END FILE ===\r") == [FileBlock("a.py", "x\n")]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".gitkeep",
+        ".env.example",
+        "frontend/vite.config.js",
+        "src/components/List.jsx",
+        "backend/tests/conftest.py",
+        ".github/workflows/ci.yml",
+        "a..b.py",
+    ],
+)
+def test_legitimate_paths_accepted(path):
+    b = FileBlock(path, "x\n")
+    assert b.path == path
+    assert parse_blocks(render_blocks([b])) == [b]
+    assert parse_blocks(render_blocks([b]), allowed={path}) == [b]
+
+
+def test_allowed_as_bare_string_is_a_type_error():
+    with pytest.raises(TypeError):
+        parse_blocks(_one("a.py"), allowed="backend/a.py")
+
+
+def test_allowed_empty_says_no_files_may_be_written():
+    with pytest.raises(BlockError, match="no files may be written in this step"):
+        parse_blocks(_one("a.py"), allowed=[])
+
+
+def test_duplicate_detection_ignores_case():
+    text = _one("frontend/src/App.jsx") + _one("frontend/src/app.jsx")
+    with pytest.raises(BlockError, match="more than once"):
+        parse_blocks(text)
+    with pytest.raises(BlockError, match="more than once"):
+        render_blocks([FileBlock("App.jsx", "1"), FileBlock("app.jsx", "2")])
+
+
+def test_trailing_whitespace_after_markers_tolerated():
+    text = "=== FILE: a.py === \t\nx = 1\n=== END FILE ===\t \n"
+    assert parse_blocks(text) == [FileBlock("a.py", "x = 1\n")]
+
+
+def test_colon_in_path_has_specific_message():
+    with pytest.raises(BlockError, match="':' in path"):
+        parse_blocks(_one("backend/a:b.py"))
