@@ -9,6 +9,7 @@ dependencies = [
     "tiktoken>=0.8",
     "datasets>=3.0",
     "tqdm>=4.66",
+    "safetensors>=0.8.0",
 ]
 
 [dependency-groups]

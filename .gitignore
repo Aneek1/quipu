@@ -7,3 +7,4 @@ checkpoints/
 *.bin
 *.pt
 *.safetensors
+hf_export/

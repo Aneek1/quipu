@@ -112,6 +112,18 @@
   .roadmap b { display: block; }
   .roadmap span { color: var(--muted); font-size: 15px; }
 
+  .chart-card { margin: 22px 0 8px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 8px; }
+  .chart-card svg { width: 100%; height: auto; display: block; }
+  .chart-card figcaption { font-size: 14px; color: var(--muted); padding: 6px 4px; }
+  .sub-h { font-family: Fraunces, Georgia, serif; font-size: 22px; margin: 36px 0 6px; }
+  .stepper { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 12px; }
+  .stepper button { font: 500 13px "JetBrains Mono", monospace; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; }
+  .stepper button[aria-selected="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .sample { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent2); border-radius: 12px; padding: 16px 18px; min-height: 96px; }
+  .sample b { font-weight: 600; }
+  .sample .loss { display: block; margin-top: 10px; font: 13px "JetBrains Mono", monospace; color: var(--muted); }
+  .roadmap li.done .k { background: var(--accent2); border-color: var(--accent2); }
+  .roadmap li.now .k { background: var(--bg); border-color: var(--accent); }
   footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--muted); font-size: 14px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
 
   @media (max-width: 820px) {
@@ -138,13 +150,13 @@
 
   <header class="hero">
     <div>
-      <span class="status"><span class="dot"></span>First training run: 25–27 Sep 2026</span>
+      <span class="status"><span class="dot"></span>quipu-114m trained · 25–27 Sep 2026</span>
       <h1>Quipu</h1>
       <p class="lede">A small language model, trained from scratch on a single 8&nbsp;GB laptop GPU.</p>
       <p class="sub">Own weights, own data pipeline, no fine-tuned base. The goal is a small model that pulls well above its size by remembering instead of memorising.</p>
       <div class="cta">
-        <a class="btn primary" href="#model">See the model</a>
-        <a class="btn ghost" href="https://huggingface.co/quipu-lm">huggingface.co/quipu-lm</a>
+        <a class="btn primary" href="#results">See the results</a>
+        <a class="btn ghost" href="https://huggingface.co/quipu-lm/quipu-114m">Download the weights</a>
       </div>
     </div>
     <figure class="quipu-fig" style="margin:0">
@@ -156,12 +168,12 @@
   <section id="model">
     <p class="kicker">quipu-114m</p>
     <h2>A 114M-parameter decoder, sized for one laptop.</h2>
-    <p class="muted">Every number here is measured on the machine that trains it, an RTX 5060 Laptop GPU with 8 GB.</p>
+    <p class="muted">Every number here was measured on the machine that trained it, an RTX 5060 Laptop GPU with 8 GB.</p>
     <div class="stats">
       <div class="stat"><b>114,114,048</b><span>parameters</span></div>
       <div class="stat"><b>3B</b><span>training tokens</span></div>
-      <div class="stat"><b>~16.5k</b><span>tokens / second, bf16</span></div>
-      <div class="stat"><b>~50 h</b><span>projected training time</span></div>
+      <div class="stat"><b>18.4k</b><span>tokens / second, bf16</span></div>
+      <div class="stat"><b>45 h 22 m</b><span>training time, zero restarts</span></div>
     </div>
 
     <div class="two" style="margin-top:40px">
@@ -207,28 +219,35 @@
     </div>
   </section>
 
-  <section>
+  <section id="results">
     <p class="kicker">Results</p>
-    <h2>Pending: the run is in progress.</h2>
-    <div class="pending">
-      Published here when training finishes:
-      <ul>
-        <li>Loss curves for text and code validation</li>
-        <li>What the model writes at each milestone, from step 100 to the end</li>
-        <li>A retrieval test hiding one fact in up to 1M tokens</li>
-      </ul>
+    <h2>It learned the shape of language in 45 hours.</h2>
+    <p class="muted">All 5,722 steps ran unattended over a weekend: no restarts, no skipped steps, no data repeated. Validation loss on held-out FineWeb-Edu text, measured every 100 steps:</p>
+    <figure class="chart-card">
+      <svg id="curve" viewBox="0 0 640 300" role="img" aria-label="Validation loss falls from 6.38 at step 100 to 3.27 at step 5,700"></svg>
+      <figcaption><span class="mono">6.38 → 3.27</span> text validation loss. Most of the gain comes in the first 1,000 steps (0.5B tokens); after that it is slow and steady, and nearly flat by the last few hundred steps.</figcaption>
+    </figure>
+
+    <h3 class="sub-h">Watch it learn</h3>
+    <p class="muted">Same prompt, greedy decoding, at each saved milestone.</p>
+    <div class="stepper" role="tablist" id="stepper"></div>
+    <div class="sample" id="sample" aria-live="polite"></div>
+
+    <div class="cards" style="margin-top:28px">
+      <div class="card"><span class="n">verdict</span><h3>Fluent, on topic, and often wrong.</h3><p>The final model says the printing press was invented "in 1848 by the French printer Pierre-Louis Leclerc". That is the honest result for a 114M base model: it has learned the form of knowledge without reliable facts, and it still repeats itself under greedy decoding.</p></div>
+      <div class="card"><span class="n">caveat · code</span><h3>The code loss of 0.97 flatters it.</h3><p>GPT-2's tokenizer splits indentation into single spaces: 36.5% of the code validation tokens are pure whitespace, against 2.0% for text. They are easy to predict, and greedy code output collapses into runs of spaces. That measurement is why the next model gets a code-aware tokenizer.</p></div>
     </div>
-    <p class="muted" style="margin-top:18px">quipu-114m is a base model. Expect fluent text and code-shaped output that is often wrong, and no instruction-following. That is the expected result at this scale, and the starting point.</p>
+    <p style="margin-top:22px"><a class="btn ghost" href="https://huggingface.co/quipu-lm/quipu-114m">Weights, milestones and model card on Hugging Face →</a></p>
   </section>
 
   <section id="next">
     <p class="kicker">Next</p>
     <h2>Where it goes from here.</h2>
     <ol class="roadmap">
-      <li class="now"><span class="k"></span><div><b>Pretraining at 114M</b><span>3B tokens, validating the whole pipeline end to end.</span></div></li>
-      <li><span class="k"></span><div><b>Memory for a 1M-token effective context</b><span>A short attention window plus a retrievable map of everything before it, on the same 8 GB card.</span></div></li>
+      <li class="done"><span class="k"></span><div><b>Pretraining at 114M · done</b><span>3B tokens in 45 hours on one laptop GPU. Weights are public.</span></div></li>
+      <li class="now"><span class="k"></span><div><b>Memory for a 1M-token effective context · next</b><span>A short attention window plus a retrievable map of everything before it, on the same 8 GB card.</span></div></li>
       <li><span class="k"></span><div><b>Instruction tuning</b><span>So it answers rather than continues.</span></div></li>
-      <li><span class="k"></span><div><b>350M with a code tokenizer and tool calling</b><span>Aimed at driving coding agents.</span></div></li>
+      <li><span class="k"></span><div><b>350M with a code tokenizer and tool calling</b><span>Aimed at driving coding agents. The whitespace result above is the measured reason for the new tokenizer.</span></div></li>
     </ol>
   </section>
 
@@ -274,6 +293,61 @@
     const t = el("text", { x, y: 284, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": "Inter, sans-serif" });
     t.textContent = name.replace(" (capped)", "").replace("JavaScript", "JS").replace("TypeScript", "TS");
   });
+
+  // Validation loss every 100 steps, from results/runs/quipu-114m-weekend.json.
+  const VAL = [[100, 6.378], [200, 5.471], [300, 4.926], [400, 4.612], [500, 4.364], [600, 4.17], [700, 4.047], [800, 3.959], [900, 3.879], [1000, 3.819], [1100, 3.774], [1200, 3.744], [1300, 3.708], [1400, 3.676], [1500, 3.648], [1600, 3.63], [1700, 3.601], [1800, 3.579], [1900, 3.567], [2000, 3.55], [2100, 3.529], [2200, 3.514], [2300, 3.509], [2400, 3.485], [2500, 3.472], [2600, 3.468], [2700, 3.452], [2800, 3.441], [2900, 3.441], [3000, 3.424], [3100, 3.41], [3200, 3.402], [3300, 3.393], [3400, 3.385], [3500, 3.376], [3600, 3.369], [3700, 3.362], [3800, 3.353], [3900, 3.348], [4000, 3.346], [4100, 3.332], [4200, 3.326], [4300, 3.323], [4400, 3.317], [4500, 3.312], [4600, 3.308], [4700, 3.303], [4800, 3.299], [4900, 3.293], [5000, 3.29], [5100, 3.286], [5200, 3.281], [5300, 3.282], [5400, 3.281], [5500, 3.276], [5600, 3.274], [5700, 3.275]];
+  (function drawCurve() {
+    const svg = document.getElementById("curve");
+    const W = 640, H = 300, L = 44, R = 14, T = 14, B = 34;
+    const xmax = 5722, ymin = 3.0, ymax = 6.6;
+    const X = s => L + (s / xmax) * (W - L - R);
+    const Y = v => T + (ymax - v) / (ymax - ymin) * (H - T - B);
+    const add = (tag, attrs, text) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (text) n.textContent = text; svg.appendChild(n); return n; };
+    for (const v of [3, 4, 5, 6]) {
+      add("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: "var(--line)", "stroke-width": 1 });
+      add("text", { x: L - 8, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "var(--muted)", "font-family": "JetBrains Mono, monospace" }, v.toFixed(1));
+    }
+    for (const s of [0, 1000, 2000, 3000, 4000, 5000]) {
+      add("text", { x: X(s), y: H - 12, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": "JetBrains Mono, monospace" }, s === 0 ? "0" : (s / 1000) + "k");
+    }
+    add("text", { x: W - R, y: H - 12, "text-anchor": "end", "font-size": 11, fill: "var(--muted)", "font-family": "Inter, sans-serif" }, "step");
+    const d = VAL.map(([s, v], i) => (i ? "L" : "M") + X(s).toFixed(1) + " " + Y(v).toFixed(1)).join(" ");
+    const area = d + ` L ${X(VAL[VAL.length - 1][0]).toFixed(1)} ${Y(ymin)} L ${X(VAL[0][0]).toFixed(1)} ${Y(ymin)} Z`;
+    add("path", { d: area, fill: "var(--accent2)", opacity: 0.12 });
+    add("path", { d, stroke: "var(--accent2)", "stroke-width": 2.5, fill: "none", "stroke-linejoin": "round" });
+    const last = VAL[VAL.length - 1];
+    add("circle", { cx: X(last[0]), cy: Y(last[1]), r: 4, fill: "var(--accent)" });
+    add("text", { x: X(last[0]) - 6, y: Y(last[1]) - 10, "text-anchor": "end", "font-size": 12, fill: "var(--fg)", "font-family": "JetBrains Mono, monospace" }, last[1].toFixed(2));
+  })();
+
+  // Greedy samples for one prompt, from results/milestones/samples.md (trimmed).
+  const PROMPT = "Photosynthesis is the process by which";
+  const SAMPLES = [
+    [100, 6.40, "the first is the first of the first time of the first time of the first time of the first time…"],
+    [250, 5.20, "the system is not the same. The current is the most common type of the system, which is the most common type of the system."],
+    [500, 4.40, "the temperature is measured. The temperature of the temperature is measured by the temperature of the temperature…"],
+    [1000, 3.85, "the body absorbs energy from the sun. The sun is the most abundant source of energy in the sun."],
+    [2000, 3.58, "plants grow and reproduce. Plants are able to produce energy from the sun and sunlight."],
+    [4000, 3.38, "plants convert carbon dioxide into oxygen and convert it into energy."],
+    [5722, 3.31, "plants convert carbon dioxide into oxygen and release carbon dioxide into the atmosphere."]
+  ];
+  const stepper = document.getElementById("stepper"), sample = document.getElementById("sample");
+  function show(i) {
+    const [step, loss, text] = SAMPLES[i];
+    [...stepper.children].forEach((b, j) => b.setAttribute("aria-selected", String(i === j)));
+    sample.innerHTML = "";
+    const b = document.createElement("b"); b.textContent = PROMPT + " ";
+    const l = document.createElement("span"); l.className = "loss";
+    l.textContent = `step ${step.toLocaleString()} · ${(step * 524288 / 1e9).toFixed(2)}B tokens seen · text val loss ${loss.toFixed(2)}`;
+    sample.append(b, document.createTextNode(text), l);
+  }
+  SAMPLES.forEach(([step], i) => {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.setAttribute("role", "tab"); btn.textContent = step.toLocaleString();
+    btn.addEventListener("click", () => show(i));
+    stepper.appendChild(btn);
+  });
+  show(SAMPLES.length - 1);
 </script>
 </body>
 </html>
