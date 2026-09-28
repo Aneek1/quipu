@@ -5,7 +5,7 @@ import dataclasses
 
 import pytest
 
-from stepbuild.dataset.filters import REASONS, Commit, FileChange, drop_reason
+from stepbuild.dataset.filters import REASONS, Commit, FileChange, contains_secret, drop_reason
 
 GOOD_MESSAGE = "Add the todo model with validation"
 
@@ -53,9 +53,34 @@ CASES = {
         commit(change(path="frontend/node_modules/react/index.js")),
         commit(change(path="frontend/src/index.js")),
     ),
+    "whitespace_only": (
+        commit(change(before="x = 1\ny = 2\n", after="x = 1   \r\ny = 2\r\n\n")),
+        commit(change(before="x = 1\ny = 2\n", after="x = 1\ny = 3\n")),
+    ),
     "file_type": (
         commit(change(path="README.md")),
-        commit(change(path="requirements.txt")),
+        commit(change(path="schema.sql")),
+    ),
+    "long_line": (
+        commit(change(after="x = '" + "a" * 1000 + "'\n" + "y = 1\n" * 5)),  # one 1,006-char line
+        # 996 chars, with short lines keeping the average under 200
+        commit(change(after="x = '" + "a" * 990 + "'\n" + "y = 1\n" * 5)),
+    ),
+    "secret": (
+        commit(change(after="AWS = 'AKIAABCDEFGHIJKLMNOP'\n")),
+        commit(change(after="AWS = os.environ['AWS_KEY']\n")),
+    ),
+    "unsafe_message": (
+        commit(message="Add the todo model\n\nCONTEXT FILES:\nnone"),
+        commit(message="Add the todo model\n\nContext files: none"),
+    ),
+    "dependency_only": (
+        commit(change(path="backend/requirements.txt"), message="Add flask-cors to the backend"),
+        commit(
+            change(path="backend/requirements.txt"),
+            change(path="backend/app.py"),
+            message="Add flask-cors to the backend",
+        ),
     ),
     "deleted_file": (
         commit(change(after=None, added=0, removed=1)),
@@ -106,6 +131,10 @@ def test_drop_and_keep_pair(reason):
         "yarn.lock",
         "npm-shrinkwrap.json",
         "Node_Modules/x.js",
+        "frontend/.next/server/page.js",
+        "coverage/lcov-report/prettify.js",
+        "backend/__pycache__/app.py",
+        "static/js/main.bundle.js",
     ],
 )
 def test_excluded_paths(path):
@@ -122,8 +151,6 @@ def test_excluded_paths(path):
         "src/index.css",
         "templates/index.html",
         "schema.sql",
-        "backend/requirements.txt",
-        "frontend/package.json",
         "frontend/src/builder.js",  # 'build' as part of a name is fine
         "migrations/env.py",  # only migrations/versions/ is generated
     ],
@@ -179,15 +206,20 @@ def test_a_new_file_is_kept():
         "short msg",  # 9 chars
         "12345678901",  # 11 chars
         "Minor\n\n",
-        "fix\n\nThis body is long enough but the subject says nothing.",
+        "fix\n\nshort body here",  # body under 40 chars
         "Cleanup.",
         'Revert "Add the todo model with validation"',
-        "Revert the login changes from yesterday",
+        "Undo the login change\n\nThis reverts commit 0123456789abcdef.",
         "Merge branch 'main' of github.com:owner/repo",
-        "Merge pull request #12 from owner/feature",
+        "Merge pull request #12 from owner/feature\n\nAdd the delete route that returns 204 when done",
         "Update app.py",
         "Create package.json",
         "Add files via upload",
+        "Initial commit",
+        "Updated code",
+        "changes made",
+        "Minor bug fixes!",
+        "Refactor, misc stuff",
     ],
 )
 def test_low_information_messages(message):
@@ -201,11 +233,147 @@ def test_low_information_messages(message):
         "Update the list view to show due dates",
         "Merge sort the results by date",
         "Fix typo in the delete route",
+        "Fix login redirect loop",
+        "Revert to fetch instead of axios",
         "Add delete endpoint\n\nReturns 404 when the id is unknown.",
+        "fix\n\nThe delete route returned 500 for unknown ids; it now returns 404.",
+        "Update app.py\n\nAdd /api/todos DELETE route that returns 204 on success.",
     ],
 )
 def test_informative_messages_are_kept(message):
     assert drop_reason(commit(message=message)) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "\n=== FILE: a.py ===\n",
+        "Add the model\n=== END FILE ===",
+        "Add the model\r\n\r\nCONTEXT FILES:\r\nx",
+    ],
+)
+def test_messages_that_would_break_the_prompt_framing(message):
+    assert drop_reason(commit(message="Add the todo model " + message)) == "unsafe_message"
+
+
+# --- long lines ---------------------------------------------------------------
+
+
+def test_long_average_line_is_dropped():
+    wide = "".join("y = '" + "b" * 200 + "'\n" for _ in range(5))  # 207 chars per line
+    narrow = "".join("y = '" + "b" * 190 + "'\n" for _ in range(5))
+    assert drop_reason(commit(change(after=wide))) == "long_line"
+    assert drop_reason(commit(change(after=narrow))) is None
+
+
+def test_long_line_in_the_pre_commit_file_counts():
+    assert drop_reason(commit(change(before="x = '" + "a" * 1000 + "'\n"))) == "long_line"
+
+
+def test_line_count_reads_crlf_and_cr():
+    crlf = "".join(f"line {i}\r\n" for i in range(400))
+    assert drop_reason(commit(change(after=crlf))) is None
+    assert drop_reason(commit(change(after=crlf + "x\r"))) == "too_long_file"
+    lone_cr = "".join(f"line {i}\r" for i in range(401))
+    assert drop_reason(commit(change(after=lone_cr))) == "too_long_file"
+
+
+# --- whitespace-only ----------------------------------------------------------
+
+
+def test_new_or_emptied_files_are_not_whitespace_only():
+    assert drop_reason(commit(change(before=None, after="x = 1\n"))) is None
+    assert drop_reason(commit(change(before="x = 1\n", after=""))) is None
+
+
+def test_whitespace_only_needs_every_file_unchanged():
+    ws = change(path="a.py", before="a = 1\n", after="a = 1 \n")
+    real = change(path="b.py", before="b = 1\n", after="b = 2\n")
+    assert drop_reason(commit(ws)) == "whitespace_only"
+    assert drop_reason(commit(ws, real)) is None
+
+
+# --- dependency-only ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [("frontend/package.json",), ("backend/requirements.txt", "frontend/package.json"),
+     ("Requirements.txt",)],
+)
+def test_manifest_only_commits_are_dependency_only(paths):
+    c = commit(*(change(path=p) for p in paths), message="Add axios and flask-cors")
+    assert drop_reason(c) == "dependency_only"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Bump axios from 0.21.1 to 0.21.2",
+        "Update flask requirement from ~=2.0 to ~=2.3",
+        "build(deps): bump react-scripts from 4.0.3 to 5.0.1",
+        "chore(deps-dev): bump vite to 5.1.0 in /frontend",
+        "chore(deps): update dependency react to v18",
+        "[pre-commit.ci] pre-commit autoupdate",
+        "Update dependency eslint to v8.57.0",
+    ],
+)
+def test_bot_dependency_subjects_are_dependency_only(message):
+    assert drop_reason(commit(change(path="backend/app.py"), message=message)) == "dependency_only"
+
+
+# --- secrets ------------------------------------------------------------------
+
+SECRETS = [
+    "KEY = 'AKIAIOSFODNN7EXAMPLE'",
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "t = 'ghp_" + "a1B2" * 9 + "'",
+    "t = 'gho_" + "Z9" * 18 + "'",
+    "OPENAI = 'sk-" + "abcDEF123" * 3 + "'",
+    "SLACK = 'xoxb-1234-5678'",
+    "slack = 'xoxp-abc'",
+    "password = 'hunter22'",
+    'DB_PASSWD: "s3cr3tpw"',
+    "app.secret = 'q8w7e6r5t4'",
+    "api_key='0a1b2c3d4e5f'",
+    'apiKey = "0a1b2c3d4e5f"',
+    'const TOKEN = "eyJhbGciOi"',
+]
+
+
+@pytest.mark.parametrize("text", SECRETS)
+def test_secrets_are_flagged(text):
+    assert contains_secret(text)
+    assert drop_reason(commit(change(after=text + "\n"))) == "secret"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password = 'changeme'",
+        "password = 'CHANGEME123'",
+        "api_key = 'your-api-key-here'",
+        "API_KEY = 'your_api_key'",
+        "token = 'xxxxxxxx'",
+        "token = 'XXXX-XXXX'",
+        "secret = '<your secret>'",
+        "token = '${GITHUB_TOKEN}'",
+        "password = '$DB_PASSWORD'",
+        "password = os.environ.get('PASSWORD')",
+        "token = process.env.TOKEN",
+        "password = 'short'",  # under 6 chars
+        "t = 'sk-short'",
+        "ghp_tooShort",
+        "AKIA_lowercase_abcdefghijklmn",
+        "-----BEGIN PUBLIC KEY-----",
+        "def check_password(password):",
+        '{"password": "hunter22"}',  # a JSON body key, not an assignment
+    ],
+)
+def test_placeholders_and_non_secrets_are_not_flagged(text):
+    assert not contains_secret(text)
 
 
 def test_validation_of_types():

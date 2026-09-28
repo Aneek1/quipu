@@ -16,23 +16,28 @@ The message is the whole commit message, stripped and with CRLF read as LF, so a
 multi-paragraph message keeps its body: retrieve takes the step as everything
 between "STEP: " and "\\n\\nCONTEXT FILES:", which gives it back unchanged.
 
-Context files whose path FileBlock refuses, or whose contents render_blocks
-refuses, are left out: they are optional extras chosen by the miner, and the
-harness would never show such a file either. The changed files themselves are not
-allowed to be unsafe: format_example refuses a commit `drop_reason` would drop, so
-the caller cannot skip the filters by mistake.
+Context files are optional extras chosen by the miner, so a doubtful one is left
+out rather than dropping the example: a path FileBlock refuses, contents
+render_blocks refuses, a path segment starting with ".env" (environment files hold
+credentials even when they look harmless), or contents `contains_secret` flags.
+Tree entries FileBlock refuses are left out too; that includes directory entries
+("backend/"), since the harness tree lists files only. The changed files
+themselves are not allowed to be doubtful: format_example refuses a commit
+`drop_reason` would drop (with the same limits, passed through), so the caller
+cannot skip the filters by mistake.
 
-Size cap: the user message may be at most `max_user_tokens`, counted with the
-harness's default counter (ceil(chars / 3), pessimistic for code), so an example
-that fits here also fits the harness's budget arithmetic. An example over the cap
-gives None; files are never cut, because an example with half a file teaches the
-model to write half files.
+Size caps, counted with the harness's default counter (ceil(chars / 3),
+pessimistic for code), so an example that fits here also fits the harness's
+budget arithmetic: the user message at most `max_user_tokens` (spec §3.1), and
+system + user + reply at most `max_total_tokens`, so a training example fits a
+fixed context window. An example over either cap gives None; files are never cut,
+because an example with half a file teaches the model to write half files.
 """
 from __future__ import annotations
 
 from typing import Mapping, Sequence
 
-from stepbuild.dataset.filters import Commit, drop_reason
+from stepbuild.dataset.filters import Commit, contains_secret, drop_reason
 from stepbuild.dataset.split import assign_split
 from stepbuild.harness.blocks import BlockError, FileBlock, render_blocks
 from stepbuild.harness.prompt import SYSTEM_PROMPT, default_count_tokens
@@ -45,9 +50,25 @@ def _to_lf(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _is_env_path(path: str) -> bool:
+    return any(seg.startswith(".env") for seg in path.split("/"))
+
+
+def _is_tree_path(path: str) -> bool:
+    try:
+        FileBlock(path, "")
+    except BlockError:
+        return False
+    return True
+
+
 def _context_blocks(context: Mapping[str, str]) -> list[FileBlock]:
     blocks: list[FileBlock] = []
     for path, text in context.items():
+        if not isinstance(path, str) or not isinstance(text, str):
+            raise TypeError("context must map path strings to content strings")
+        if _is_env_path(path) or contains_secret(text):
+            continue
         try:
             block = FileBlock(path, text)
             render_blocks(blocks + [block])  # refuses marker lines and case duplicates
@@ -65,9 +86,14 @@ def format_example(
     context: Mapping[str, str],
     tree: Sequence[str],
     max_user_tokens: int = 6000,
+    max_total_tokens: int = 8000,
+    max_files: int = 3,
+    max_lines: int = 200,
+    max_file_lines: int = 400,
 ) -> dict | None:
     """The spec §3.1 JSON row for `commit`, or None if the user message is over
-    `max_user_tokens`. `context` maps path -> pre-commit contents, shown in the given
+    `max_user_tokens` or the whole example over `max_total_tokens`. The filter
+    limits are drop_reason's and must match the ones the caller filtered with. `context` maps path -> pre-commit contents, shown in the given
     order; `tree` is the project tree, one path per entry."""
     if not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
         raise ValueError(f"repo must be 'owner/name', got {repo!r}")
@@ -75,11 +101,13 @@ def format_example(
         raise ValueError("licence must be a non-empty SPDX id")
     if tag not in TAGS:
         raise ValueError(f"tag must be one of {sorted(TAGS)}, got {tag!r}")
-    if isinstance(tree, str) or not all(isinstance(p, str) for p in tree):
+    if isinstance(tree, str) or not all(isinstance(p, str) for p in tree if _is_tree_path(p)):
         raise TypeError("tree must be a sequence of path strings, not a single str")
     if not isinstance(context, Mapping):
         raise TypeError("context must map path -> contents")
-    reason = drop_reason(commit)
+    reason = drop_reason(
+        commit, max_files=max_files, max_lines=max_lines, max_file_lines=max_file_lines
+    )
     if reason is not None:
         raise ValueError(f"commit {commit.sha} is dropped by the filters ({reason})")
 
@@ -88,11 +116,14 @@ def format_example(
     user = (
         f"STEP: {step}\n\n"
         f"CONTEXT FILES:\n{render_blocks(ctx) if ctx else NO_CONTEXT}\n"
-        "PROJECT TREE:\n" + "".join(p + "\n" for p in tree)
+        "PROJECT TREE:\n" + "".join(p + "\n" for p in tree if _is_tree_path(p))
     )
     if default_count_tokens(user) > max_user_tokens:
         return None
     reply = render_blocks([FileBlock(c.path, c.after) for c in commit.changes])
+    total = sum(default_count_tokens(t) for t in (SYSTEM_PROMPT, user, reply))
+    if total > max_total_tokens:
+        return None
     return {
         "repo": repo,
         "licence": licence,

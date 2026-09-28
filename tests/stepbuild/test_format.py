@@ -32,7 +32,7 @@ def make_commit(message="Add the item store", sha="abc123"):
 
 
 CONTEXT = {"backend/models.py": MODELS_BEFORE, "backend/app.py": "from models import Store\n"}
-TREE = ["backend/", "backend/app.py", "backend/models.py", "frontend/", "frontend/src/"]
+TREE = ["backend/app.py", "backend/models.py", "frontend/src/List.jsx"]
 
 
 def fmt(**kw):
@@ -69,7 +69,7 @@ def test_user_message_exact():
         "STEP: Add the item store\n\n"
         "CONTEXT FILES:\n" + context + "\n"
         "PROJECT TREE:\n"
-        "backend/\nbackend/app.py\nbackend/models.py\nfrontend/\nfrontend/src/\n"
+        "backend/app.py\nbackend/models.py\nfrontend/src/List.jsx\n"
     )
 
 
@@ -155,3 +155,65 @@ def test_round_trip_through_the_harness_loader(tmp_path):
             FileBlock("backend/models.py", MODELS_AFTER),
             FileBlock("frontend/src/List.jsx", LIST_AFTER),
         ]
+
+
+def test_tree_entries_a_file_block_rejects_are_left_out():
+    # The harness tree lists files only: directories ("backend/") are not paths.
+    tree = ["backend/", "../up.py", "C:/abs.py", "a\\b.py", "backend/app.py", ""]
+    user = fmt(tree=tree)["messages"][1]["content"]
+    assert user.endswith("PROJECT TREE:\nbackend/app.py\n")
+
+
+def test_total_cap_counts_system_user_and_reply():
+    row = fmt()
+    total = sum(math.ceil(len(m["content"]) / 3) for m in row["messages"])
+    assert fmt(max_total_tokens=total) == row
+    assert fmt(max_total_tokens=total - 1) is None
+
+
+def test_default_total_cap_is_8000_tokens():
+    # 200 lines of ~100 chars pass every filter; the reply alone is ~6,700 tokens,
+    # and showing the old version as context pushes the total past 8,000.
+    body = "".join(f"v{i:03} = '" + "a" * 92 + "'\n" for i in range(199))
+    big = Commit(
+        "abc", "Add the constants table", 1,
+        (FileChange("backend/c.py", body, body + "z = 1\n", 1, 0),),
+    )
+    assert fmt(commit=big, context={}, max_user_tokens=10**6) is not None
+    assert fmt(commit=big, context={"backend/c.py": body}, max_user_tokens=10**6) is None
+
+
+def test_filter_limits_pass_through():
+    with pytest.raises(ValueError, match="too_many_files"):
+        fmt(max_files=1)
+    with pytest.raises(ValueError, match="too_many_lines"):
+        fmt(max_lines=4)
+    with pytest.raises(ValueError, match="too_long_file"):
+        fmt(max_file_lines=2)
+    wide = Commit(
+        "abc", "Add the item store", 1,
+        tuple(FileChange(f"backend/m{i}.py", None, f"x = {i}\n", 1, 0) for i in range(4)),
+    )
+    with pytest.raises(ValueError, match="too_many_files"):
+        fmt(commit=wide)
+    assert fmt(commit=wide, max_files=4) is not None
+
+
+@pytest.mark.parametrize(
+    "path, text",
+    [
+        (".env", "DEBUG=1\n"),
+        ("backend/.env.local", "DEBUG=1\n"),
+        (".envrc", "export X=1\n"),
+        ("backend/config.py", "API_KEY = 'AKIAIOSFODNN7EXAMPLE'\n"),
+    ],
+)
+def test_env_files_and_secret_context_are_left_out(path, text):
+    user = fmt(context={path: text, "backend/app.py": "a = 1\n"})["messages"][1]["content"]
+    assert f"=== FILE: {path} ===" not in user
+    assert "=== FILE: backend/app.py ===" in user
+
+
+def test_a_name_containing_env_later_is_shown():
+    user = fmt(context={"backend/settings.env.py": "X = 1\n"})["messages"][1]["content"]
+    assert "=== FILE: backend/settings.env.py ===" in user
