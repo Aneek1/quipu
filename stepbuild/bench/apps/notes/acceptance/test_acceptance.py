@@ -126,7 +126,8 @@ def test_empty_title_is_400(client, title):
     assert "error" in response.get_json()
 
 
-def test_non_string_body_is_400(client):
-    response = client.post("/api/notes", json={"title": "x", "body": 42})
+@pytest.mark.parametrize("body", [42, None])
+def test_non_string_body_is_400(client, body):
+    response = client.post("/api/notes", json={"title": "x", "body": body})
     assert response.status_code == 400
     assert "error" in response.get_json()

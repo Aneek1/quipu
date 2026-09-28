@@ -9,6 +9,21 @@ import pytest
 from app import create_app
 
 
+FIELDS = ("id", "name", "description")
+
+
+def view(item):
+    """Only the spec's fields: an app may return extra keys (such as created_at)."""
+    return {key: item[key] for key in FIELDS}
+
+
+CHECKIN_FIELDS = ("id", "habit_id", "date")
+
+
+def checkin_view(checkin):
+    return {key: checkin[key] for key in CHECKIN_FIELDS}
+
+
 @pytest.fixture
 def client():
     app = create_app()
@@ -20,7 +35,7 @@ def client():
 def create(client, **body):
     response = client.post("/api/habits", json=body)
     assert response.status_code == 201, response.get_data(as_text=True)
-    return response.get_json()
+    return view(response.get_json())
 
 
 def checkins_url(habit):
@@ -61,7 +76,7 @@ def test_get_one(client):
     habit = create(client, name="Meditate", description="morning")
     response = client.get(f"/api/habits/{habit['id']}")
     assert response.status_code == 200
-    assert response.get_json() == habit
+    assert view(response.get_json()) == habit
 
 
 def test_update(client):
@@ -69,8 +84,8 @@ def test_update(client):
     body = {"name": "Final", "description": "new"}
     response = client.put(f"/api/habits/{habit['id']}", json=body)
     assert response.status_code == 200
-    assert response.get_json() == {"id": habit["id"], **body}
-    assert client.get(f"/api/habits/{habit['id']}").get_json() == {"id": habit["id"], **body}
+    assert view(response.get_json()) == {"id": habit["id"], **body}
+    assert view(client.get(f"/api/habits/{habit['id']}").get_json()) == {"id": habit["id"], **body}
 
 
 def test_partial_update_keeps_the_fields_left_out(client):
@@ -78,8 +93,8 @@ def test_partial_update_keeps_the_fields_left_out(client):
     response = client.put(f"/api/habits/{habit['id']}", json={"description": "x"})
     assert response.status_code == 200
     expected = {"id": habit["id"], "name": "Keep me", "description": "x"}
-    assert response.get_json() == expected
-    assert client.get(f"/api/habits/{habit['id']}").get_json() == expected
+    assert view(response.get_json()) == expected
+    assert view(client.get(f"/api/habits/{habit['id']}").get_json()) == expected
 
 
 @pytest.mark.parametrize("body", [{"name": ""}, {"name": "   "}, {"description": 3}])
@@ -88,7 +103,7 @@ def test_update_that_breaks_a_rule_is_400(client, body):
     response = client.put(f"/api/habits/{habit['id']}", json=body)
     assert response.status_code == 400
     assert "error" in response.get_json()
-    assert client.get(f"/api/habits/{habit['id']}").get_json() == habit
+    assert view(client.get(f"/api/habits/{habit['id']}").get_json()) == habit
 
 
 def test_ids_are_never_reused(client):
@@ -116,7 +131,8 @@ def test_missing_ids_are_404(client):
 
 
 @pytest.mark.parametrize(
-    "body", [{"description": "no name"}, {"name": ""}, {"name": "  "}, {"name": 4}, {"name": "x", "description": 4}]
+    "body", [{"description": "no name"}, {"name": ""}, {"name": "  "}, {"name": 4}, {"name": "x", "description": 4},
+             {"name": "x", "description": None}, {"name": None}]
 )
 def test_invalid_habit_is_400_with_an_error(client, body):
     response = client.post("/api/habits", json=body)
@@ -141,10 +157,10 @@ def test_checkin_is_idempotent_per_day(client):
     again = client.post(checkins_url(habit), json={"date": "2026-09-28"})
     assert first.status_code == 201
     assert again.status_code == 200
-    assert again.get_json() == first.get_json()
+    assert checkin_view(again.get_json()) == checkin_view(first.get_json())
     listed = client.get(checkins_url(habit))
     assert listed.status_code == 200
-    assert listed.get_json() == [first.get_json()]
+    assert [checkin_view(c) for c in listed.get_json()] == [checkin_view(first.get_json())]
 
 
 def test_checkins_on_different_days_and_habits_are_separate(client):
@@ -165,7 +181,8 @@ def test_a_new_habit_has_no_checkins(client):
 
 
 @pytest.mark.parametrize(
-    "body", [{}, {"date": ""}, {"date": 20260928}, {"date": "28/09/2026"}, {"date": "2026-9-28"}, {"date": "2026-02-30"}]
+    "body", [{}, {"date": ""}, {"date": 20260928}, {"date": "28/09/2026"}, {"date": "2026-9-28"}, {"date": "2026-02-30"},
+             {"date": None}]
 )
 def test_invalid_checkin_date_is_400(client, body):
     habit = create(client, name="Run")

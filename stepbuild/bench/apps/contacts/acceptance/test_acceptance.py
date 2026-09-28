@@ -8,6 +8,14 @@ import pytest
 
 from app import create_app
 
+
+FIELDS = ("id", "name", "email", "phone")
+
+
+def view(item):
+    """Only the spec's fields: an app may return extra keys (such as created_at)."""
+    return {key: item[key] for key in FIELDS}
+
 EMAIL = "grace@example.org"
 
 
@@ -23,7 +31,7 @@ def create(client, **body):
     body.setdefault("email", EMAIL)
     response = client.post("/api/contacts", json=body)
     assert response.status_code == 201, response.get_data(as_text=True)
-    return response.get_json()
+    return view(response.get_json())
 
 
 def test_create_returns_201_and_the_contact_with_an_integer_id(client):
@@ -61,7 +69,7 @@ def test_get_one(client):
     contact = create(client, name="Alan", phone="1")
     response = client.get(f"/api/contacts/{contact['id']}")
     assert response.status_code == 200
-    assert response.get_json() == contact
+    assert view(response.get_json()) == contact
 
 
 def test_update(client):
@@ -69,8 +77,8 @@ def test_update(client):
     body = {"name": "Final", "email": "final@example.com", "phone": "2"}
     response = client.put(f"/api/contacts/{contact['id']}", json=body)
     assert response.status_code == 200
-    assert response.get_json() == {"id": contact["id"], **body}
-    assert client.get(f"/api/contacts/{contact['id']}").get_json() == {"id": contact["id"], **body}
+    assert view(response.get_json()) == {"id": contact["id"], **body}
+    assert view(client.get(f"/api/contacts/{contact['id']}").get_json()) == {"id": contact["id"], **body}
 
 
 def test_partial_update_keeps_the_fields_left_out(client):
@@ -78,8 +86,8 @@ def test_partial_update_keeps_the_fields_left_out(client):
     response = client.put(f"/api/contacts/{contact['id']}", json={"phone": "new"})
     assert response.status_code == 200
     expected = {"id": contact["id"], "name": "Keep me", "email": EMAIL, "phone": "new"}
-    assert response.get_json() == expected
-    assert client.get(f"/api/contacts/{contact['id']}").get_json() == expected
+    assert view(response.get_json()) == expected
+    assert view(client.get(f"/api/contacts/{contact['id']}").get_json()) == expected
 
 
 @pytest.mark.parametrize(
@@ -90,7 +98,7 @@ def test_update_that_breaks_a_rule_is_400(client, body):
     response = client.put(f"/api/contacts/{contact['id']}", json=body)
     assert response.status_code == 400
     assert "error" in response.get_json()
-    assert client.get(f"/api/contacts/{contact['id']}").get_json() == contact
+    assert view(client.get(f"/api/contacts/{contact['id']}").get_json()) == contact
 
 
 def test_ids_are_never_reused(client):
@@ -130,6 +138,8 @@ def test_missing_ids_are_404(client):
         {"name": "x", "email": "a@b@example.org"},
         {"name": "x", "email": 42},
         {"name": "x", "email": EMAIL, "phone": 5551234},
+        {"name": "x", "email": EMAIL, "phone": None},
+        {"name": "x", "email": None},
     ],
 )
 def test_invalid_contact_is_400_with_an_error(client, body):

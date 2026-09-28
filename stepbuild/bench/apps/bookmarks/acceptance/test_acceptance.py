@@ -8,6 +8,14 @@ import pytest
 
 from app import create_app
 
+
+FIELDS = ("id", "title", "url", "note")
+
+
+def view(item):
+    """Only the spec's fields: an app may return extra keys (such as created_at)."""
+    return {key: item[key] for key in FIELDS}
+
 URL = "https://example.com/page"
 
 
@@ -23,7 +31,7 @@ def create(client, **body):
     body.setdefault("url", URL)
     response = client.post("/api/bookmarks", json=body)
     assert response.status_code == 201, response.get_data(as_text=True)
-    return response.get_json()
+    return view(response.get_json())
 
 
 def test_create_returns_201_and_the_bookmark_with_an_integer_id(client):
@@ -70,8 +78,8 @@ def test_update(client):
     body = {"title": "Final", "url": "https://final.example", "note": "x"}
     response = client.put(f"/api/bookmarks/{bookmark['id']}", json=body)
     assert response.status_code == 200
-    assert response.get_json() == {"id": bookmark["id"], **body}
-    assert client.get(f"/api/bookmarks/{bookmark['id']}").get_json() == {"id": bookmark["id"], **body}
+    assert view(response.get_json()) == {"id": bookmark["id"], **body}
+    assert view(client.get(f"/api/bookmarks/{bookmark['id']}").get_json()) == {"id": bookmark["id"], **body}
 
 
 def test_partial_update_keeps_the_fields_left_out(client):
@@ -79,8 +87,8 @@ def test_partial_update_keeps_the_fields_left_out(client):
     response = client.put(f"/api/bookmarks/{bookmark['id']}", json={"note": "new"})
     assert response.status_code == 200
     expected = {"id": bookmark["id"], "title": "Keep me", "url": URL, "note": "new"}
-    assert response.get_json() == expected
-    assert client.get(f"/api/bookmarks/{bookmark['id']}").get_json() == expected
+    assert view(response.get_json()) == expected
+    assert view(client.get(f"/api/bookmarks/{bookmark['id']}").get_json()) == expected
 
 
 @pytest.mark.parametrize("body", [{"title": ""}, {"url": "ftp://example.com"}, {"note": 5}])
@@ -89,7 +97,7 @@ def test_update_that_breaks_a_rule_is_400(client, body):
     response = client.put(f"/api/bookmarks/{bookmark['id']}", json=body)
     assert response.status_code == 400
     assert "error" in response.get_json()
-    assert client.get(f"/api/bookmarks/{bookmark['id']}").get_json() == bookmark
+    assert view(client.get(f"/api/bookmarks/{bookmark['id']}").get_json()) == bookmark
 
 
 def test_ids_are_never_reused(client):
@@ -127,6 +135,8 @@ def test_missing_ids_are_404(client):
         {"title": "x", "url": "ftp://example.com"},
         {"title": "x", "url": 42},
         {"title": "x", "url": URL, "note": 42},
+        {"title": "x", "url": URL, "note": None},
+        {"title": None, "url": URL},
     ],
 )
 def test_invalid_bookmark_is_400_with_an_error(client, body):

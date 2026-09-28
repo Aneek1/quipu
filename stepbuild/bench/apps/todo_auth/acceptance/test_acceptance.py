@@ -67,7 +67,7 @@ def test_a_taken_username_is_409(app):
     "body",
     [{"password": "pw"}, {"username": "", "password": "pw"}, {"username": "  ", "password": "pw"},
      {"username": 5, "password": "pw"}, {"username": "ada"}, {"username": "ada", "password": ""},
-     {"username": "ada", "password": 1234}],
+     {"username": "ada", "password": 1234}, {"username": "ada", "password": None}],
 )
 def test_invalid_registration_is_400(app, body):
     client = app.test_client()
@@ -206,7 +206,8 @@ def test_missing_ids_are_404(client):
     assert client.delete("/api/todos/999").status_code == 404
 
 
-@pytest.mark.parametrize("body", [{"done": False}, {"title": ""}, {"title": "   "}, {"title": 3}, {"title": "x", "done": "yes"}])
+@pytest.mark.parametrize("body", [{"done": False}, {"title": ""}, {"title": "   "}, {"title": 3}, {"title": "x", "done": "yes"},
+                                    {"title": "x", "done": None}])
 def test_invalid_todo_is_400_with_an_error(client, body):
     response = client.post("/api/todos", json=body)
     assert response.status_code == 400

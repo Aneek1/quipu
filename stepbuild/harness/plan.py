@@ -100,8 +100,10 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
         "create(data), list_items(), get(id), update(id, data) and delete(id); items "
         "are plain dicts that include their `id`. `get` and `update` return None and "
         "`delete` returns False when the id does not exist; `delete` returns True when "
-        "it removed the item. Also write a validate_<entity>(data) function for each "
-        "entity created through the API: validate_<entity>(data) returns a list of "
+        "it removed the item. Also write a validate_<name>(data) function for each "
+        "JSON body the API accepts: one per entity created through the API, plus one "
+        "for the body of each extra action endpoint the spec names (such as a check-in "
+        "or a decrement); each validate function returns a list of "
         "error strings, one for each rule the spec states: a missing or empty required "
         "field, a field of the wrong type, and any range rule (for example a negative "
         "amount); the list is empty when the data is valid. "
@@ -133,7 +135,9 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
         "with `from app import create_app` only if needed. Check every /api/ endpoint in "
         "the spec: create returns 201 and the new item with its `id`, list returns a "
         "JSON array, get one, update, delete and then 404, and 400 when a required "
-        "field is missing. The tests must pass against backend/app.py as written.",
+        "field is missing. If the spec includes login, register and log in with "
+        "`client` first; the fixture starts logged out. The tests must pass against "
+        "backend/app.py as written.",
     ),
     (
         "components",
@@ -159,7 +163,10 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
         "and frontend/src/App.jsx (default export App) does "
         "import List from './components/List.jsx' and "
         "import Form from './components/Form.jsx', loads the items on mount, and "
-        "creates and deletes items through api.js, updating state.",
+        "creates and deletes items through api.js, updating state. If the spec includes "
+        "login, api.js also exports register, login and logout, and App.jsx shows a "
+        "login form with a register button when logged out (a 401 on load means logged "
+        "out) and a logout button when logged in.",
     ),
     (
         "run",

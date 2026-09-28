@@ -81,6 +81,8 @@ def test_spec_is_one_paragraph_naming_api_endpoints(app):
         spec,
     )
     assert d1, "the D1 partial-update sentence is missing"
+    # Task 5 review: null is a sent value, never "left out".
+    assert "a field sent as `null` counts as sent, so `null` for a field is 400" in spec.lower()
     assert f"`{d1.group(1)}` missing" in spec, "the D1 example field must be a required field"
 
 
@@ -211,6 +213,32 @@ def test_acceptance_catches_app_specific_breakages(breakage, tmp_path):
     path.write_text(broken, encoding="utf-8")
     result = run_acceptance(app, root)
     assert not result.passed, f"{breakage} went unnoticed by the {app} acceptance tests"
+
+
+# Spec-correct variations the acceptance tests must tolerate: (file, pattern, replacement).
+# The specs never say "no other keys", so an app that returns extra fields is correct.
+TOLERATED = {
+    # Every stored item (and habit check-in) carries an extra key the spec does not name.
+    "extra_created_at_key": (
+        "backend/models.py",
+        r'item\["id"\] = self\._next_id',
+        'item["id"] = self._next_id\n        item["created_at"] = "2026-09-28T12:00:00Z"',
+    ),
+}
+
+
+@pytest.mark.parametrize("variation", sorted(TOLERATED))
+@pytest.mark.parametrize("app", APPS)
+def test_acceptance_tolerates_spec_correct_variations(app, variation, tmp_path):
+    root = _backend_only(tmp_path)
+    _write_backend_steps(app, root)
+    rel, pattern, replacement = TOLERATED[variation]
+    path = root / rel
+    varied, count = re.subn(pattern, lambda _: replacement, path.read_text(encoding="utf-8"))
+    assert count == 1, f"{variation}: pattern not found once in the {app} reference {rel}"
+    path.write_text(varied, encoding="utf-8")
+    result = run_acceptance(app, root)
+    assert result.passed, f"{variation} (spec-correct) failed the {app} acceptance tests:\n{result.output}"
 
 
 def test_acceptance_ignores_a_stray_pytest_config_above_its_temp_dir(tmp_path, monkeypatch):

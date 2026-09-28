@@ -101,6 +101,22 @@ def test_titles_state_the_task4_review_decisions():
         "For PUT, merge the sent fields into the existing item and validate the merged item "
         "with the same validate function." in steps["routes"]
     )
+    # D5 (Task 5 review): a validate function per JSON body, including action endpoints.
+    assert (
+        "a validate_<name>(data) function for each JSON body the API accepts: one per "
+        "entity created through the API, plus one for the body of each extra action "
+        "endpoint the spec names (such as a check-in or a decrement)" in steps["model"]
+    )
+    # Task 5 review: login apps (todo_auth) in the test and wiring steps.
+    assert (
+        "If the spec includes login, register and log in with `client` first; the "
+        "fixture starts logged out." in steps["api_tests"]
+    )
+    assert (
+        "If the spec includes login, api.js also exports register, login and logout, and "
+        "App.jsx shows a login form with a register button when logged out (a 401 on load "
+        "means logged out) and a logout button when logged in." in steps["wiring"]
+    )
     # D3: api.js must cover list, create and delete; more is allowed.
     assert (
         "exports async functions to list, create and delete items (it may export others)"

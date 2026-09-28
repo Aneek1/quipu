@@ -9,6 +9,14 @@ import pytest
 from app import create_app
 
 
+FIELDS = ("id", "title", "author", "status")
+
+
+def view(item):
+    """Only the spec's fields: an app may return extra keys (such as created_at)."""
+    return {key: item[key] for key in FIELDS}
+
+
 @pytest.fixture
 def client():
     app = create_app()
@@ -21,7 +29,7 @@ def create(client, **body):
     body.setdefault("author", "Octavia Butler")
     response = client.post("/api/books", json=body)
     assert response.status_code == 201, response.get_data(as_text=True)
-    return response.get_json()
+    return view(response.get_json())
 
 
 def test_create_returns_201_and_the_book_with_an_integer_id(client):
@@ -64,7 +72,7 @@ def test_get_one(client):
     book = create(client, title="Parable of the Sower")
     response = client.get(f"/api/books/{book['id']}")
     assert response.status_code == 200
-    assert response.get_json() == book
+    assert view(response.get_json()) == book
 
 
 def test_update(client):
@@ -72,8 +80,8 @@ def test_update(client):
     body = {"title": "Final", "author": "Someone Else", "status": "done"}
     response = client.put(f"/api/books/{book['id']}", json=body)
     assert response.status_code == 200
-    assert response.get_json() == {"id": book["id"], **body}
-    assert client.get(f"/api/books/{book['id']}").get_json() == {"id": book["id"], **body}
+    assert view(response.get_json()) == {"id": book["id"], **body}
+    assert view(client.get(f"/api/books/{book['id']}").get_json()) == {"id": book["id"], **body}
 
 
 def test_partial_update_keeps_the_fields_left_out(client):
@@ -81,8 +89,8 @@ def test_partial_update_keeps_the_fields_left_out(client):
     response = client.put(f"/api/books/{book['id']}", json={"status": "reading"})
     assert response.status_code == 200
     expected = {"id": book["id"], "title": "Keep me", "author": "Kept", "status": "reading"}
-    assert response.get_json() == expected
-    assert client.get(f"/api/books/{book['id']}").get_json() == expected
+    assert view(response.get_json()) == expected
+    assert view(client.get(f"/api/books/{book['id']}").get_json()) == expected
 
 
 @pytest.mark.parametrize(
@@ -93,7 +101,7 @@ def test_update_that_breaks_a_rule_is_400(client, body):
     response = client.put(f"/api/books/{book['id']}", json=body)
     assert response.status_code == 400
     assert "error" in response.get_json()
-    assert client.get(f"/api/books/{book['id']}").get_json() == book
+    assert view(client.get(f"/api/books/{book['id']}").get_json()) == book
 
 
 def test_ids_are_never_reused(client):
@@ -131,6 +139,7 @@ def test_missing_ids_are_404(client):
         {"title": "x", "author": "A", "status": "finished"},
         {"title": "x", "author": "A", "status": "Done"},
         {"title": "x", "author": "A", "status": 1},
+        {"title": "x", "author": "A", "status": None},
     ],
 )
 def test_invalid_book_is_400_with_an_error(client, body):

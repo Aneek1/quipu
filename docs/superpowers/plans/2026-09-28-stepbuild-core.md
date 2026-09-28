@@ -17,6 +17,7 @@
 - Branch `pipeline-114m`. Test command, always exactly: `CUDA_VISIBLE_DEVICES= python -m uv run python -m pytest -m "not gpu_gate" -q` (plain `uv run pytest` falls through to the global Python on this machine). Run only the new test file while iterating (`... -m pytest tests/stepbuild/test_x.py -q`), full suite before committing.
 - TDD: write the failing test, see it fail for the right reason, implement, see it pass.
 - Dependencies via `python -m uv add <pkg>` (or `--dev`); commit `uv.lock`. Never pip-install globally. After adding anything, confirm torch still reports `+cu128` and `cuda.is_available() True`.
+- While iterating, `-m "not gpu_gate and not npm"` skips the slow npm gate; the full command must still pass before each commit.
 - Commits: plain sentences, **no trailers of any kind**, never push. Never commit `data/`, `results/`, `checkpoints/`, `hf_export/`, `node_modules/`, or the npm/template cache.
 - Mutation checks are required where a task lists them: back the file up to the session scratchpad, mutate, show the named test fails, restore **by copying the backup** (never `git checkout -- <file>`), confirm with `cmp`.
 - Style: follow `quipu/` — explanatory docstrings that say *why*, frozen dataclasses, strict validation with clear errors, atomic writes via `quipu.fsio.write_text_atomic` / `replace_with_retry`.
@@ -308,7 +309,7 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 - A `Store` class keeps items in a dict and gives each new item an integer `id`.
 - Its methods are `create(data)`, `list_items()`, `get(id)`, `update(id, data)` and `delete(id)`. Items are plain dicts that include their `id`.
 - `get` and `update` return None and `delete` returns False when the id does not exist; `delete` returns True when it removed the item. (D2, Task 4 review.)
-- There is one `validate_<entity>(data)` function for each entity created through the API. It returns a list of error strings, one for each rule the spec states: a missing or empty required field, a field of the wrong type, and any range rule (for example a negative amount). The list is empty when the data is valid. (D5.)
+- There is a `validate_<name>(data)` function for each JSON body the API accepts: one per entity created through the API, plus one for the body of each extra action endpoint the spec names (such as a check-in or a decrement). Each returns a list of error strings, one for each rule the spec states: a missing or empty required field, a field of the wrong type, and any range rule (for example a negative amount). The list is empty when the data is valid. (D5.)
 - Standard library only, no Flask imports.
 
 **`backend/app.py` (step 2).**
@@ -332,16 +333,18 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 
 **`backend/tests/test_api.py` (step 3).**
 - Tests use the `client` fixture and import with `from app import create_app` only if they need it.
+- If the spec includes login, register and log in with `client` first; the fixture starts logged out.
 
 **Frontend (steps 4–5).**
 - `List({items, onDelete})` renders the items, calls `onDelete(item.id)` and uses `item.id` as the React key.
 - `Form({onSubmit})` has controlled inputs for the fields of the app's main entity and clears itself after submit. Neither component makes network calls.
 - `api.js` exports async functions to list, create and delete items (it may export others). They call relative URLs under `/api/`, send JSON and throw on a non-2xx response. (D3.)
 - `App.jsx` has a default export, loads the items on mount, and imports `List` and `Form` by explicit paths: `import List from './components/List.jsx'` and `import Form from './components/Form.jsx'`.
+- If the spec includes login, api.js also exports register, login and logout, and App.jsx shows a login form with a register button when logged out (a 401 on load means logged out) and a logout button when logged in.
 
 **Benchmark `spec.md` (Tasks 4–5).**
 - Each spec names every endpoint (method plus `/api/` path), the required fields, the id field, the shape of the list response and any extra status codes.
-- Each spec also states, in these words: "ids are never reused, even after a delete"; "every new app instance starts with no items"; and "PUT accepts any subset of the fields; fields left out keep their values; a field that is sent follows the same rules as on create (so an empty `title` is 400)" (adapt the example field for apps without a `title`). `tests/stepbuild/test_bench_reference.py` checks for these phrases.
+- Each spec also states, in these words: "ids are never reused, even after a delete"; "every new app instance starts with no items"; and "PUT accepts any subset of the fields; fields left out keep their values; a field that is sent follows the same rules as on create (so an empty `title` is 400)" (adapt the example field for apps without a `title`); and "a field sent as `null` counts as sent, so `null` for a field is 400" (Task 5 review). `tests/stepbuild/test_bench_reference.py` checks for these phrases.
 - Each spec lists every 400 rule explicitly (missing/empty required fields, wrong types, range rules) with its default values, e.g. "a string that is not empty after trimming whitespace".
 - App-specific rules:
   - expenses: 400 on a negative amount.
@@ -352,6 +355,7 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 **Acceptance tests (Tasks 4–5).**
 - They define their own client and do not rely on the template's conftest.
 - They accept 200 or 204 on delete, and assert only that an `error` key exists (not its text).
+- They compare only the fields the spec names (a `view()` helper), because no spec says "no other keys": a response with an extra key such as `created_at` is correct. The gate test `test_acceptance_tolerates_spec_correct_variations` adds such a key to every reference backend and requires acceptance to pass. (Task 5 review.)
 - They rely on the integer `id` and on the list endpoint returning a JSON array.
 - They cover, besides CRUD: a partial PUT keeps the fields left out; a PUT that breaks a create rule is 400; ids are not reused after a delete; each new app starts empty. The gate test `test_acceptance_catches_plausible_breakages` mutates each reference backend (full-replace PUT, unvalidated PUT, `len + 1` ids) and requires acceptance to fail; its patterns match the todo/notes reference code, so later references should keep the same shapes (`changes = {key: data[key] for key in FIELDS if key in data}`, `errors = validate_<entity>({**item, **changes})`, `item["id"] = self._next_id`) or extend the table.
 

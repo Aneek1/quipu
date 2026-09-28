@@ -125,7 +125,8 @@ def test_empty_title_is_400(client, title):
     assert "error" in response.get_json()
 
 
-def test_non_boolean_done_is_400(client):
-    response = client.post("/api/todos", json={"title": "x", "done": "yes"})
+@pytest.mark.parametrize("done", ["yes", None])
+def test_non_boolean_done_is_400(client, done):
+    response = client.post("/api/todos", json={"title": "x", "done": done})
     assert response.status_code == 400
     assert "error" in response.get_json()
