@@ -13,11 +13,15 @@ Python checks use the current interpreter (`sys.executable`), so they see the
 same Flask and pytest as the harness, not whatever `python` is first on PATH.
 
 Each check runs with a timeout. A timeout is a failed check whose output is
-exactly "timed out after Ns", and the whole process tree is killed (`taskkill /T
-/F` on Windows, where npm spawns node children that would otherwise outlive it;
-the process group elsewhere). Output is the last 60 lines of stdout and stderr
-together: the end is where pytest's summary and vite's error are, and it keeps
-the feedback that goes back to the model short.
+exactly "timed out after Ns", and the whole process tree is killed. On Windows
+each check runs in a Job Object with KILL_ON_JOB_CLOSE, so everything it started
+dies when the check ends, timeout or not, even a detached grandchild (npm spawns
+node children, and a test may start a server); `taskkill /T /F` stays as the
+fallback on timeout. Elsewhere the check's process group is killed on timeout.
+
+Output is the last 60 lines of stdout and stderr together: the end is where
+pytest's summary and vite's error are, and it keeps the feedback that goes back
+to the model short.
 
 No network during checks is best effort only: HTTP_PROXY / HTTPS_PROXY /
 ALL_PROXY point at 127.0.0.1:9 (discard port, nothing listens) and NO_PROXY is
@@ -38,10 +42,12 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
+from stepbuild.harness.plan import CHECKS
+
 if TYPE_CHECKING:
     from stepbuild.harness.sandbox import Sandbox
 
-CHECK_NAMES = ("pyflakes", "pytest", "npm_build")
+CHECK_NAMES = CHECKS
 OUTPUT_LINES = 60
 UNREACHABLE_PROXY = "http://127.0.0.1:9"
 
@@ -52,6 +58,112 @@ class CheckResult:
     passed: bool
     output: str      # last 60 lines of stdout + stderr, or "timed out after Ns"
     seconds: float
+
+
+class _Job:
+    """A Windows Job Object with KILL_ON_JOB_CLOSE: closing it kills every process
+    still in it, including grandchildren that detached from the console or process
+    group, which `taskkill /T` (it walks parent pids) can miss. Children inherit
+    the job, so assigning the check's process is enough, as long as it happens
+    before that process spawns anything: the gap between Popen returning and the
+    assignment is microseconds, while Python or node take far longer to start.
+
+    ctypes only, no new dependency. If the job cannot be created or assigned (for
+    example on a very old Windows), the check runs without it and taskkill /T on
+    timeout remains the fallback."""
+
+    _LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD
+        )
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k32.TerminateJobObject.restype = wintypes.BOOL
+        k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self._k32 = k32
+        self._handle = k32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        info = ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = self._LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(
+            self._handle, self._EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            err = ctypes.get_last_error()
+            self.close()
+            raise OSError(err, "SetInformationJobObject failed")
+
+    def assign(self, proc: subprocess.Popen) -> None:
+        import ctypes
+
+        if not self._k32.AssignProcessToJobObject(self._handle, int(proc._handle)):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+    def terminate(self) -> None:
+        if self._handle:
+            self._k32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        """Close the job, killing whatever is still running in it."""
+        if self._handle:
+            self._k32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _start_job(proc: subprocess.Popen) -> _Job | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        job = _Job()
+    except OSError:
+        return None
+    try:
+        job.assign(proc)
+    except OSError:
+        job.close()
+        return None
+    return job
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -92,16 +204,23 @@ def run_with_timeout(
         stderr=subprocess.STDOUT,
         **kwargs,
     )
+    job = _start_job(proc)
     try:
-        out, _ = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
         try:
-            out, _ = proc.communicate(timeout=10)
+            out, _ = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            out = b""  # a grandchild still holds the pipe; give up on the output
-        return None, (out or b"").decode("utf-8", errors="replace")
-    return proc.returncode, out.decode("utf-8", errors="replace")
+            if job is not None:
+                job.terminate()
+            _kill_tree(proc)  # fallback, and the only kill where there is no job
+            try:
+                out, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                out = b""  # a grandchild still holds the pipe; give up on the output
+            return None, (out or b"").decode("utf-8", errors="replace")
+        return proc.returncode, out.decode("utf-8", errors="replace")
+    finally:
+        if job is not None:
+            job.close()  # kills detached grandchildren the check left behind
 
 
 def _check_env() -> dict[str, str]:

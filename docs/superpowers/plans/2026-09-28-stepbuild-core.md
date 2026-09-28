@@ -319,6 +319,10 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 - `backend/tests/test_smoke.py` calls `create_app()` and asserts the app object exists, so a backend bug shows up in step 2, while the model can still fix it.
 - `frontend/src/main.jsx` must eagerly `import.meta.glob('./components/*.jsx', { eager: true })`. Otherwise the step-4 build would not compile the components, because nothing imports them until step 5.
 
+**Sandbox lifecycle (Tasks 4, 7, 8; fixed in the Task 3 review).**
+- Callers delete sandboxes only with `stepbuild.harness.sandbox.remove_sandbox()`. `frontend/node_modules` is a junction (symlink off Windows) into the shared npm cache, and a hand-written recursive delete that follows it (anything trusting `Path.is_dir()`) empties the cache for every sandbox.
+- `run_acceptance` (Task 4) must write its own `pytest.ini` (or pass `-c`) in its temp dir, so a stray config in a parent directory (there is one in `%TEMP%` on the dev machine) cannot change the run. It must also set `PYTHONPATH` to the sandbox's `backend/` itself, because the checks' environment (`checks._check_env`) strips `PYTHONPATH` and the acceptance tests do not use the template's conftest.
+
 **`backend/tests/test_api.py` (step 3).**
 - Tests use the `client` fixture and import with `from app import create_app` only if they need it.
 

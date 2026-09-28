@@ -2,29 +2,54 @@
 one is tested on both sides: the untouched template passes, and a specific break
 fails that check with output the model can act on."""
 import shutil
+import subprocess
+import sys
 
 import pytest
 
+from stepbuild.harness import checks
 from stepbuild.harness import sandbox as sb
 from stepbuild.harness.blocks import FileBlock
 from stepbuild.harness.checks import CheckResult, run_checks
-from stepbuild.harness.sandbox import Sandbox, create_sandbox, write_blocks
+from stepbuild.harness.plan import CHECKS
+from stepbuild.harness.sandbox import Sandbox, create_sandbox, remove_sandbox, write_blocks
 
 LIST = "frontend/src/components/List.jsx"
+
+# A backend test that starts a detached child sleeping for a minute, records its
+# pid in child.pid and passes at once.
+SPAWN_DETACHED = """import subprocess
+import sys
+
+
+def test_spawn():
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        creationflags=flags,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open("child.pid", "w") as f:
+        f.write(str(child.pid))
+"""
 
 
 @pytest.fixture(scope="module")
 def box(npm_cache, tmp_path_factory):
     """One full sandbox for the npm tests in this module; each test that adds a
     component removes it again, so test order does not matter."""
-    return create_sandbox(tmp_path_factory.mktemp("checks"), npm_cache)
+    box = create_sandbox(tmp_path_factory.mktemp("checks"), npm_cache)
+    yield box
+    remove_sandbox(box)
 
 
 @pytest.fixture
 def py_box(tmp_path):
     """A fresh template copy without node_modules, for the Python-only checks."""
     root = tmp_path / "py"
-    shutil.copytree(sb.TEMPLATE_DIR, root)
+    shutil.copytree(sb.TEMPLATE_DIR, root, ignore=sb._TEMPLATE_IGNORE)
     return Sandbox(root)
 
 
@@ -48,10 +73,14 @@ def test_pytest_ignores_config_in_a_parent_directory(tmp_path):
         '[tool.pytest.ini_options]\naddopts = "-k no_such_test"\n', encoding="utf-8"
     )
     root = tmp_path / "py"
-    shutil.copytree(sb.TEMPLATE_DIR, root)
+    shutil.copytree(sb.TEMPLATE_DIR, root, ignore=sb._TEMPLATE_IGNORE)
     [r] = run_checks(Sandbox(root), ["pytest"])
     assert r.passed, r.output
     assert "1 passed" in r.output
+
+
+def test_check_names_come_from_the_plan():
+    assert checks.CHECK_NAMES is CHECKS
 
 
 def test_unknown_check_is_rejected(py_box):
@@ -133,6 +162,40 @@ def test_checks_see_an_unreachable_proxy(py_box):
     )
     [r] = run_checks(py_box, ["pytest"])
     assert r.passed, r.output
+
+
+def _process_exited(pid: int, wait_ms: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    synchronize = 0x00100000
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        return True  # no such process any more
+    try:
+        return kernel32.WaitForSingleObject(handle, wait_ms) == 0  # WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Job Objects are Windows-only")
+def test_detached_grandchild_does_not_outlive_the_check(py_box):
+    # The test starts a detached child that would sleep for a minute, records its
+    # pid and passes at once. The check's Job Object must kill the child when the
+    # check ends, although taskkill /T never runs (nothing timed out).
+    _write(py_box, "backend/tests/test_api.py", SPAWN_DETACHED)
+    [r] = run_checks(py_box, ["pytest"])
+    assert r.passed, r.output
+    pid = int((py_box.root / "backend" / "child.pid").read_text())
+    try:
+        assert _process_exited(pid, 5000), "detached child survived the check"
+    finally:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
 
 
 @pytest.mark.npm
