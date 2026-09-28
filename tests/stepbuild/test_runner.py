@@ -17,6 +17,7 @@ from stepbuild.harness import runner
 from stepbuild.harness.checks import CheckResult
 from stepbuild.harness.model import ScriptedModel
 from stepbuild.harness.plan import make_plan
+from stepbuild.harness.prompt import TRIMMED, default_count_tokens
 from stepbuild.harness.retrieve import Example, ExampleLibrary
 from stepbuild.harness.runner import (
     AppResult,
@@ -140,7 +141,7 @@ def test_disallowed_file_is_a_parse_error_fed_back_as_format(sandbox):
 
 
 def test_prompt_too_long_fails_the_step_without_calling_the_model(sandbox):
-    model = ScriptedModel(REF, context_tokens=4000)
+    model = ScriptedModel(REF, context_tokens=5500)
     result = run_app(model, _backend_plan(), sandbox, EMPTY)
     assert result.status == "failed_at_step_1"
     assert model.calls == []
@@ -149,8 +150,9 @@ def test_prompt_too_long_fails_the_step_without_calling_the_model(sandbox):
     assert attempt.reply == "" and attempt.parse_error is None
     (check,) = attempt.checks
     assert check.name == "prompt_too_long" and not check.passed
-    # max_tokens = context_tokens - reply_reserve (2048) - retry_reserve (1536)
-    assert "the budget is 416" in check.output
+    # max_tokens = context_tokens - reply_reserve (2048)
+    #              - retry_reserve (reply_reserve + FEEDBACK_MAX_TOKENS = 3072)
+    assert "the budget is 380" in check.output
 
 
 def test_reserves_are_adjustable(sandbox):
@@ -161,6 +163,112 @@ def test_reserves_are_adjustable(sandbox):
     # 600 - 100 - 50 = 450 is still too small for the todo prompt.
     check = result.steps[0].attempts[0].checks[0]
     assert check.name == "prompt_too_long" and "the budget is 450" in check.output
+
+
+def test_a_reply_missing_an_allowed_file_is_a_format_failure_and_writes_nothing(
+    sandbox, monkeypatch
+):
+    only_list = REF[3].split("=== FILE: frontend/src/components/Form.jsx ===")[0]
+    assert "List.jsx" in only_list and "Form.jsx" not in only_list
+    writes = []
+    real_write = runner.write_blocks
+
+    def spy_write(box, blocks):
+        writes.append(sorted(b.path for b in blocks))
+        real_write(box, blocks)
+
+    monkeypatch.setattr(runner, "write_blocks", spy_write)
+    model = ScriptedModel([*REF[:3], only_list, *REF[3:]])
+    result = run_app(model, _backend_plan(), sandbox, EMPTY)
+    assert result.status == "passed_steps"
+    # One write per passing reply, each with all of its step's files; the partial
+    # reply wrote nothing.
+    plan = _backend_plan()
+    assert writes == [sorted(s.allowed_files) for s in plan.steps if s.model_step]
+    step4 = result.steps[3]
+    assert len(step4.attempts) == 2
+    first = step4.attempts[0]
+    message = "reply is missing FILE blocks for: frontend/src/components/Form.jsx"
+    assert first.parse_error == message
+    assert first.checks == (CheckResult("format", False, message, 0.0),)
+    feedback = _last_user(model.calls[4])
+    assert "--- format ---" in feedback and message in feedback
+    assert feedback.endswith("Reply again with complete FILE blocks for every allowed file.")
+
+
+def test_a_do_nothing_model_fails_step_one_on_the_contract(sandbox):
+    placeholder = (TEMPLATE_DIR / "backend" / "models.py").read_text(encoding="utf-8")
+    stub = f"=== FILE: backend/models.py ===\n{placeholder}=== END FILE ===\n"
+    model = ScriptedModel([stub] * 4)
+    result = run_app(model, _backend_plan(), sandbox, EMPTY, max_retries=3)
+    assert result.status == "failed_at_step_1"
+    (step,) = result.steps
+    assert len(step.attempts) == 4
+    for attempt in step.attempts:
+        checks = {c.name: c for c in attempt.checks}
+        assert checks["pyflakes"].passed  # the placeholder is clean Python...
+        assert not checks["contract"].passed  # ...but not a Store
+        assert checks["contract"].output == "backend/models.py does not define `class Store`"
+    assert "does not define `class Store`" in _last_user(model.calls[1])
+
+
+def test_write_refusal_is_a_format_failure_but_os_errors_propagate(sandbox, monkeypatch):
+    real_write = runner.write_blocks
+    calls = []
+
+    def refuse_once(box, blocks):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("refusing to write 'backend/models.py': it resolves outside the sandbox")
+        real_write(box, blocks)
+
+    monkeypatch.setattr(runner, "write_blocks", refuse_once)
+    result = run_app(ScriptedModel([REF[0], *REF]), _backend_plan(), sandbox, EMPTY)
+    assert result.status == "passed_steps"
+    first = result.steps[0].attempts[0]
+    assert first.parse_error and "resolves outside the sandbox" in first.parse_error
+    assert first.checks[0].name == "format"
+
+    def disk_error(box, blocks):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner, "write_blocks", disk_error)
+    with pytest.raises(OSError, match="disk full"):
+        run_app(ScriptedModel(REF), _backend_plan(), sandbox, EMPTY)
+
+
+def test_retry_prompt_fits_the_context_even_with_long_failure_output(sandbox, monkeypatch):
+    """base <= context - reply_reserve - retry_reserve, the previous reply <=
+    reply_reserve and the feedback <= FEEDBACK_MAX_TOKENS, so the retry prompt
+    fits in context - reply_reserve, leaving room for the next reply."""
+    context = 16384
+    # Enough ~600-token examples that build_messages fills the prompt budget.
+    fillers = [
+        Example(f"Example {i}", f"=== FILE: e{i}.py ===\n" + f"# pad {i}\n" * 200 + "=== END FILE ===\n")
+        for i in range(40)
+    ]
+
+    class Filling:
+        def top(self, query, k=2, prefer_paths=None):
+            return fillers
+
+    # A reply just under reply_reserve (2048 tokens at ceil(chars / 3)).
+    padding = "# padding line\n" * ((2048 * 3 - len(REF[0])) // 15 - 1)
+    reply = REF[0].replace("=== END FILE ===", padding + "=== END FILE ===", 1)
+    assert default_count_tokens(reply) <= 2048
+
+    def huge_failure(box, names, timeout_s=180, *, step_key=None):
+        return [CheckResult("pytest", False, "E " + "very long failure line\n" * 20000, 1.0)]
+
+    monkeypatch.setattr(runner, "run_checks", huge_failure)
+    model = ScriptedModel([reply, reply], context_tokens=context)
+    run_app(model, _backend_plan(), sandbox, Filling(), max_retries=1)
+    base, retry = model.calls
+    base_size = sum(default_count_tokens(m["content"]) for m in base)
+    assert base_size > context - 2048 - 3072 - 1000  # the budget really was filled
+    retry_size = sum(default_count_tokens(m["content"]) for m in retry)
+    assert TRIMMED in retry[-1]["content"]
+    assert retry_size <= context - 2048
 
 
 class _Crashing:

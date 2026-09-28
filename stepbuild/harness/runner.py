@@ -5,18 +5,28 @@ For each model step (1-5):
 - Retrieval is queried with the step TITLE only and the step's allowed files as
   `prefer_paths` (see retrieve.py for why never the spec).
 - The prompt budget comes from the model: max_tokens = context_tokens -
-  reply_reserve - retry_reserve, so the prompt, the reply and one round of
-  feedback all fit; a model with no stated window gets DEFAULT_MAX_TOKENS.
+  reply_reserve - retry_reserve; a model with no stated window gets
+  DEFAULT_MAX_TOKENS. retry_reserve defaults to reply_reserve +
+  FEEDBACK_MAX_TOKENS, because a retry prompt is the original prompt plus the
+  previous reply plus the feedback turn (capped at FEEDBACK_MAX_TOKENS by
+  feedback_messages), and it still needs reply_reserve for the next reply. So
+  every retry fits in context_tokens as long as a reply stays within
+  reply_reserve (the backend's max new tokens).
 - The prompt is built from the files currently in the sandbox (project_files).
   If it does not fit (PromptTooLong), the step fails at once with a check named
   "prompt_too_long": retrying would send the same prompt again.
-- Each attempt: model.complete -> parse_blocks(allowed=step.allowed_files). A reply
-  that does not parse is a failed pseudo-check "format" (nothing is written); a
-  reply that parses is written and the step's checks run. All checks pass -> the
-  step passes. Otherwise the failures are fed back and the model tries again, up
-  to 1 + max_retries attempts. Retries use feedback_messages: the original prompt
-  plus only the latest reply and its failures, so a retry never outgrows a prompt
-  that fit.
+- Each attempt: model.complete -> parse_blocks(allowed=step.allowed_files). The
+  reply must carry a FILE block for EVERY allowed file, even one it leaves as it
+  was; a partial reply would otherwise leave a template placeholder in place and
+  could still pass. A reply that does not parse, misses a file, or that
+  write_blocks refuses (a ValueError, raised before anything is written) is a
+  failed pseudo-check "format" and nothing is written. An OSError from writing is
+  an environment problem, not a model mistake, and propagates. Otherwise the
+  files are written and the step's checks run, starting with its `contract`
+  (checks.py). All checks pass -> the step passes. Otherwise the failures are fed
+  back and the model tries again, up to 1 + max_retries attempts. Retries use
+  feedback_messages: the original prompt plus only the latest reply and its
+  failures, so a retry never outgrows a prompt that fit.
 - Anything model.complete raises is a failed check "model_error" and fails the
   step without a retry: a crashing backend is not a model mistake to feed back.
 
@@ -45,6 +55,7 @@ from stepbuild.harness.model import StepModel
 from stepbuild.harness.plan import AppPlan, Step
 from stepbuild.harness.prompt import (
     DEFAULT_MAX_TOKENS,
+    FEEDBACK_MAX_TOKENS,
     PromptTooLong,
     build_messages,
     feedback_messages,
@@ -53,7 +64,9 @@ from stepbuild.harness.retrieve import ExampleLibrary
 from stepbuild.harness.sandbox import Sandbox, write_blocks
 
 REPLY_RESERVE = 2048
-RETRY_RESERVE = 1536
+# A retry prompt is the original prompt + the previous reply (<= REPLY_RESERVE)
+# + the capped feedback turn, and it still needs REPLY_RESERVE for its own reply.
+RETRY_RESERVE = REPLY_RESERVE + FEEDBACK_MAX_TOKENS
 N_EXAMPLES = 2
 
 # Never part of the prompt: installed or generated trees, and lockfiles (large,
@@ -145,13 +158,17 @@ def _run_model_step(
             return StepTrace(step.number, step.key, tuple(attempts), False)
         try:
             blocks = parse_blocks(reply, allowed=step.allowed_files)
-        except BlockError as e:
+            written = {b.path for b in blocks}
+            missing = [p for p in step.allowed_files if p not in written]
+            if missing:
+                raise BlockError("reply is missing FILE blocks for: " + ", ".join(missing))
+            write_blocks(sandbox, blocks)  # ValueError = refused before writing anything
+        except ValueError as e:  # BlockError is a ValueError; OSError propagates
             checks = _failed("format", str(e))
             attempts.append(Attempt(reply, str(e), checks))
             messages = feedback_messages(base, reply, checks)
             continue
-        write_blocks(sandbox, blocks)
-        checks = tuple(run_checks(sandbox, step.checks))
+        checks = tuple(run_checks(sandbox, step.checks, step_key=step.key))
         attempts.append(Attempt(reply, None, checks))
         if all(c.passed for c in checks):
             return StepTrace(step.number, step.key, tuple(attempts), True)
@@ -160,7 +177,7 @@ def _run_model_step(
 
 
 def _run_check_step(step: Step, sandbox: Sandbox) -> StepTrace:
-    checks = tuple(run_checks(sandbox, step.checks))
+    checks = tuple(run_checks(sandbox, step.checks, step_key=step.key))
     passed = all(c.passed for c in checks)
     return StepTrace(step.number, step.key, (Attempt("", None, checks),), passed)
 

@@ -88,6 +88,91 @@ def test_unknown_check_is_rejected(py_box):
         run_checks(py_box, ["mypy"])
 
 
+# --- contract: the step wrote a file of the right shape (no-op replies fail) ---
+
+def _contract(box, step_key):
+    [r] = run_checks(box, ["contract"], step_key=step_key)
+    assert r.name == "contract"
+    return r
+
+
+def test_contract_needs_a_step_key_it_knows(py_box):
+    with pytest.raises(ValueError, match="step_key"):
+        run_checks(py_box, ["contract"])
+    with pytest.raises(ValueError, match="no contract"):
+        run_checks(py_box, ["contract"], step_key="run")
+
+
+@pytest.mark.parametrize(
+    "step_key, expected",
+    [
+        ("model", ["backend/models.py does not define `class Store`"]),
+        ("routes", ['backend/app.py has no route string starting with "/api/"']),
+        ("api_tests", ["backend/tests/test_api.py is missing"]),
+        (
+            "components",
+            [
+                "frontend/src/components/List.jsx is missing",
+                "frontend/src/components/Form.jsx is missing",
+            ],
+        ),
+        (
+            "wiring",
+            [
+                "frontend/src/App.jsx does not import './components/List.jsx'",
+                "frontend/src/App.jsx does not import './components/Form.jsx'",
+                "frontend/src/api.js is missing",
+            ],
+        ),
+    ],
+)
+def test_template_placeholders_fail_every_step_contract(py_box, step_key, expected):
+    r = _contract(py_box, step_key)
+    assert not r.passed
+    assert r.output.splitlines() == expected
+
+
+def test_contract_passes_on_files_of_the_right_shape(py_box):
+    _write(py_box, "backend/models.py", "class Store:\n    pass\n")
+    _write(py_box, "backend/app.py", "def create_app():\n    return '/api/items'\n")
+    _write(py_box, "backend/tests/test_api.py", "def helper():\n    pass\n\n\ndef test_x(client):\n    pass\n")
+    _write(py_box, LIST, "export default function List() { return null }\n")
+    _write(py_box, "frontend/src/components/Form.jsx", "export default function Form() { return null }\n")
+    _write(py_box, "frontend/src/api.js", "export async function listItems() {}\n")
+    _write(
+        py_box, "frontend/src/App.jsx",
+        'import List from "./components/List.jsx"\n'
+        "import Form from './components/Form.jsx'\n"
+        "export default function App() { return null }\n",
+    )
+    for key in ("model", "routes", "api_tests", "components", "wiring"):
+        r = _contract(py_box, key)
+        assert r.passed, (key, r.output)
+        assert r.output == ""
+
+
+@pytest.mark.parametrize(
+    "path, content, step_key, expected",
+    [
+        ("backend/models.py", "def broken(:\n", "model", "backend/models.py does not parse (line 1)"),
+        ("backend/models.py", "Store = dict\n", "model", "backend/models.py does not define `class Store`"),
+        ("backend/app.py", "# '/api/items' only in a comment\n", "routes",
+         'backend/app.py has no route string starting with "/api/"'),
+        ("backend/tests/test_api.py", "def check_x():\n    pass\n", "api_tests",
+         "backend/tests/test_api.py defines no test_* function"),
+        (LIST, "function List() {}\n", "components",
+         "frontend/src/components/List.jsx has no `export default`"),
+        ("frontend/src/api.js", "async function listItems() {}\n", "wiring",
+         "frontend/src/api.js has no `export`"),
+    ],
+)
+def test_contract_names_exactly_what_is_missing(py_box, path, content, step_key, expected):
+    _write(py_box, path, content)
+    r = _contract(py_box, step_key)
+    assert not r.passed
+    assert any(line.startswith(expected) for line in r.output.splitlines()), r.output
+
+
 def test_syntax_error_fails_pyflakes_with_file_name(py_box):
     _write(py_box, "backend/models.py", "def broken(:\n    pass\n")
     [r] = run_checks(py_box, ["pyflakes"])

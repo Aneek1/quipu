@@ -18,7 +18,9 @@ from stepbuild.bench.acceptance import list_apps, load_reference, load_spec, run
 from stepbuild.harness.blocks import parse_blocks, render_blocks
 from stepbuild.harness.checks import CheckResult, run_checks
 from stepbuild.harness.plan import make_plan
-from stepbuild.harness.sandbox import TEMPLATE_DIR, create_sandbox, remove_sandbox, write_blocks
+from stepbuild.harness.sandbox import (
+    TEMPLATE_DIR, Sandbox, create_sandbox, remove_sandbox, write_blocks,
+)
 
 APPS = list_apps()
 
@@ -119,6 +121,21 @@ def test_unknown_app_is_rejected():
         load_reference("no_such_app")
     with pytest.raises(ValueError, match="unknown app"):
         run_acceptance("../todo", Path("."))
+
+
+@pytest.mark.parametrize("app", APPS)
+def test_every_reference_step_passes_its_contract(app, tmp_path):
+    """The contract check (the step wrote a file of the right shape) must accept
+    every reference step, or a correct model reply would be sent back."""
+    box = Sandbox(tmp_path / "project")
+    for step, reply in zip(_model_steps(app), load_reference(app)):
+        blocks = parse_blocks(reply, allowed=step.allowed_files)
+        for b in blocks:
+            target = box.root / b.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b.content.encode("utf-8"))
+        [result] = run_checks(box, ["contract"], step_key=step.key)
+        assert result.passed, f"{app} step {step.number} ({step.key}): {result.output}"
 
 
 @pytest.mark.parametrize("app", APPS)
@@ -283,7 +300,7 @@ def test_reference_replays_through_every_step_and_passes_acceptance(app, npm_cac
         for step in plan.steps:
             if step.model_step:
                 write_blocks(sandbox, parse_blocks(next(replies), allowed=step.allowed_files))
-            results = run_checks(sandbox, step.checks)
+            results = run_checks(sandbox, step.checks, step_key=step.key)
             failed = [r for r in results if not r.passed]
             assert not failed, f"step {step.number} ({step.key}): " + "\n".join(
                 f"{r.name}:\n{r.output}" for r in failed

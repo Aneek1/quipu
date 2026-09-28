@@ -241,6 +241,11 @@ Loop per model step: build messages → `model.complete` → `parse_blocks(reply
 
 Query retrieval with the step title only and prefer_paths=step.allowed_files; compute max_tokens from the model's context_tokens; use feedback_messages so retries don't grow the prompt; a PromptTooLong is recorded as a failed attempt (check name 'prompt_too_long').
 
+Task 7 review (fixed on top of 34c163b):
+- Every reply must carry a FILE block for every allowed file of its step, even one it leaves unchanged; a reply missing any is a "format" failure ("reply is missing FILE blocks for: <paths>"), nothing is written, and it is fed back. The REPLY WITH section says "Write every file listed" and the feedback ends "Reply again with complete FILE blocks for every allowed file." A ValueError from write_blocks (a refused path) is also a "format" failure; an OSError propagates.
+- Every model step runs a `contract` check first (checks.py, `run_checks(..., step_key=step.key)`): the step's files have the shape the step asks for, so a reply that leaves the template placeholders (which pass pyflakes, pytest and the build) cannot pass. The run step does not include it; the placeholders are meant to fail it.
+- Retry budget: the feedback turn is capped at FEEDBACK_MAX_TOKENS = 1024 (same counter as the prompt; each failed check's output cut from the front in proportion to its length, keeping the tail), and retry_reserve defaults to reply_reserve + FEEDBACK_MAX_TOKENS = 3072, so base + previous reply + feedback fits in context_tokens - reply_reserve.
+
 - [ ] Tests (`npm`-marked): (1) ScriptedModel replaying `todo` reference → status `passed_steps`, every step one attempt; (2) step 2 reply with a Python syntax error four times → `failed_at_step_2`, 4 attempts, pyflakes output recorded, model called exactly 4 times for that step and never for step 3; (3) bad reply then the reference reply → step passes with 2 attempts and the second call's messages contain the pyflakes error; (4) a reply writing a disallowed file → parse_error recorded and fed back. Fast non-npm variants of (2)–(4) using steps 1–3 only are allowed and preferred for the default suite.
 - [ ] Mutation: `max_retries` ignored (single attempt) → test (3) fails. Restore.
 - [ ] Commit: "Add the step runner with retries, feedback and per-app traces".
@@ -325,6 +330,14 @@ Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell 
 - Status codes: 201 create, 200 read/update, 200 or 204 delete, 400 with an `{"error": ...}` body on validation errors, 404 missing, plus any code the spec names (401, 409).
 - Apps with login set `app.secret_key` inside `create_app()`.
 - Step 2 runs the `pyflakes` and `pytest` checks.
+
+**`contract` check (every model step; Task 7 review).** Run first in each model step's checks, in-process:
+- step 1: `backend/models.py` defines `class Store` (AST).
+- step 2: `backend/app.py` has a string constant starting with "/api/" (AST, so a comment does not count).
+- step 3: `backend/tests/test_api.py` defines at least one function named `test_*` (AST).
+- step 4: `List.jsx` and `Form.jsx` each contain `export default` (text).
+- step 5: `App.jsx` imports './components/List.jsx' and './components/Form.jsx', and `api.js` has at least one `export` (text).
+- The output lists exactly what is missing, one line each (it is fed back). The template placeholders fail it on purpose; the run step does not run it. Every reference step passes it (`test_every_reference_step_passes_its_contract`).
 
 **Template (Task 3).**
 - `backend/tests/conftest.py` provides the `client` fixture, built from `create_app()` with `TESTING = True`. Step 3 uses this fixture and never redefines it.

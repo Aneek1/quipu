@@ -11,7 +11,9 @@ import pytest
 from stepbuild.harness.checks import CheckResult
 from stepbuild.harness.plan import make_plan
 from stepbuild.harness.prompt import (
+    FEEDBACK_MAX_TOKENS,
     SYSTEM_PROMPT,
+    TRIMMED,
     PromptTooLong,
     append_feedback,
     build_messages,
@@ -93,11 +95,12 @@ def test_reply_format_is_the_last_section():
     user = _user(build_messages(PLAN, _step(5), TEMPLATE_FILES, []))
     assert user.endswith(
         "\nREPLY WITH:\n"
-        "One block per file you write:\n"
+        "One block per file:\n"
         "=== FILE: <path> ===\n"
         "<the complete file>\n"
         "=== END FILE ===\n"
-        "Files to write: frontend/src/api.js, frontend/src/App.jsx. "
+        "Write every file listed, even one you do not change: "
+        "frontend/src/api.js, frontend/src/App.jsx. "
         "No other text and no ``` fences.\n"
     )
 
@@ -273,7 +276,7 @@ def _check(name, passed, output):
     return CheckResult(name=name, passed=passed, output=output, seconds=0.1)
 
 
-FEEDBACK_TAIL = "\nFix the files and reply again with complete FILE blocks for the files you change."
+FEEDBACK_TAIL = "\nReply again with complete FILE blocks for every allowed file."
 
 
 def test_append_feedback_includes_only_failed_checks_and_does_not_mutate():
@@ -322,3 +325,36 @@ def test_feedback_messages_keep_only_the_original_prompt_and_the_latest_attempt(
     assert msgs[3]["content"].endswith(FEEDBACK_TAIL)
     with pytest.raises(ValueError):
         feedback_messages(base, "r", [_check("pytest", True, "ok")])
+
+
+def test_feedback_is_capped_keeping_the_tail_of_each_output_proportionally():
+    base = build_messages(PLAN, _step(2), TEMPLATE_FILES, [])
+    long_a = "".join(f"a line {i}\n" for i in range(3000)) + "A_END"
+    long_b = "".join(f"b line {i}\n" for i in range(1000)) + "B_END"
+    msgs = feedback_messages(
+        base, "r", [_check("pyflakes", False, long_a), _check("pytest", False, long_b)]
+    )
+    fb = msgs[-1]["content"]
+    assert default_count_tokens(fb) <= FEEDBACK_MAX_TOKENS
+    assert fb.startswith("The checks failed:\n") and fb.endswith(FEEDBACK_TAIL)
+    a = fb[fb.index("--- pyflakes ---\n") + len("--- pyflakes ---\n"): fb.index("--- pytest ---\n")]
+    b = fb[fb.index("--- pytest ---\n") + len("--- pytest ---\n"):]
+    # The end of each output survives (that is where the error is) ...
+    assert "A_END" in a and "B_END" in b
+    assert "a line 0\n" not in a and "b line 0\n" not in b
+    assert a.startswith(TRIMMED) and b.startswith(TRIMMED)
+    # ... and the longer output keeps the larger share.
+    assert len(a) > len(b)
+
+
+def test_feedback_cap_uses_the_callers_counter_and_leaves_short_output_alone():
+    base = build_messages(PLAN, _step(2), TEMPLATE_FILES, [])
+    out = "E assert 1 == 2\n" * 100
+    msgs = feedback_messages(
+        base, "r", [_check("pytest", False, out)], max_tokens=300, count_tokens=len
+    )
+    fb = msgs[-1]["content"]
+    assert len(fb) <= 300 and TRIMMED in fb
+    untouched = feedback_messages(base, "r", [_check("pytest", False, "short")])
+    assert "--- pytest ---\nshort\n" in untouched[-1]["content"]
+    assert TRIMMED not in untouched[-1]["content"]

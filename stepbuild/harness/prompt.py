@@ -51,7 +51,12 @@ is raised with the measured size, and the runner records a failed attempt.
 Retries. feedback_messages (what the runner uses) keeps only the original prompt
 plus the latest reply and its failures, so a prompt that fit once keeps fitting
 however many retries follow. append_feedback, which keeps the whole history, is
-kept for callers that want it.
+kept for callers that want it. The feedback turn itself is capped at
+FEEDBACK_MAX_TOKENS (same counter as the prompt): when the failed checks' output
+is longer, each output is cut from the front in proportion to its length, keeping
+its tail (where pytest's summary and vite's error are) behind a TRIMMED marker.
+So a retry costs at most the previous reply plus FEEDBACK_MAX_TOKENS, which is
+what the runner reserves for it.
 """
 from __future__ import annotations
 
@@ -78,7 +83,9 @@ _TREE_NOISE = (
 )
 _EXAMPLE_LABEL = "EXAMPLE {n} (from a different project: copy the structure, not the names):"
 _FEEDBACK_HEAD = "The checks failed:\n"
-_FEEDBACK_TAIL = "\nFix the files and reply again with complete FILE blocks for the files you change."
+_FEEDBACK_TAIL = "\nReply again with complete FILE blocks for every allowed file."
+FEEDBACK_MAX_TOKENS = 1024
+TRIMMED = "[... earlier output cut ...]\n"
 
 
 class PromptTooLong(ValueError):
@@ -175,11 +182,12 @@ def build_messages(
     ]
     reply_with = (
         "REPLY WITH:\n"
-        "One block per file you write:\n"
+        "One block per file:\n"
         "=== FILE: <path> ===\n"
         "<the complete file>\n"
         "=== END FILE ===\n"
-        f"Files to write: {', '.join(step.allowed_files)}. No other text and no ``` fences.\n"
+        f"Write every file listed, even one you do not change: {', '.join(step.allowed_files)}. "
+        "No other text and no ``` fences.\n"
     )
     tree = sorted(p for p in files if _in_tree(p))
     system_tokens = count(SYSTEM_PROMPT)
@@ -225,19 +233,68 @@ def build_messages(
     ]
 
 
-def _feedback(reply: str, failures: Sequence[CheckResult]) -> list[dict[str, str]]:
+def _tail_of(text: str, keep: int) -> str:
+    """The last `keep` characters of `text`, starting at a line boundary when
+    one is available, behind the TRIMMED marker; `text` itself if it fits."""
+    if keep >= len(text):
+        return text
+    tail = text[len(text) - keep:] if keep > 0 else ""
+    newline = tail.find("\n")
+    if 0 <= newline < len(tail) - 1:
+        tail = tail[newline + 1:]
+    return TRIMMED + tail
+
+
+def _feedback_text(
+    failed: Sequence[CheckResult], max_tokens: int, count: Callable[[str], int]
+) -> str:
+    outputs = [c.output.rstrip() for c in failed]
+
+    def render(texts: Sequence[str]) -> str:
+        body = "\n".join(f"--- {c.name} ---\n{t}" for c, t in zip(failed, texts))
+        return _FEEDBACK_HEAD + body + _FEEDBACK_TAIL
+
+    text = render(outputs)
+    if count(text) <= max_tokens:
+        return text
+    total = sum(len(o) for o in outputs)
+
+    def trimmed(kept: int) -> str:  # `kept` characters shared in proportion to length
+        return render([_tail_of(o, len(o) * kept // total) for o in outputs])
+
+    lo, hi = 0, total  # largest kept that fits; a longer tail never counts less
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if count(trimmed(mid)) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return trimmed(lo)
+
+
+def _feedback(
+    reply: str,
+    failures: Sequence[CheckResult],
+    max_tokens: int,
+    count_tokens: Callable[[str], int] | None,
+) -> list[dict[str, str]]:
     failed = [c for c in failures if not c.passed]
     if not failed:
         raise ValueError("feedback needs at least one failed check")
-    body = "\n".join(f"--- {c.name} ---\n{c.output.rstrip()}" for c in failed)
+    text = _feedback_text(failed, max_tokens, count_tokens or default_count_tokens)
     return [
         {"role": "assistant", "content": reply},
-        {"role": "user", "content": _FEEDBACK_HEAD + body + _FEEDBACK_TAIL},
+        {"role": "user", "content": text},
     ]
 
 
 def feedback_messages(
-    base: Sequence[Mapping[str, str]], reply: str, failures: Sequence[CheckResult]
+    base: Sequence[Mapping[str, str]],
+    reply: str,
+    failures: Sequence[CheckResult],
+    *,
+    max_tokens: int = FEEDBACK_MAX_TOKENS,
+    count_tokens: Callable[[str], int] | None = None,
 ) -> list[dict[str, str]]:
     """The retry prompt the runner uses: the ORIGINAL prompt `base`, the latest
     `reply`, and a user turn listing each failed check's name and output. Earlier
@@ -245,14 +302,21 @@ def feedback_messages(
 
     Passed checks are left out (they would only distract). A reply that could not
     be parsed arrives as a failed pseudo-check named "format" whose output is the
-    BlockError message, and renders the same way. `base` is not changed."""
-    return [dict(m) for m in base] + _feedback(reply, failures)
+    BlockError message, and renders the same way. The feedback turn is capped at
+    `max_tokens` counted with `count_tokens` (default: the prompt's counter), see
+    the module docstring. `base` is not changed."""
+    return [dict(m) for m in base] + _feedback(reply, failures, max_tokens, count_tokens)
 
 
 def append_feedback(
-    messages: Sequence[Mapping[str, str]], reply: str, failures: Sequence[CheckResult]
+    messages: Sequence[Mapping[str, str]],
+    reply: str,
+    failures: Sequence[CheckResult],
+    *,
+    max_tokens: int = FEEDBACK_MAX_TOKENS,
+    count_tokens: Callable[[str], int] | None = None,
 ) -> list[dict[str, str]]:
     """Like feedback_messages but keeps the whole history: `messages` (which may
     already hold earlier attempts), the reply and its feedback. Kept for
     compatibility; the runner uses feedback_messages so retries stay bounded."""
-    return [dict(m) for m in messages] + _feedback(reply, failures)
+    return [dict(m) for m in messages] + _feedback(reply, failures, max_tokens, count_tokens)

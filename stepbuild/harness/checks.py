@@ -1,5 +1,17 @@
-"""The three checks that decide whether a step passed: pyflakes, pytest, npm build.
+"""The checks that decide whether a step passed: contract, pyflakes, pytest, npm build.
 
+- `contract`: in-process, no subprocess. The step's files have the shape the
+  step asks for, so a reply that leaves the template placeholders in place (they
+  pass the other three checks) cannot pass. It needs the step (`step_key`):
+  model -> backend/models.py defines `class Store`; routes -> backend/app.py
+  has a string constant starting with "/api/"; api_tests ->
+  backend/tests/test_api.py defines a function named test_*; components ->
+  List.jsx and Form.jsx each contain `export default`; wiring -> App.jsx imports
+  './components/List.jsx' and './components/Form.jsx' and api.js has an
+  `export`. Python files are read with `ast` (a comment mentioning "/api/" does
+  not count); JSX is plain text. The output lists exactly what is missing, one
+  line each, because it is fed back to the model. The checks-only run step does
+  not use it: the template placeholders are meant to fail it.
 - `pyflakes`: `python -m pyflakes backend` from the project root. Fails only when
   pyflakes reports something (syntax errors, undefined names, unused imports).
 - `pytest`: `python -m pytest -q tests` with cwd `backend`, so `from app import
@@ -33,7 +45,9 @@ code.
 from __future__ import annotations
 
 import dataclasses
+import ast
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -273,20 +287,138 @@ def run_command_check(
     return CheckResult(name, code == 0, _tail(output), seconds)
 
 
+_MODELS = "backend/models.py"
+_APP = "backend/app.py"
+_TEST_API = "backend/tests/test_api.py"
+_LIST = "frontend/src/components/List.jsx"
+_FORM = "frontend/src/components/Form.jsx"
+_APP_JSX = "frontend/src/App.jsx"
+_API_JS = "frontend/src/api.js"
+_EXPORT = re.compile(r"^\s*export\b", re.MULTILINE)
+
+
+def _imports(module: str) -> re.Pattern[str]:
+    return re.compile(r"\bimport\b[^;]*?\bfrom\s*['\"]" + re.escape(module) + r"['\"]")
+
+
+def _text(root: Path, rel: str, problems: list[str]) -> str | None:
+    """The file's text, or None after recording why it cannot be checked."""
+    try:
+        return (root / rel).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        problems.append(f"{rel} is missing")
+    except UnicodeDecodeError:
+        problems.append(f"{rel} is not UTF-8 text")
+    except OSError as e:
+        problems.append(f"{rel} cannot be read: {e}")
+    return None
+
+
+def _python(root: Path, rel: str, problems: list[str]) -> ast.Module | None:
+    text = _text(root, rel, problems)
+    if text is None:
+        return None
+    try:
+        return ast.parse(text, filename=rel)
+    except (SyntaxError, ValueError) as e:
+        line = getattr(e, "lineno", None)
+        where = f" (line {line})" if line else ""
+        problems.append(f"{rel} does not parse{where}: {getattr(e, 'msg', e)}")
+        return None
+
+
+def _contract_model(root: Path, problems: list[str]) -> None:
+    tree = _python(root, _MODELS, problems)
+    if tree is not None and not any(
+        isinstance(n, ast.ClassDef) and n.name == "Store" for n in tree.body
+    ):
+        problems.append(f"{_MODELS} does not define `class Store`")
+
+
+def _contract_routes(root: Path, problems: list[str]) -> None:
+    tree = _python(root, _APP, problems)
+    if tree is not None and not any(
+        isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.startswith("/api/")
+        for n in ast.walk(tree)
+    ):
+        problems.append(f'{_APP} has no route string starting with "/api/"')
+
+
+def _contract_api_tests(root: Path, problems: list[str]) -> None:
+    tree = _python(root, _TEST_API, problems)
+    if tree is not None and not any(
+        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")
+        for n in ast.walk(tree)
+    ):
+        problems.append(f"{_TEST_API} defines no test_* function")
+
+
+def _contract_components(root: Path, problems: list[str]) -> None:
+    for rel in (_LIST, _FORM):
+        text = _text(root, rel, problems)
+        if text is not None and "export default" not in text:
+            problems.append(f"{rel} has no `export default`")
+
+
+def _contract_wiring(root: Path, problems: list[str]) -> None:
+    app = _text(root, _APP_JSX, problems)
+    if app is not None:
+        for module in ("./components/List.jsx", "./components/Form.jsx"):
+            if not _imports(module).search(app):
+                problems.append(f"{_APP_JSX} does not import '{module}'")
+    api = _text(root, _API_JS, problems)
+    if api is not None and not _EXPORT.search(api):
+        problems.append(f"{_API_JS} has no `export`")
+
+
+_CONTRACTS = {
+    "model": _contract_model,
+    "routes": _contract_routes,
+    "api_tests": _contract_api_tests,
+    "components": _contract_components,
+    "wiring": _contract_wiring,
+}
+
+
+def check_contract(root: Path, step_key: str) -> CheckResult:
+    """The `contract` check for one model step (see the module docstring). Output
+    is one line per problem, empty when the step's files have the right shape."""
+    rule = _CONTRACTS.get(step_key)
+    if rule is None:
+        raise ValueError(f"step {step_key!r} has no contract; known: {sorted(_CONTRACTS)}")
+    start = time.monotonic()
+    problems: list[str] = []
+    rule(Path(root), problems)
+    return CheckResult("contract", not problems, "\n".join(problems), time.monotonic() - start)
+
+
 def run_checks(
-    sandbox: "Sandbox", names: Sequence[str], timeout_s: int = 180
+    sandbox: "Sandbox",
+    names: Sequence[str],
+    timeout_s: int = 180,
+    *,
+    step_key: str | None = None,
 ) -> list[CheckResult]:
     """Run the named checks in order and return one result per name. Every check
-    runs even if an earlier one failed, so the model sees all problems at once."""
+    runs even if an earlier one failed, so the model sees all problems at once.
+    `step_key` (the plan step's key) is required when "contract" is named."""
     if isinstance(names, str):
         raise TypeError("names must be a sequence of check names, not a single str")
     unknown = [n for n in names if n not in CHECK_NAMES]
     if unknown:
         raise ValueError(f"unknown check(s) {unknown}; expected some of {list(CHECK_NAMES)}")
+    if "contract" in names:
+        if step_key is None:
+            raise ValueError("the contract check needs step_key (the plan step's key)")
+        if step_key not in _CONTRACTS:
+            raise ValueError(f"step {step_key!r} has no contract; known: {sorted(_CONTRACTS)}")
     root = Path(sandbox.root)
     env = check_env()
     results = []
     for name in names:
+        if name == "contract":
+            results.append(check_contract(root, step_key))
+            continue
         command = _command(name, root)
         if isinstance(command, str):
             results.append(CheckResult(name, False, command, 0.0))

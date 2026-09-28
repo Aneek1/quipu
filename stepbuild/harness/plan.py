@@ -2,12 +2,19 @@
 
 Every app is a Flask API plus a Vite React frontend, built in the same order:
 
-    1 model       backend/models.py                          pyflakes
-    2 routes      backend/app.py                             pyflakes, pytest
-    3 api_tests   backend/tests/test_api.py                  pyflakes, pytest
-    4 components  frontend/src/components/{List,Form}.jsx    npm_build
-    5 wiring      frontend/src/{api.js,App.jsx}              npm_build
+    1 model       backend/models.py                          contract, pyflakes
+    2 routes      backend/app.py                             contract, pyflakes, pytest
+    3 api_tests   backend/tests/test_api.py                  contract, pyflakes, pytest
+    4 components  frontend/src/components/{List,Form}.jsx    contract, npm_build
+    5 wiring      frontend/src/{api.js,App.jsx}              contract, npm_build
     6 run         (no files, no model call)                  pyflakes, pytest, npm_build
+
+Every model step checks its `contract` first (checks.py): the step's files have
+the shape the step asks for (a `class Store`, an "/api/" route, a test_*
+function, default exports, the component imports). The template's placeholders
+already pass pyflakes, pytest and the build, so without it a reply that changes
+nothing would pass steps 1, 4 and 5. The placeholders are meant to FAIL the
+contract, which is why the checks-only run step does not include it.
 
 The order is fixed rather than planned by the model because the thing being
 measured is whether a small model can write each file well, not whether it can plan;
@@ -35,7 +42,7 @@ import re
 
 from stepbuild.harness.blocks import FileBlock
 
-CHECKS = ("pyflakes", "pytest", "npm_build")
+CHECKS = ("contract", "pyflakes", "pytest", "npm_build")
 N_STEPS = 6
 
 # Letters, digits, '_' and '-', starting with a letter: the name ends up in
@@ -94,7 +101,7 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
     (
         "model",
         ("backend/models.py",),
-        ("pyflakes",),
+        ("contract", "pyflakes"),
         "Write backend/models.py for the {app} app: a `Store` class that keeps items "
         "in a dict and assigns each new item an integer `id`, with methods "
         "create(data), list_items(), get(id), update(id, data) and delete(id); items "
@@ -112,7 +119,7 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
     (
         "routes",
         ("backend/app.py",),
-        ("pyflakes", "pytest"),
+        ("contract", "pyflakes", "pytest"),
         "Write backend/app.py for the {app} app: a create_app() Flask factory that "
         "creates a new Store() for each call and uses it in the routes; import from "
         "models with `from models import Store, ...`. Expose the REST endpoints described "
@@ -129,7 +136,7 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
     (
         "api_tests",
         ("backend/tests/test_api.py",),
-        ("pyflakes", "pytest"),
+        ("contract", "pyflakes", "pytest"),
         "Write backend/tests/test_api.py for the {app} app: pytest tests that use the "
         "`client` fixture from backend/tests/conftest.py (do not redefine it); import "
         "with `from app import create_app` only if needed. Check every /api/ endpoint in "
@@ -142,7 +149,7 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
     (
         "components",
         ("frontend/src/components/List.jsx", "frontend/src/components/Form.jsx"),
-        ("npm_build",),
+        ("contract", "npm_build"),
         "Write the React components for the {app} app: "
         "frontend/src/components/List.jsx (default export List, props `items` and "
         "`onDelete`; renders each item's fields with a delete button that calls "
@@ -155,7 +162,7 @@ _STEPS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], str], ...] = (
     (
         "wiring",
         ("frontend/src/api.js", "frontend/src/App.jsx"),
-        ("npm_build",),
+        ("contract", "npm_build"),
         "Wire up the {app} app frontend: frontend/src/api.js exports async functions "
         "to list, create and delete items (it may export others) that call the "
         "backend endpoints from the spec with fetch (api.js calls "

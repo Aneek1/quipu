@@ -12,17 +12,23 @@ from stepbuild.harness.plan import CHECKS, AppPlan, Step, make_plan
 SPEC = "A todo list: each todo has a required title and a done flag."
 
 EXPECTED = [
-    (1, "model", ("backend/models.py",), ("pyflakes",), True),
-    (2, "routes", ("backend/app.py",), ("pyflakes", "pytest"), True),
-    (3, "api_tests", ("backend/tests/test_api.py",), ("pyflakes", "pytest"), True),
+    (1, "model", ("backend/models.py",), ("contract", "pyflakes"), True),
+    (2, "routes", ("backend/app.py",), ("contract", "pyflakes", "pytest"), True),
+    (3, "api_tests", ("backend/tests/test_api.py",), ("contract", "pyflakes", "pytest"), True),
     (
         4,
         "components",
         ("frontend/src/components/List.jsx", "frontend/src/components/Form.jsx"),
-        ("npm_build",),
+        ("contract", "npm_build"),
         True,
     ),
-    (5, "wiring", ("frontend/src/api.js", "frontend/src/App.jsx"), ("npm_build",), True),
+    (
+        5,
+        "wiring",
+        ("frontend/src/api.js", "frontend/src/App.jsx"),
+        ("contract", "npm_build"),
+        True,
+    ),
     (6, "run", (), ("pyflakes", "pytest", "npm_build"), False),
 ]
 
@@ -134,9 +140,20 @@ def test_app_name_substitution_is_literal():
 
 
 def test_checks_come_from_the_known_set():
-    assert CHECKS == ("pyflakes", "pytest", "npm_build")
+    assert CHECKS == ("contract", "pyflakes", "pytest", "npm_build")
     for s in make_plan("todo", SPEC).steps:
         assert set(s.checks) <= set(CHECKS)
+
+
+def test_every_model_step_checks_its_contract_first_and_run_does_not():
+    # The contract is what stops a do-nothing reply (the template placeholders)
+    # from passing a step; the placeholders are expected to fail it, so the
+    # checks-only run step, which writes nothing, must not run it.
+    for s in make_plan("todo", SPEC).steps:
+        if s.model_step:
+            assert s.checks[0] == "contract", s.key
+        else:
+            assert "contract" not in s.checks
 
 
 @pytest.mark.parametrize("app", ["", "   ", "\t\n"])
