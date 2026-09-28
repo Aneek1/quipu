@@ -8,3 +8,6 @@ checkpoints/
 *.pt
 *.safetensors
 hf_export/
+stepbuild/harness/template/frontend/node_modules/
+stepbuild/harness/template/frontend/dist/
+node_modules/
