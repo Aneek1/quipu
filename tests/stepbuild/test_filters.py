@@ -340,6 +340,18 @@ SECRETS = [
     "api_key='0a1b2c3d4e5f'",
     'apiKey = "0a1b2c3d4e5f"',
     'const TOKEN = "eyJhbGciOi"',
+    # Flask's common forms: the keyword inside a longer name, config subscripts,
+    # and a hardcoded fallback to an environment lookup.
+    "SECRET_KEY = 'abc123def456'",
+    'JWT_SECRET_KEY="jwt-signing-value"',
+    'DB_PASSWORD = "pg-pass-1234"',
+    'api_token: "tok-9f8e7d6c"',
+    "app.config['SECRET_KEY'] = 'hard to guess string'",
+    'app.config["SECRET_KEY"] = "hard to guess string"',
+    'SECRET_KEY = os.environ.get("SECRET_KEY", "hardcoded-fallback-value")',
+    "key = os.getenv('API_TOKEN', 'fallback-token-1')",
+    # A real value that merely starts with "your" is not a placeholder.
+    "password = 'yourfavouritepw1'",
 ]
 
 
@@ -370,6 +382,13 @@ def test_secrets_are_flagged(text):
         "-----BEGIN PUBLIC KEY-----",
         "def check_password(password):",
         '{"password": "hunter22"}',  # a JSON body key, not an assignment
+        'SECRET_KEY = os.environ["SECRET_KEY"]',
+        'SECRET_KEY = os.environ.get("SECRET_KEY")',
+        "SECRET_KEY = os.getenv('SECRET_KEY')",
+        'SECRET_KEY = os.environ.get("SECRET_KEY", "$FALLBACK")',
+        "app.config['SECRET_KEY'] = 'your-secret-key'",
+        "JWT_SECRET_KEY = '<your jwt secret>'",
+        'json={"username": "alice", "password": "hunter22"}',
     ],
 )
 def test_placeholders_and_non_secrets_are_not_flagged(text):

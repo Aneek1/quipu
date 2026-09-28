@@ -144,10 +144,20 @@ _SECRET_TOKENS = re.compile(
     r"|sk-[A-Za-z0-9]{20,}"
     r"|xox[baprs]-"
 )
+_SECRET_NAME = r"\w*(?:password|passwd|secret|api_key|apikey|token)\w*"
+# NAME = '...', NAME: "...", and config['NAME'] = '...' (the optional quote + "]").
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(password|passwd|secret|api_key|apikey|token)\s*[:=]\s*(['\"])([^'\"]{6,})\2"
+    rf"(?i){_SECRET_NAME}(?:['\"]\])?\s*[:=]\s*(['\"])(?P<value>[^'\"]{{6,}})\1"
 )
-_PLACEHOLDER_PREFIXES = ("changeme", "your", "<", "$", "%(", "{{", "***", "process.env", "os.environ")
+# os.environ.get("NAME", "fallback") / os.getenv('NAME', 'fallback'): a hardcoded
+# fallback ships the secret whenever the variable is unset.
+_SECRET_FALLBACK = re.compile(
+    rf"(?i)(?:environ\.get|getenv)\(\s*['\"]{_SECRET_NAME}['\"]\s*,\s*(['\"])"
+    rf"(?P<value>[^'\"]{{6,}})\1"
+)
+_PLACEHOLDER_PREFIXES = (
+    "changeme", "your-", "your_", "<your", "<", "$", "%(", "{{", "***", "process.env", "os.environ"
+)
 _PLACEHOLDER_WORDS = ("xxx", "example", "placeholder", "dummy", "replace", "redacted")
 
 
@@ -281,13 +291,21 @@ def _is_placeholder(value: str) -> bool:
 def contains_secret(text: str) -> bool:
     """True when `text` looks like it holds a credential: a known token shape (AWS
     key id, private key header, GitHub/OpenAI/Slack token), or a quoted value of 6+
-    characters assigned to a password/secret/api key/token name that is not an
-    obvious placeholder ("changeme", "your-...", "xxx", "<...>", "${...}", "$VAR").
-    Tuned to keep false negatives low: a dropped good commit costs one example,
-    a published secret costs far more."""
+    characters that is not an obvious placeholder ("changeme", "your-...",
+    "your_...", "xxx", "<...>", "${...}", "$VAR") given to a name containing
+    password/passwd/secret/api_key/apikey/token (SECRET_KEY, DB_PASSWORD,
+    api_token), either assigned (`NAME = '...'`, `NAME: "..."`,
+    `app.config['NAME'] = '...'`) or as the fallback of an environment lookup
+    (`os.environ.get("NAME", "...")`). A JSON body key (`{"password": "..."}`)
+    is not an assignment. Tuned to keep false negatives low: a dropped good commit
+    costs one example, a published secret costs far more."""
     if _SECRET_TOKENS.search(text):
         return True
-    return any(not _is_placeholder(m.group(3)) for m in _SECRET_ASSIGNMENT.finditer(text))
+    return any(
+        not _is_placeholder(m.group("value"))
+        for pattern in (_SECRET_ASSIGNMENT, _SECRET_FALLBACK)
+        for m in pattern.finditer(text)
+    )
 
 
 def _is_unsafe_message(message: str) -> bool:
