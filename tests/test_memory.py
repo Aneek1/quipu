@@ -236,3 +236,56 @@ def test_window_rejects_unknown_or_duplicate_chunk_ids():
         pack_window([0, 0], _chunks(), [1], budget=50)
     with pytest.raises(ValueError):
         pack_window([17], _chunks(), [1], budget=50)
+
+
+# ------------------------------------------- window: one break, and rank order
+
+
+def test_window_no_double_separator_when_chunk_already_ends_in_one():
+    # The last chunk already ends with the separator (a needle ends "\n"): the
+    # prompt must follow exactly one separator, never two.
+    chunks = [[100] * 5, [101, 101, 9]]
+    packed = pack_window([1], chunks, [1, 2], budget=50, separator=[9])
+    assert packed.tokens == (101, 101, 9, 1, 2)
+    # and between non-adjacent chunks too
+    chunks = [[100, 9], [101] * 3, [102] * 3]
+    packed = pack_window([0, 2], chunks, [1], budget=50, separator=[9])
+    assert packed.tokens == (100, 9, 102, 102, 102, 9, 1)
+
+
+def test_window_ends_with_break_predicate_counts_any_newline_token():
+    # token 7 stands for a token that decodes to something ending in a newline
+    chunks = [[100, 7]]
+    packed = pack_window([0], chunks, [1], budget=50, separator=[9],
+                         ends_with_break=lambda t: t in (7, 9))
+    assert packed.tokens == (100, 7, 1)
+
+
+def test_join_with_break():
+    from quipu.memory.window import join_with_break
+    assert join_with_break([5, 9], [1], [9]) == [5, 9, 1]
+    assert join_with_break([5], [1], [9]) == [5, 9, 1]
+    assert join_with_break([], [1], [9]) == [1]
+
+
+def test_window_rank_order_puts_best_chunk_next_to_prompt():
+    packed = pack_window([4, 0, 2], _chunks(), [1], budget=50, separator=[9], order="rank")
+    assert packed.chunk_ids == (2, 0, 4)            # reverse rank: best last
+    assert packed.tokens[-7:] == tuple([104] * 5 + [9, 1])
+
+
+def test_window_rank_order_respects_budget_and_keeps_prompt_last():
+    for budget in range(2, 40):
+        p = pack_window([5, 1, 3, 0, 2], _chunks(), [1, 1], budget=budget,
+                        separator=[9], order="rank")
+        assert len(p.tokens) <= budget
+        assert p.tokens[-2:] == (1, 1)
+        if p.chunk_ids:
+            assert p.chunk_ids[-1] == 5           # the best chunk always sits last
+    p = pack_window([5, 1, 3], _chunks(), [1], budget=13, separator=[9], order="rank")
+    assert p.chunk_ids == (1, 5)
+
+
+def test_window_rejects_unknown_order():
+    with pytest.raises(ValueError):
+        pack_window([0], _chunks(), [1], budget=50, order="random")

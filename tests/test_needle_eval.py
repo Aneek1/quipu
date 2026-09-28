@@ -329,3 +329,81 @@ def test_main_cli_with_latest_pointer(tmp_path):
     assert (out / "text_64.json").is_file() and (out / "code_64.json").is_file()
     assert (out / "summary.md").is_file()
     assert not list(out.glob("*.tmp"))
+
+
+# ------------------------------------------- one newline before the prompt
+
+
+@pytest.mark.parametrize("kind", ["text", "code"])
+def test_off_window_has_exactly_one_newline_before_prompt_at_depth_100(tok, kind):
+    base = np.arange(1000, 1400, dtype=np.uint16)
+    needle = needle_eval.make_needle(kind, random.Random(4))
+    ids = needle_eval.needle_token_ids(needle, tok)
+    planted, pos = needle_eval.plant(base, ids, 100)
+    prompt = tok.encode(needle.prompt)
+    window, hit = needle_eval.off_window(planted, pos, prompt, 120, tok.encode("\n"),
+                                         needle_eval.newline_predicate(tok))
+    assert hit
+    assert window[-len(prompt):] == prompt
+    before = tok.decode(window[:-len(prompt)])
+    assert before.endswith(needle.text + "\n")
+    assert not before.endswith("\n\n")
+    # and a tail that does not end in a newline still gets exactly one
+    window, _ = needle_eval.off_window(base.copy(), 0, prompt, 120, tok.encode("\n"),
+                                       needle_eval.newline_predicate(tok))
+    assert window[-len(prompt) - 1] == tok.encode("\n")[0]
+
+
+def test_packed_needle_window_has_one_newline_before_prompt(tok):
+    base = np.arange(1000, 1100, dtype=np.uint16)
+    needle = needle_eval.make_needle("code", random.Random(9))
+    ids = needle_eval.needle_token_ids(needle, tok)
+    planted, pos = needle_eval.plant(base, ids, 100)
+    spans = chunk_spans(len(base), 16)
+    ci = needle_eval.needle_chunk_index(pos, spans)
+    chunks = [base[s.start:s.end].tolist() for s in spans]
+    chunks[ci] = needle_eval.planted_chunk(base, spans[ci], pos, ids)
+    prompt = tok.encode(needle.prompt)
+    from quipu.memory.window import pack_window
+    packed = pack_window([ci], chunks, prompt, 120, separator=tok.encode("\n"),
+                         ends_with_break=needle_eval.newline_predicate(tok))
+    text = tok.decode(list(packed.tokens))
+    assert text.endswith(needle.text + "\n" + needle.prompt)
+
+
+def test_newline_predicate(tok):
+    pred = needle_eval.newline_predicate(tok)
+    assert pred(tok.encode("\n")[0])
+    assert pred(tok.encode("\n\n")[0])
+    assert not pred(tok.encode(" vault")[0])
+
+
+# ---------------------------------------------------------- order option
+
+
+def test_condition_labels():
+    assert needle_eval.condition_labels(["off", "bm25", "fused"], ["document"]) == [
+        ("off", "document", "off"), ("bm25", "document", "bm25"), ("fused", "document", "fused")]
+    assert needle_eval.condition_labels(["off", "bm25"], ["document", "rank"]) == [
+        ("off", "document", "off"), ("bm25", "document", "bm25"), ("bm25", "rank", "bm25+rank")]
+    assert needle_eval.condition_labels(["bm25"], ["rank"]) == [("bm25", "rank", "bm25+rank")]
+
+
+def test_end_to_end_with_both_orders(tmp_path, tok):
+    shard_dir = tmp_path / "shards"
+    _write_haystacks(shard_dir)
+    haystacks = {"code": needle_eval.load_haystack(shard_dir, "code")}
+    out = tmp_path / "needle"
+    needle_eval.run(
+        model=_tiny_model(), tok=tok, haystacks=haystacks, sizes=[200], depths=[0, 100],
+        trials=1, conditions=["off", "bm25", "dense"], device="cpu", out_dir=out, seed=0,
+        embedder_factory=HashEmbedder, chunk_tokens=16, orders=["document", "rank"],
+    )
+    data = json.loads((out / "code_200.json").read_text(encoding="utf-8"))
+    assert list(data["aggregates"]) == ["off", "bm25", "bm25+rank", "dense", "dense+rank"]
+    ranked = [r for r in data["trials"] if r["condition"] == "bm25+rank"]
+    assert all(r["window_chunks"][-1] == r["needle_chunk"] for r in ranked)   # BM25 rank 0
+    for rec in data["trials"]:
+        assert rec["window_tokens"] <= 128 - needle_eval.MAX_NEW_TOKENS
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert "| bm25+rank |" in summary

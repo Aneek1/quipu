@@ -50,7 +50,7 @@ from quipu.memory.bm25 import BM25Index
 from quipu.memory.chunker import CHUNK_TOKENS, Chunk, chunk_spans
 from quipu.memory.dense import DenseIndex, E5Embedder, Embedder
 from quipu.memory.fusion import reciprocal_rank_fusion
-from quipu.memory.window import pack_window
+from quipu.memory.window import ORDERS, join_with_break, pack_window
 from quipu.model import Quipu
 from quipu.tokenizer import Tokenizer
 from quipu.train import LATEST
@@ -214,6 +214,49 @@ def greedy_continue(model: Quipu, tokens: Sequence[int], n: int, device: str) ->
     return out
 
 
+def newline_predicate(tok: Tokenizer) -> Callable[[int], bool]:
+    """True for a token whose text ends in a newline ("\n", "\n\n", ...). Used to
+    skip the separator before the prompt when one is already there: the needle ends
+    in "\n", and "fact\n\nprompt" makes the model read a topic change and stop
+    copying (code 1k at depth 100 went 0/20 -> 19/20 once the blank line was gone)."""
+    cache: dict[int, bool] = {}
+
+    def ends_in_newline(t: int) -> bool:
+        if t not in cache:
+            cache[t] = tok.decode([t]).endswith("\n")
+        return cache[t]
+
+    return ends_in_newline
+
+
+def off_window(
+    planted: np.ndarray, pos: int, prompt: Sequence[int], budget: int,
+    separator: Sequence[int], ends_with_break: Callable[[int], bool],
+) -> tuple[list[int], bool]:
+    """Memory off: the document's tail, one break, the prompt, cut from the left to
+    `budget`. Returns (window, hit) where hit means the whole needle survived the cut."""
+    # Only the last `budget` tokens can matter, so never turn the whole 1M-token
+    # document into a Python list.
+    offset = max(len(planted) - budget, 0)
+    full = join_with_break(planted[offset:].tolist(), prompt, separator, ends_with_break)
+    cut = max(len(full) - budget, 0)
+    return full[cut:], pos >= offset + cut
+
+
+def condition_labels(conditions: Sequence[str], orders: Sequence[str]) -> list[tuple[str, str, str]]:
+    """(condition, order, label) triples. "off" has no chunks to order, so it runs
+    once; a memory condition runs once per order, labelled "bm25" for document order
+    (the spec's default) and "bm25+rank" for rank order."""
+    out = []
+    for cond in conditions:
+        if cond == "off":
+            out.append(("off", "document", "off"))
+            continue
+        for order in orders:
+            out.append((cond, order, cond if order == "document" else f"{cond}+rank"))
+    return out
+
+
 # --------------------------------------------------------------------------
 # scoring
 # --------------------------------------------------------------------------
@@ -269,12 +312,15 @@ def run_one(
     *, model: Quipu, tok: Tokenizer, kind: str, haystack: np.ndarray, size: int,
     depths: Sequence[int], trials: int, conditions: Sequence[str], device: str,
     seed: int, embedder: Embedder | None, chunk_tokens: int, log: Callable[[str], None],
+    orders: Sequence[str] = ("document",),
 ) -> dict:
     budget = model.cfg.context - MAX_NEW_TOKENS
     base = haystack[: size - NEEDLE_RESERVE]
     spans = chunk_spans(len(base), chunk_tokens)
     base_chunks = [base[c.start:c.end].tolist() for c in spans]
     sep = tok.encode("\n")
+    is_break = newline_predicate(tok)
+    labels = condition_labels(conditions, orders)
 
     build_s: dict[str, float | None] = {"bm25": None, "dense": None}
     bm25 = dense = None
@@ -293,7 +339,7 @@ def run_one(
         f"dense={build_s['dense'] if build_s['dense'] is None else round(build_s['dense'], 2)}s")
 
     records: list[dict] = []
-    peak: dict[str, float | None] = {c: None for c in conditions}
+    peak: dict[str, float | None] = {label: None for _, _, label in labels}
     for depth in depths:
         for trial in range(trials):
             needle = make_needle(kind, trial_rng(seed, kind, size, depth, trial))
@@ -311,19 +357,13 @@ def run_one(
                 dense.patch(ci, tok.decode(chunks[ci]))
 
             try:
-                for cond in conditions:
+                for cond, order, label in labels:
                     if _cuda(device):
                         torch.cuda.reset_peak_memory_stats()
                     ranking: list[int] = []
                     latency = None
                     if cond == "off":
-                        # Only the last `budget` tokens can matter, so never turn
-                        # the whole 1M-token document into a Python list.
-                        offset = max(len(planted) - budget, 0)
-                        full = planted[offset:].tolist() + sep + prompt
-                        cut = max(len(full) - budget, 0)
-                        window = full[cut:]
-                        hit = pos >= offset + cut
+                        window, hit = off_window(planted, pos, prompt, budget, sep, is_break)
                         window_chunks: list[int] = []
                     else:
                         t0 = time.perf_counter()
@@ -339,7 +379,8 @@ def run_one(
                         else:
                             raise ValueError(f"unknown condition {cond!r}")
                         latency = (time.perf_counter() - t0) * 1000.0
-                        packed = pack_window(ranking, chunks, prompt, budget, separator=sep)
+                        packed = pack_window(ranking, chunks, prompt, budget, separator=sep,
+                                             order=order, ends_with_break=is_break)
                         window = list(packed.tokens)
                         window_chunks = list(packed.chunk_ids)
                         hit = ci in packed.chunk_ids
@@ -347,10 +388,10 @@ def run_one(
                     cont = tok.decode(cont_ids)
                     if _cuda(device):
                         mb = torch.cuda.max_memory_allocated() / 2**20
-                        peak[cond] = mb if peak[cond] is None else max(peak[cond], mb)
+                        peak[label] = mb if peak[label] is None else max(peak[label], mb)
                     records.append({
                         "haystack": kind, "size": size, "depth": depth, "trial": trial,
-                        "condition": cond, "adjective": needle.adjective, "value": needle.value,
+                        "condition": label, "order": order, "adjective": needle.adjective, "value": needle.value,
                         "needle_pos": pos, "needle_chunk": ci,
                         "needle_rank": ranking.index(ci) if ci in ranking else None,
                         "window_chunks": window_chunks, "window_tokens": len(window),
@@ -365,9 +406,9 @@ def run_one(
                     dense.patch(ci, base_texts[ci])
 
     aggregates = aggregate(records)
-    for cond in conditions:
-        aggregates[cond]["peak_vram_mb"] = peak[cond]
-        aggregates[cond]["index_build_s"] = {
+    for cond, _, label in labels:
+        aggregates[label]["peak_vram_mb"] = peak[label]
+        aggregates[label]["index_build_s"] = {
             "off": None, "bm25": build_s["bm25"], "dense": build_s["dense"],
             "fused": (build_s["bm25"] or 0.0) + (build_s["dense"] or 0.0)
             if build_s["bm25"] is not None and build_s["dense"] is not None else None,
@@ -376,7 +417,7 @@ def run_one(
         "haystack": kind, "size": size, "size_label": format_size(size),
         "base_tokens": len(base), "chunks": len(spans), "chunk_tokens": chunk_tokens,
         "window_budget": budget, "depths": list(depths), "trials_per_depth": trials,
-        "seed": seed, "index_build_s": build_s, "aggregates": aggregates, "trials": records,
+        "seed": seed, "orders": list(orders), "index_build_s": build_s, "aggregates": aggregates, "trials": records,
     }
 
 
@@ -385,12 +426,15 @@ def run(
     depths: Sequence[int], trials: int, conditions: Sequence[str], device: str, out_dir: Path,
     seed: int = DEFAULT_SEED, embedder_factory: Callable[[], Embedder] | None = None,
     chunk_tokens: int = CHUNK_TOKENS, log: Callable[[str], None] = print,
+    orders: Sequence[str] = ("document",),
 ) -> list[dict]:
     """Evaluate every (haystack, size); write one JSON per pair as it finishes (so a
     crash late in the run keeps the finished pairs) and the summary at the end."""
     unknown = set(conditions) - set(CONDITIONS)
     if unknown or not conditions:
         raise ValueError(f"conditions must be a non-empty subset of {CONDITIONS}, got {conditions!r}")
+    if not orders or set(orders) - set(ORDERS) or len(set(orders)) != len(orders):
+        raise ValueError(f"orders must be distinct values from {ORDERS}, got {orders!r}")
     if trials < 1:
         raise ValueError(f"trials must be at least 1, got {trials}")
     for d in depths:
@@ -416,7 +460,7 @@ def run(
             res = run_one(
                 model=model, tok=tok, kind=kind, haystack=hay, size=size, depths=depths,
                 trials=trials, conditions=conditions, device=device, seed=seed,
-                embedder=embedder, chunk_tokens=chunk_tokens, log=log,
+                embedder=embedder, chunk_tokens=chunk_tokens, log=log, orders=orders,
             )
             res["seconds"] = time.perf_counter() - t0
             _write_text_atomic(out_dir / f"{kind}_{format_size(size)}.json",
@@ -514,6 +558,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--conditions", default=",".join(CONDITIONS))
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--out", default=None, help="default results/needle (results/needle/quick with --quick)")
+    parser.add_argument("--order", default="document", choices=["document", "rank", "both"],
+                        help="window layout for memory conditions; both runs each twice "
+                             "(labelled e.g. bm25 and bm25+rank)")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--chunk-tokens", type=int, default=CHUNK_TOKENS)
     parser.add_argument("--quick", action="store_true",
@@ -545,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         conditions=conditions, device=device, out_dir=out, seed=args.seed,
         embedder_factory=lambda: E5Embedder(device=device), chunk_tokens=args.chunk_tokens,
         log=lambda m: print(m, flush=True),
+        orders=["document", "rank"] if args.order == "both" else [args.order],
     )
     print(f"needle_eval: done in {time.perf_counter() - t0:.0f}s; wrote {out}", flush=True)
     return 0
