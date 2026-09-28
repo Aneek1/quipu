@@ -1,15 +1,25 @@
 """Pick dataset examples to show the model for a step.
 
 The library is the train split of the step dataset (spec §3.1): each example is a
-STEP instruction and the FILE-block reply that carried it out. For a benchmark
-step the caller queries with the step title plus the app spec, and the top two
-examples go into the prompt.
+STEP instruction (a commit message) and the FILE-block reply that carried it out.
+
+Callers query with the STEP TITLE ONLY, not the app spec, and pass the step's
+allowed files as `prefer_paths`. Both choices come from measuring on real
+commit-message data: a title + spec query over step + reply picked an example of
+the same kind of step (model, routes, tests, frontend) first only 12 times in 50,
+because the spec's many nouns match everything; the title alone plus a preference
+for examples that write the same kind of file got 47 in 50.
+
+File roles (the preference): a Python test file (`test_*.py`, or any .py under a
+`tests/` directory), other Python (.py), and frontend source (.js .jsx .ts .tsx
+.css). Examples whose reply writes a file with a role of any preferred path come
+first, in BM25 order; the other matching examples fill the remaining places, also
+in BM25 order. A preferred path with no role (README.md) prefers nothing.
 
 BM25 over GPT-2 token ids (quipu.memory.bm25, tokenized with quipu's tiktoken
 wrapper) rather than embeddings: it needs no model, is deterministic, and rewards
 exact identifiers (a route name, a field, `create_app`) that matter most when
-choosing code to imitate. Each example is indexed on step + reply, so a query
-matches both what was asked and what was written.
+choosing code to imitate. Each example is indexed on step + reply.
 
 Ranking is deterministic, with ties going to the earlier example, so a benchmark
 run is reproducible. Only examples that share at least one token with the query
@@ -20,13 +30,35 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from pathlib import Path
-from typing import Sequence
+from typing import Collection, Sequence
 
 from quipu.memory.bm25 import BM25Index
 from quipu.tokenizer import Tokenizer
 
 _STEP_PREFIX = "STEP: "
+_STEP_END = "\n\nCONTEXT FILES:"
+_FILE_LINE = re.compile(r"^=== FILE: (.+?) ===[ \t]*$", re.MULTILINE)
+_FRONTEND_EXTS = (".js", ".jsx", ".ts", ".tsx", ".css")
+
+
+def file_role(path: str) -> str | None:
+    """"test", "python", "frontend", or None for anything else."""
+    segments = path.split("/")
+    name = segments[-1]
+    if name.endswith(".py"):
+        if name.startswith("test_") or "tests" in segments[:-1]:
+            return "test"
+        return "python"
+    if name.endswith(_FRONTEND_EXTS):
+        return "frontend"
+    return None
+
+
+def _written_roles(reply: str) -> frozenset[str]:
+    roles = (file_role(p.strip()) for p in _FILE_LINE.findall(reply))
+    return frozenset(r for r in roles if r is not None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,6 +74,7 @@ class ExampleLibrary:
         if bad:
             raise TypeError(f"examples must be Example instances, got {bad}")
         self._tok = Tokenizer("gpt2")
+        self._roles = [_written_roles(e.reply) for e in self.examples]
         # BM25Index refuses an empty corpus; an empty library simply never matches.
         self._index = (
             BM25Index([self._tok.encode(e.step + "\n" + e.reply) for e in self.examples])
@@ -53,10 +86,11 @@ class ExampleLibrary:
     def from_jsonl(cls, paths: Sequence[Path], split: str = "train") -> "ExampleLibrary":
         """Load the examples of one split from dataset JSONL shards (spec §3.1 format).
 
-        The step is the text after "STEP: " on the user message, up to the first
-        blank line (where CONTEXT FILES begins); the reply is the assistant message.
-        Blank lines are skipped; anything malformed raises ValueError naming the
-        file and line, because a silently skipped row would bias retrieval unseen.
+        The step is everything between "STEP: " and "\\n\\nCONTEXT FILES:" in the
+        user message, so a multi-paragraph commit message keeps its body; the reply
+        is the assistant message. CRLF and lone CR become LF in both. Blank lines are
+        skipped; anything malformed raises ValueError naming the file and line,
+        because a silently skipped row would bias retrieval unseen.
         """
         examples: list[Example] = []
         for path in paths:
@@ -78,12 +112,26 @@ class ExampleLibrary:
                     examples.append(_parse_row(row, where))
         return cls(examples)
 
-    def top(self, query: str, k: int = 2) -> list[Example]:
-        """The k best-matching examples, best first; [] if nothing matches."""
+    def top(
+        self, query: str, k: int = 2, prefer_paths: Collection[str] | None = None
+    ) -> list[Example]:
+        """The k best examples for `query` (the step title), best first; [] if
+        nothing matches. Examples writing a file of the same role as any of
+        `prefer_paths` rank ahead of the rest (see the module docstring)."""
         if self._index is None or k <= 0:
             return []
-        hits = self._index.search(self._tok.encode(query), k)
-        return [self.examples[i] for i in hits]
+        if isinstance(prefer_paths, str):
+            raise TypeError("prefer_paths must be a collection of paths, not a single str")
+        ranked = self._index.search(self._tok.encode(query), self._index.n)
+        wanted = {file_role(p) for p in prefer_paths or ()} - {None}
+        if wanted:
+            preferred = [i for i in ranked if self._roles[i] & wanted]
+            ranked = preferred + [i for i in ranked if not self._roles[i] & wanted]
+        return [self.examples[i] for i in ranked[:k]]
+
+
+def _to_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _parse_row(row: dict, where: str) -> Example:
@@ -99,9 +147,13 @@ def _parse_row(row: dict, where: str) -> Example:
     content, answer = user.get("content"), reply.get("content")
     if not isinstance(content, str) or not isinstance(answer, str):
         raise ValueError(f"{where}: message contents must be strings")
+    content = _to_lf(content)
     if not content.startswith(_STEP_PREFIX):
         raise ValueError(f"{where}: user message must start with {_STEP_PREFIX!r}")
-    step = content[len(_STEP_PREFIX):].split("\n\n", 1)[0].strip()
+    end = content.find(_STEP_END)
+    if end < 0:
+        raise ValueError(f"{where}: user message has no {_STEP_END.strip()!r} section")
+    step = content[len(_STEP_PREFIX):end].strip()
     if not step:
         raise ValueError(f"{where}: empty STEP instruction")
-    return Example(step=step, reply=answer)
+    return Example(step=step, reply=_to_lf(answer))

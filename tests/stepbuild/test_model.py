@@ -43,8 +43,14 @@ def test_name_defaults_and_can_be_set():
     assert ScriptedModel(["x"], name="ref-todo").name == "ref-todo"
 
 
+def test_context_tokens_defaults_to_none_and_can_be_set():
+    assert ScriptedModel(["x"]).context_tokens is None
+    assert ScriptedModel(["x"], context_tokens=4096).context_tokens == 4096
+
+
 def test_satisfies_the_protocol():
     model: StepModel = ScriptedModel(["x"])
+    assert isinstance(model, StepModel)
     assert isinstance(model.name, str)
     assert callable(model.complete)
 

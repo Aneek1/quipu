@@ -13,7 +13,16 @@ from typing import Protocol, Sequence, runtime_checkable
 
 @runtime_checkable
 class StepModel(Protocol):
-    name: str  # recorded in traces and results, so runs can be told apart
+    """`name` is recorded in traces and results, so runs can be told apart.
+
+    `context_tokens` is the model's context window in tokens, or None when it has
+    no meaningful limit (ScriptedModel). The runner sizes each prompt from it:
+    max_tokens = context_tokens - reply_reserve - retry_reserve, so the prompt,
+    the reply and one round of feedback all fit.
+    """
+
+    name: str
+    context_tokens: int | None
 
     def complete(self, messages: list[dict[str, str]]) -> str: ...
 
@@ -24,7 +33,9 @@ class ScriptedModel:
     reply. Records a copy of every messages list it was given (for assertions): a
     copy, because the caller may keep appending to the list it passed."""
 
-    def __init__(self, replies: Sequence[str], name: str = "scripted") -> None:
+    def __init__(
+        self, replies: Sequence[str], name: str = "scripted", context_tokens: int | None = None
+    ) -> None:
         if isinstance(replies, str):
             raise TypeError("replies must be a sequence of strings, not a single str")
         replies = tuple(replies)
@@ -32,6 +43,7 @@ class ScriptedModel:
         if bad:
             raise TypeError(f"every reply must be a str, got {bad}")
         self.name = name
+        self.context_tokens = context_tokens
         self._replies = replies
         self.calls: list[list[dict[str, str]]] = []
 

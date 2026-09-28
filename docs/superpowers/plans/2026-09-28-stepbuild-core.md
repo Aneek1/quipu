@@ -239,6 +239,8 @@ def write_trace(result: AppResult, path: Path) -> None   # atomic JSON
 ```
 Loop per model step: build messages → `model.complete` → `parse_blocks(reply, allowed=step.allowed_files)`; on `BlockError` record the attempt with `parse_error` and feed the error back as a failed pseudo-check `"format"`; else write blocks, run the step's checks; all pass → next step; else feed failures back. Up to `1 + max_retries` attempts. Step 6 runs checks only. Stop at the first step that exhausts its attempts.
 
+Query retrieval with the step title only and prefer_paths=step.allowed_files; compute max_tokens from the model's context_tokens; use feedback_messages so retries don't grow the prompt; a PromptTooLong is recorded as a failed attempt (check name 'prompt_too_long').
+
 - [ ] Tests (`npm`-marked): (1) ScriptedModel replaying `todo` reference → status `passed_steps`, every step one attempt; (2) step 2 reply with a Python syntax error four times → `failed_at_step_2`, 4 attempts, pyflakes output recorded, model called exactly 4 times for that step and never for step 3; (3) bad reply then the reference reply → step passes with 2 attempts and the second call's messages contain the pyflakes error; (4) a reply writing a disallowed file → parse_error recorded and fed back. Fast non-npm variants of (2)–(4) using steps 1–3 only are allowed and preferred for the default suite.
 - [ ] Mutation: `max_retries` ignored (single attempt) → test (3) fails. Restore.
 - [ ] Commit: "Add the step runner with retries, feedback and per-app traces".
@@ -256,6 +258,8 @@ def summarise(records: Sequence[dict]) -> str
 def main(argv=None) -> int   # CLI: --model scripted-reference (built in: replays reference solutions), --apps, --out
 ```
 A built-in `ReferenceModel` (per app, returns that app's reference replies) makes `python -m stepbuild.bench.run --model reference` produce a 100% table — the end-to-end proof the spec asks for.
+
+The benchmark example library must never contain the benchmark apps' own reference solutions (leakage); use the dataset train split only.
 - [ ] Tests: summary numbers on hand-made records (including a failed app and retries); CLI with `--model reference --apps todo` (npm-marked) writes JSON + `summary.md` with 100% for that app.
 - [ ] Commit: "Add the benchmark runner, scores and a reference model".
 
