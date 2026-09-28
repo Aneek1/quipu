@@ -118,7 +118,7 @@ def make_plan(app: str, spec: str) -> AppPlan
 ```
 Fixed order and files (these are the only files the template leaves for the model; see Task 3):
 1 `model`: `backend/models.py` — checks `pyflakes`
-2 `routes`: `backend/app.py` — checks `pyflakes`
+2 `routes`: `backend/app.py` — checks `pyflakes`, `pytest` (changed in review: the template's `test_smoke.py` makes pytest meaningful here, see the contract below)
 3 `api_tests`: `backend/tests/test_api.py` — checks `pyflakes`, `pytest`
 4 `components`: `frontend/src/components/List.jsx`, `frontend/src/components/Form.jsx` — checks `npm_build`
 5 `wiring`: `frontend/src/api.js`, `frontend/src/App.jsx` — checks `npm_build`
@@ -295,3 +295,51 @@ All rules exactly as spec §3.1 (extensions, excluded paths, low-information mes
 
 - [ ] Whole-feature review against the spec (dispatch a reviewer): every §3 unit exists; §5 tests and mutations present; `python -m stepbuild.bench.run --model reference` prints 100% for all 10 apps; dataset report produced.
 - [ ] Record results and any follow-ups in `docs/superpowers/plans/2026-09-28-stepbuild-core.md` under a "Results" heading. Commit.
+
+## Contract for Tasks 3–5
+
+Fixed in the Task 2 review. The step titles in `stepbuild/harness/plan.py` tell the model this contract, and `tests/stepbuild/test_plan.py` pins the wording. The template (Task 3), the benchmark specs, acceptance tests and reference solutions (Tasks 4–5) must all agree with it.
+
+**`backend/models.py` (step 1).**
+- A `Store` class keeps items in a dict and gives each new item an integer `id`.
+- Its methods are `create(data)`, `list_items()`, `get(id)`, `update(id, data)` and `delete(id)`. Items are plain dicts that include their `id`.
+- There is one `validate_<entity>(data)` function for each entity created through the API. It returns a list of error strings, empty when the data is valid.
+- Standard library only, no Flask imports.
+
+**`backend/app.py` (step 2).**
+- `create_app()` creates a new `Store()` on every call and uses it in the routes, so each app and each test starts empty.
+- It imports with `from models import Store, ...`.
+- Every endpoint is under `/api/` and returns JSON. The list endpoint returns a JSON array of items.
+- Status codes: 201 create, 200 read/update, 200 or 204 delete, 400 with an `{"error": ...}` body on validation errors, 404 missing, plus any code the spec names (401, 409).
+- Apps with login set `app.secret_key` inside `create_app()`.
+- Step 2 runs the `pyflakes` and `pytest` checks.
+
+**Template (Task 3).**
+- `backend/tests/conftest.py` provides the `client` fixture, built from `create_app()` with `TESTING = True`. Step 3 uses this fixture and never redefines it.
+- `backend/tests/test_smoke.py` calls `create_app()` and asserts the app object exists, so a backend bug shows up in step 2, while the model can still fix it.
+- `frontend/src/main.jsx` must eagerly `import.meta.glob('./components/*.jsx', { eager: true })`. Otherwise the step-4 build would not compile the components, because nothing imports them until step 5.
+
+**`backend/tests/test_api.py` (step 3).**
+- Tests use the `client` fixture and import with `from app import create_app` only if they need it.
+
+**Frontend (steps 4–5).**
+- `List({items, onDelete})` renders the items, calls `onDelete(item.id)` and uses `item.id` as the React key.
+- `Form({onSubmit})` has controlled inputs for the fields of the app's main entity and clears itself after submit. Neither component makes network calls.
+- `api.js` has async fetch functions that call relative URLs under `/api/`, send JSON and throw on a non-2xx response.
+- `App.jsx` has a default export, loads the items on mount, and imports `List` and `Form` by explicit paths: `import List from './components/List.jsx'` and `import Form from './components/Form.jsx'`.
+
+**Benchmark `spec.md` (Tasks 4–5).**
+- Each spec names every endpoint (method plus `/api/` path), the required fields, the id field, the shape of the list response and any extra status codes.
+- App-specific rules:
+  - expenses: 400 on a negative amount.
+  - inventory: 409 when stock would go below zero.
+  - habits: a check-in is idempotent per day.
+  - todo_auth: register, login and logout endpoints; 401 when logged out; todos are per user; users are kept in memory.
+
+**Acceptance tests (Tasks 4–5).**
+- They define their own client and do not rely on the template's conftest.
+- They accept 200 or 204 on delete, and assert only that an `error` key exists (not its text).
+- They rely on the integer `id` and on the list endpoint returning a JSON array.
+
+**Reference solutions.**
+- `reference/step_N.txt` writes exactly that step's allowed files: no more, no fewer.

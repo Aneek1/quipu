@@ -13,7 +13,7 @@ SPEC = "A todo list: each todo has a required title and a done flag."
 
 EXPECTED = [
     (1, "model", ("backend/models.py",), ("pyflakes",), True),
-    (2, "routes", ("backend/app.py",), ("pyflakes",), True),
+    (2, "routes", ("backend/app.py",), ("pyflakes", "pytest"), True),
     (3, "api_tests", ("backend/tests/test_api.py",), ("pyflakes", "pytest"), True),
     (
         4,
@@ -61,6 +61,32 @@ def test_titles_state_the_contract_the_template_relies_on():
     for s in steps.values():
         for f in s.allowed_files:
             assert f in s.title, (s.key, f)
+
+
+def test_titles_state_the_cross_task_contract():
+    steps = {s.key: s.title for s in make_plan("todo", SPEC).steps}
+    for word in ("Store", "create", "list_items", "get", "update", "delete", "validate_", "id"):
+        assert word in steps["model"], word
+    for word in ("new Store()", "from models import Store", "/api/", "JSON array",
+                 "201", "400", "404", "401", "409", "secret_key"):
+        assert word in steps["routes"], word
+    assert "from app import create_app" in steps["api_tests"]
+    assert "do not redefine" in steps["api_tests"]
+    assert "onDelete(item.id)" in steps["components"]
+    assert "item.id as the React key" in steps["components"]
+    assert "main entity" in steps["components"]
+    assert "/api/" in steps["wiring"]
+    assert "import List from './components/List.jsx'" in steps["wiring"]
+    assert "import Form from './components/Form.jsx'" in steps["wiring"]
+
+
+def test_app_name_substitution_is_literal():
+    # Titles are filled with str.replace, not str.format: braces in a title must
+    # never be interpreted, whatever the table grows to contain.
+    for s in make_plan("todo", SPEC).steps:
+        assert "{app}" not in s.title and "todo" in s.title
+    routes = make_plan("todo", SPEC).steps[1].title
+    assert '{"error": ...}' in routes  # would raise KeyError under str.format
 
 
 def test_checks_come_from_the_known_set():
@@ -114,7 +140,7 @@ def test_step_rejects_unsafe_file_paths():
     with pytest.raises(BlockError):
         _step(allowed_files=("../escape.py",))
     with pytest.raises(BlockError):
-        _step(allowed_files=("backend\app.py",))
+        _step(allowed_files=(r"backend\app.py",))
 
 
 def test_step_rejects_unknown_checks_and_bad_shapes():
