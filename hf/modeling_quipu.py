@@ -2,7 +2,7 @@
 huggingface_hub; it does not import the training package.
 
     from modeling_quipu import load, generate
-    model = load("quipu-lm/quipu-114m")            # or a local directory
+    model = load("AneekC/quipu-114m")            # or a local directory
     print(generate(model, "Photosynthesis is the process by which", max_new_tokens=60))
 
 The architecture matches `quipu/model.py` in the training repo exactly; the export
@@ -141,7 +141,7 @@ def _resolve(repo_or_dir: str, filename: str, revision: str | None) -> str:
 
 
 def load(
-    repo_or_dir: str = "quipu-lm/quipu-114m",
+    repo_or_dir: str = "AneekC/quipu-114m",
     weights: str = "model.safetensors",
     device: str = "cpu",
     revision: str | None = None,

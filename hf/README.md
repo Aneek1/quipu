@@ -112,14 +112,14 @@ pip install torch safetensors tiktoken huggingface_hub
 from huggingface_hub import hf_hub_download
 import importlib.util, sys
 
-path = hf_hub_download("quipu-lm/quipu-114m", "modeling_quipu.py")
+path = hf_hub_download("AneekC/quipu-114m", "modeling_quipu.py")
 spec = importlib.util.spec_from_file_location("modeling_quipu", path)
 mq = importlib.util.module_from_spec(spec)
 sys.modules["modeling_quipu"] = mq
 spec.loader.exec_module(mq)
 
-model = mq.load("quipu-lm/quipu-114m")                  # final model
-early = mq.load("quipu-lm/quipu-114m", weights="milestones/step_001000.safetensors")
+model = mq.load("AneekC/quipu-114m")                  # final model
+early = mq.load("AneekC/quipu-114m", weights="milestones/step_001000.safetensors")
 
 print(mq.generate(model, "Photosynthesis is the process by which",
                   max_new_tokens=60, temperature=0.8, seed=1337))
