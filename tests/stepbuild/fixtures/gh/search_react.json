@@ -1,0 +1,54 @@
+{
+ "total_count": 2,
+ "incomplete_results": false,
+ "items": [
+  {
+   "name": "package.json",
+   "path": "frontend/package.json",
+   "sha": "0000000000000000000000000000000000000000",
+   "url": "https://api.github.com/repositories/1/contents/frontend/package.json?ref=0",
+   "git_url": "https://api.github.com/repositories/1/git/blobs/0",
+   "html_url": "https://github.com/acme/beta/blob/0/frontend/package.json",
+   "repository": {
+    "id": 1,
+    "node_id": "R_x",
+    "name": "beta",
+    "full_name": "acme/beta",
+    "private": false,
+    "owner": {
+     "login": "acme",
+     "type": "User"
+    },
+    "html_url": "https://github.com/acme/beta",
+    "description": null,
+    "fork": false,
+    "url": "https://api.github.com/repos/acme/beta"
+   },
+   "score": 1.0
+  },
+  {
+   "name": "package.json",
+   "path": "package.json",
+   "sha": "0000000000000000000000000000000000000000",
+   "url": "https://api.github.com/repositories/1/contents/package.json?ref=0",
+   "git_url": "https://api.github.com/repositories/1/git/blobs/0",
+   "html_url": "https://github.com/acme/gamma/blob/0/package.json",
+   "repository": {
+    "id": 1,
+    "node_id": "R_x",
+    "name": "gamma",
+    "full_name": "acme/gamma",
+    "private": false,
+    "owner": {
+     "login": "acme",
+     "type": "User"
+    },
+    "html_url": "https://github.com/acme/gamma",
+    "description": null,
+    "fork": false,
+    "url": "https://api.github.com/repos/acme/gamma"
+   },
+   "score": 1.0
+  }
+ ]
+}

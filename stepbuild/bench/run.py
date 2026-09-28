@@ -196,38 +196,57 @@ def _blocks(reply: str):
         return []  # not FILE blocks: only the whole-reply comparison applies
 
 
-def check_no_leakage(library: ExampleLibrary) -> str:
-    """Raise LeakageError if any library example copies a reference reply (see the
-    module docstring); otherwise return a one-line description of what was checked."""
-    whole: dict[str, str] = {}
-    by_path: dict[str, list[tuple[str, frozenset]]] = {}
-    for app in list_apps():
-        for n, reply in enumerate(load_reference(app), start=1):
-            where = f"{app} step {n}"
-            whole.setdefault(_collapse(reply), where)
-            for block in _blocks(reply):
-                by_path.setdefault(block.path, []).append((where, _shingles(block.content)))
-    for i, example in enumerate(library.examples):
-        label = f"library example {i} ({example.step[:60]!r})"
-        where = whole.get(_collapse(example.reply))
+class LeakageGuard:
+    """The reference index of the leakage guard (see the module docstring), built
+    once from every app's reference replies, so one guard can screen many replies:
+    check_no_leakage screens a library with it, and the dataset build
+    (stepbuild.dataset.build) skips mined examples it flags, so a leaked reference
+    never reaches the shards in the first place."""
+
+    def __init__(self) -> None:
+        self._whole: dict[str, str] = {}
+        self._by_path: dict[str, list[tuple[str, frozenset]]] = {}
+        for app in list_apps():
+            for n, reply in enumerate(load_reference(app), start=1):
+                where = f"{app} step {n}"
+                self._whole.setdefault(_collapse(reply), where)
+                for block in _blocks(reply):
+                    self._by_path.setdefault(block.path, []).append(
+                        (where, _shingles(block.content))
+                    )
+
+    def find(self, reply: str) -> str | None:
+        """None if `reply` is clean, else what it copies, worded to follow a label
+        (" is the reference reply of ..." or ": its <path> is a near-copy ...")."""
+        where = self._whole.get(_collapse(reply))
         if where is not None:
-            raise LeakageError(
-                f"{label} is the reference reply of {where} (whitespace ignored); "
-                "the example library must be the dataset's train split only"
-            )
-        for block in _blocks(example.reply):
-            refs = by_path.get(block.path)
+            return f" is the reference reply of {where} (whitespace ignored)"
+        for block in _blocks(reply):
+            refs = self._by_path.get(block.path)
             if not refs:
                 continue
             mine = _shingles(block.content)
             for where, theirs in refs:
                 score = jaccard(mine, theirs)
                 if score >= LEAK_JACCARD:
-                    raise LeakageError(
-                        f"{label}: its {block.path} is a near-copy of the reference for "
-                        f"{where} ({SHINGLE}-shingle Jaccard {score:.3f} >= {LEAK_JACCARD}); "
-                        "the example library must be the dataset's train split only"
+                    return (
+                        f": its {block.path} is a near-copy of the reference for "
+                        f"{where} ({SHINGLE}-shingle Jaccard {score:.3f} >= {LEAK_JACCARD})"
                     )
+        return None
+
+
+def check_no_leakage(library: ExampleLibrary) -> str:
+    """Raise LeakageError if any library example copies a reference reply (see the
+    module docstring); otherwise return a one-line description of what was checked."""
+    guard = LeakageGuard()
+    for i, example in enumerate(library.examples):
+        found = guard.find(example.reply)
+        if found is not None:
+            label = f"library example {i} ({example.step[:60]!r})"
+            raise LeakageError(
+                f"{label}{found}; the example library must be the dataset's train split only"
+            )
     return (
         f"passed ({len(library.examples)} examples vs every app's reference: whitespace-"
         f"collapsed exact match, per-file {SHINGLE}-shingle Jaccard >= {LEAK_JACCARD})"

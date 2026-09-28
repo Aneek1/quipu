@@ -1,0 +1,508 @@
+{
+ "sha": "14bf4c111a1d73d5dac0846a55cbbc310f8d1cca",
+ "url": "https://api.github.com/repos/philfung/perplexed/git/trees/14bf4c111a1d73d5dac0846a55cbbc310f8d1cca",
+ "tree": [
+  {
+   "path": ".dockerignore",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "19d8fcf6b41a6b1cc951a1670b233709e3d8d168",
+   "size": 122,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/19d8fcf6b41a6b1cc951a1670b233709e3d8d168"
+  },
+  {
+   "path": ".gitignore",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "dbf7da0d873e73ad6d96cda390ebfb24b920380e",
+   "size": 196,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/dbf7da0d873e73ad6d96cda390ebfb24b920380e"
+  },
+  {
+   "path": ".pre-commit-config.yaml",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "1ea6da0d8529a1709506d20898bd397c59f99764",
+   "size": 460,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/1ea6da0d8529a1709506d20898bd397c59f99764"
+  },
+  {
+   "path": "Dockerfile",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "a4a473265a3877a1a22bcdecd2ab6d30b61313cf",
+   "size": 1962,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/a4a473265a3877a1a22bcdecd2ab6d30b61313cf"
+  },
+  {
+   "path": "Dockerfile-cloudflare",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "b547f52657b6330d399fcd903a5e95aa237308c7",
+   "size": 1063,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/b547f52657b6330d399fcd903a5e95aa237308c7"
+  },
+  {
+   "path": "LICENSE.md",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "cc0ba20f788fb1bb70221aaf5c5b1872aa2d4086",
+   "size": 1083,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/cc0ba20f788fb1bb70221aaf5c5b1872aa2d4086"
+  },
+  {
+   "path": "README.md",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "c982a2afb17495a94495170221346fadbff07b5b",
+   "size": 5468,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/c982a2afb17495a94495170221346fadbff07b5b"
+  },
+  {
+   "path": "backend",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "98682ae33ad6a8edb8ff5774bd65c7be2a710e88",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/98682ae33ad6a8edb8ff5774bd65c7be2a710e88"
+  },
+  {
+   "path": "backend/.env.example",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "b8e87d1700e72af32b7f48192e662b664e8ff619",
+   "size": 186,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/b8e87d1700e72af32b7f48192e662b664e8ff619"
+  },
+  {
+   "path": "backend/archive",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "7374835a65aa613eb705c01d58cbf5e979cc023b",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/7374835a65aa613eb705c01d58cbf5e979cc023b"
+  },
+  {
+   "path": "backend/archive/flask_app.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "d33b6d498e8c73181f6f70c82a52db6f0e3a7395",
+   "size": 3128,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/d33b6d498e8c73181f6f70c82a52db6f0e3a7395"
+  },
+  {
+   "path": "backend/archive/flask_requirements.txt",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "11a9794c90212244cb5e1458b004de412e44c546",
+   "size": 55,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/11a9794c90212244cb5e1458b004de412e44c546"
+  },
+  {
+   "path": "backend/archive/search.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "aaa5574ba9e45342ffc63941920e5ff88c4681ed",
+   "size": 5125,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/aaa5574ba9e45342ffc63941920e5ff88c4681ed"
+  },
+  {
+   "path": "backend/config.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "07af3c8880ef8138875abb1d38ef59e0832a6d7e",
+   "size": 1984,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/07af3c8880ef8138875abb1d38ef59e0832a6d7e"
+  },
+  {
+   "path": "backend/fastapi_app.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "dc230e83a77c5087b3cc1220cbee06eaa1410210",
+   "size": 8921,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/dc230e83a77c5087b3cc1220cbee06eaa1410210"
+  },
+  {
+   "path": "backend/models.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "0aa11bed72d304dea2ef057f94f3cc42158f670a",
+   "size": 1253,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/0aa11bed72d304dea2ef057f94f3cc42158f670a"
+  },
+  {
+   "path": "backend/query_cache.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "87982873eca842d64f9ae456b9d1e41394224e95",
+   "size": 509,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/87982873eca842d64f9ae456b9d1e41394224e95"
+  },
+  {
+   "path": "backend/rate_limiter.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "5eda71df30538ea50e2e59825de61e6b70d0c4ab",
+   "size": 1413,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/5eda71df30538ea50e2e59825de61e6b70d0c4ab"
+  },
+  {
+   "path": "backend/requirements.txt",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "558469e0c92a3554ef0d2edeeb97079aaef8cb67",
+   "size": 479,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/558469e0c92a3554ef0d2edeeb97079aaef8cb67"
+  },
+  {
+   "path": "backend/ruff.toml",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "1766453b42a4e274c580c3db4ab94b87da4e6896",
+   "size": 150,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/1766453b42a4e274c580c3db4ab94b87da4e6896"
+  },
+  {
+   "path": "backend/search.py",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "175d3543279858fb7e6e5119b44cc80f7353cff1",
+   "size": 8421,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/175d3543279858fb7e6e5119b44cc80f7353cff1"
+  },
+  {
+   "path": "deployment",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "4586adb00f0ea5159910bf37ef5ce9a1996254ef",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/4586adb00f0ea5159910bf37ef5ce9a1996254ef"
+  },
+  {
+   "path": "deployment/cloudflare",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "093f35cd9bab0482d9d6d8e6aa4e17f3fb2a4763",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/093f35cd9bab0482d9d6d8e6aa4e17f3fb2a4763"
+  },
+  {
+   "path": "deployment/cloudflare/README.md",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "636fbca94ed701ac4304ceedcc35f18846429182",
+   "size": 2652,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/636fbca94ed701ac4304ceedcc35f18846429182"
+  },
+  {
+   "path": "deployment/cloudflare/index.ts",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "a53a333374be6284959d4cc8adaeda385f0a9352",
+   "size": 1254,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/a53a333374be6284959d4cc8adaeda385f0a9352"
+  },
+  {
+   "path": "deployment/cloudflare/justfile",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "f00097833a99fdae8d3965bb2fc58baf7ca059d7",
+   "size": 2229,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/f00097833a99fdae8d3965bb2fc58baf7ca059d7"
+  },
+  {
+   "path": "deployment/cloudflare/package.json",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "d4b2625cf21936b879b28100754a16a2977c5da7",
+   "size": 117,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/d4b2625cf21936b879b28100754a16a2977c5da7"
+  },
+  {
+   "path": "deployment/cloudflare/tsconfig.json",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "bd706b53f9f571c39f8a3b744e9dabf888b6ace6",
+   "size": 1725,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/bd706b53f9f571c39f8a3b744e9dabf888b6ace6"
+  },
+  {
+   "path": "deployment/cloudflare/wrangler.toml",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "6a143e45edd02df6e18328d761dbefb7ba6c91bc",
+   "size": 1460,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/6a143e45edd02df6e18328d761dbefb7ba6c91bc"
+  },
+  {
+   "path": "deployment/fly",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "a976149801e42a04dd2a925799e8cdd570deaa43",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/a976149801e42a04dd2a925799e8cdd570deaa43"
+  },
+  {
+   "path": "deployment/fly/fly.toml",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "08df3558dbeeea335bc722851cc293a37a01bf44",
+   "size": 526,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/08df3558dbeeea335bc722851cc293a37a01bf44"
+  },
+  {
+   "path": "deployment/fly/justfile",
+   "mode": "100755",
+   "type": "blob",
+   "sha": "3f12dff0b5c300556e8294e40364e26a57d8f88c",
+   "size": 984,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/3f12dff0b5c300556e8294e40364e26a57d8f88c"
+  },
+  {
+   "path": "docker",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "7d7916172e626f2b9cd7b574c1078eba50529f5b",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/7d7916172e626f2b9cd7b574c1078eba50529f5b"
+  },
+  {
+   "path": "docker/entrypoint.sh",
+   "mode": "100755",
+   "type": "blob",
+   "sha": "908c0227d9133588aaf027661a244ba8f7ee2336",
+   "size": 93,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/908c0227d9133588aaf027661a244ba8f7ee2336"
+  },
+  {
+   "path": "docker/groq_test.py",
+   "mode": "100755",
+   "type": "blob",
+   "sha": "6bae5e72310a519dfdb9fcc6f97db8c8b2968785",
+   "size": 549,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/6bae5e72310a519dfdb9fcc6f97db8c8b2968785"
+  },
+  {
+   "path": "docker/nginx.conf",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "8b526c32defcdff9b2248085a89d2fb75c1913cc",
+   "size": 805,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/8b526c32defcdff9b2248085a89d2fb75c1913cc"
+  },
+  {
+   "path": "docker/start_server.sh",
+   "mode": "100755",
+   "type": "blob",
+   "sha": "99d3ef5e9406b8df1ca6bedf679e58fe4114c696",
+   "size": 1546,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/99d3ef5e9406b8df1ca6bedf679e58fe4114c696"
+  },
+  {
+   "path": "frontend",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "9dfa8c8e50092c86f8b6b4855c27b524d72a009e",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/9dfa8c8e50092c86f8b6b4855c27b524d72a009e"
+  },
+  {
+   "path": "frontend/.env.cloudflare-local",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "59edc449cfab3897bd5671c2bddcb75b93210e8f",
+   "size": 294,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/59edc449cfab3897bd5671c2bddcb75b93210e8f"
+  },
+  {
+   "path": "frontend/.env.cloudflare-prod",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "50d729508d0d5c78f488ef57420d64494584a032",
+   "size": 314,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/50d729508d0d5c78f488ef57420d64494584a032"
+  },
+  {
+   "path": "frontend/.env.development",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "85f66d11a4d11ab5a4320952b9b465d4d286e1a8",
+   "size": 568,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/85f66d11a4d11ab5a4320952b9b465d4d286e1a8"
+  },
+  {
+   "path": "frontend/.env.production.example",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "457275f8f3f5d665d5c1da4172607d4b766d368d",
+   "size": 492,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/457275f8f3f5d665d5c1da4172607d4b766d368d"
+  },
+  {
+   "path": "frontend/.env.staging",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "9feec6da3fbe1ebfff0426ffb1091bd608a62667",
+   "size": 438,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/9feec6da3fbe1ebfff0426ffb1091bd608a62667"
+  },
+  {
+   "path": "frontend/.eslint-baseline.json",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "02ebb8670d0461545e5cb72b148093cc9768bb4e",
+   "size": 807475,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/02ebb8670d0461545e5cb72b148093cc9768bb4e"
+  },
+  {
+   "path": "frontend/.gitignore",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "4d29575de80483b005c29bfcac5061cd2f45313e",
+   "size": 310,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/4d29575de80483b005c29bfcac5061cd2f45313e"
+  },
+  {
+   "path": "frontend/package-lock.json",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "262b4a913246192c003f4eb9e1815f1a28a014d9",
+   "size": 766918,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/262b4a913246192c003f4eb9e1815f1a28a014d9"
+  },
+  {
+   "path": "frontend/package.json",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "32a06402fe5c049b225835832ecfb210d810ba2c",
+   "size": 1526,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/32a06402fe5c049b225835832ecfb210d810ba2c"
+  },
+  {
+   "path": "frontend/public",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "760ed29cd486f89309a4bc4bb23aaed4b10c93bc",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/760ed29cd486f89309a4bc4bb23aaed4b10c93bc"
+  },
+  {
+   "path": "frontend/public/favicon.ico",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "a11777cc471a4344702741ab1c8a588998b1311a",
+   "size": 3870,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/a11777cc471a4344702741ab1c8a588998b1311a"
+  },
+  {
+   "path": "frontend/public/fonts",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "a6a865c6f6bdba1befac624ff47e481de53600cb",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/a6a865c6f6bdba1befac624ff47e481de53600cb"
+  },
+  {
+   "path": "frontend/public/images",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "803ae510ff13fce30b2223374974fa258b68c2cf",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/803ae510ff13fce30b2223374974fa258b68c2cf"
+  },
+  {
+   "path": "frontend/public/index.html",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "7a09c2b32dbe8c0e9b293f8acad16379c2859c90",
+   "size": 1827,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/7a09c2b32dbe8c0e9b293f8acad16379c2859c90"
+  },
+  {
+   "path": "frontend/public/manifest.json",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "23d5bc45969c05f9ee2df81fb67a2d617d1dfdda",
+   "size": 482,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/23d5bc45969c05f9ee2df81fb67a2d617d1dfdda"
+  },
+  {
+   "path": "frontend/public/robots.txt",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "e9e57dc4d41b9b46e05112e9f45b7ea6ac0ba15e",
+   "size": 67,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/e9e57dc4d41b9b46e05112e9f45b7ea6ac0ba15e"
+  },
+  {
+   "path": "frontend/src",
+   "mode": "040000",
+   "type": "tree",
+   "sha": "f68d218d2adb7ec00b8424d1e51333e8ed242fb0",
+   "url": "https://api.github.com/repos/philfung/perplexed/git/trees/f68d218d2adb7ec00b8424d1e51333e8ed242fb0"
+  },
+  {
+   "path": "frontend/src/App.css",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "d9a007921fa5624cf8540eb4ab3a79e35f8cad38",
+   "size": 669,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/d9a007921fa5624cf8540eb4ab3a79e35f8cad38"
+  },
+  {
+   "path": "frontend/src/App.js",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "42e30b7e57cbbc3f3d1f86c9866ad38cdc5a434e",
+   "size": 13480,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/42e30b7e57cbbc3f3d1f86c9866ad38cdc5a434e"
+  },
+  {
+   "path": "frontend/src/constants.js",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "baa746a721ecdf31602b579da4ee7555dc48df53",
+   "size": 230,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/baa746a721ecdf31602b579da4ee7555dc48df53"
+  },
+  {
+   "path": "frontend/src/defaults.js",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "ab75f099baec858170e4aa251b6ca99abe74c0d5",
+   "size": 597,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/ab75f099baec858170e4aa251b6ca99abe74c0d5"
+  },
+  {
+   "path": "frontend/src/index.css",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "5e37f81929cba95df4dc591108d3342c63b6676b",
+   "size": 504,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/5e37f81929cba95df4dc591108d3342c63b6676b"
+  },
+  {
+   "path": "frontend/src/index.js",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "d563c0fb10ba0e42724b21286eb546ee4e5734fc",
+   "size": 535,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/d563c0fb10ba0e42724b21286eb546ee4e5734fc"
+  },
+  {
+   "path": "frontend/src/reportWebVitals.js",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "5253d3ad9e6be6690549cb255f5952337b02401d",
+   "size": 362,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/5253d3ad9e6be6690549cb255f5952337b02401d"
+  },
+  {
+   "path": "frontend/tailwind.config.js",
+   "mode": "100644",
+   "type": "blob",
+   "sha": "d2c4e0fba93863f60db4babe55d6b9737c6bc5f8",
+   "size": 1202,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/d2c4e0fba93863f60db4babe55d6b9737c6bc5f8"
+  },
+  {
+   "path": "justfile",
+   "mode": "100755",
+   "type": "blob",
+   "sha": "2e44e43abf193c43e85d75c3056f03f5745afe0c",
+   "size": 3798,
+   "url": "https://api.github.com/repos/philfung/perplexed/git/blobs/2e44e43abf193c43e85d75c3056f03f5745afe0c"
+  }
+ ],
+ "truncated": false
+}
