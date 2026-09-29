@@ -165,3 +165,14 @@ The owner chose to make quipu-moe multilingual in the ten languages of their own
 **Evaluation (§7):** bits per byte reported per language (ten languages + code), plus two fixed prompts per language at each milestone.
 
 **Budget (§8):** the $20 cap is unchanged; with the 48k vocabulary the full run trims to ~8.3B tokens.
+
+## 12. Amendment — FP8 training (2026-09-29)
+
+The owner chose to try FP8 training. It is an option decided by measurement, not a default:
+
+- **What runs in FP8:** the matrix multiplies of the attention projections (q, k, v, o), the shared expert and the routed experts, with dynamic scaling (tensorwise at first; rowwise if tensorwise loses accuracy). Master weights, optimizer state (AdamW and Muon, including Newton–Schulz), gradients' accumulation, the router, embeddings / tied head, norms and the AttnRes mix stay in bf16/fp32. Routed experts may stay bf16 in the first version if grouped FP8 GEMMs are not available for sm_120; the throughput gain is then measured without them and reported as such.
+- **Config:** `train.precision = "bf16" | "fp8"` (default `"bf16"`). Dense quipu-114m is unaffected.
+- **Checked on the laptop first:** the RTX 5060 is Blackwell (sm_120) like the 5090, so correctness (loss curve within noise of bf16 on the smoke config) and a first speed number cost nothing.
+- **A/B pair 4 (§6.1):** bf16 vs FP8 on the scale-down, same seed and tokens. **Kept if** FP8's tokens/s is ≥ 1.2× bf16 **and** its final validation loss is within the seed noise of bf16 (and no extra loss spikes). Otherwise the full run stays bf16. Cost of the pair plus its seed re-run: about 45 minutes of box time (~$0.40), paid from the A/B allowance.
+- **If kept:** the throughput gain buys more tokens inside the same $20 cap; the full run's token target is recomputed from the measured tokens/s by the launcher (M9), never assumed.
+- **Not in scope:** int4/FP4 training. int4 is for inference only: M10 adds a weight-only int4 export with its measured quality loss (bits per byte per language and the stepbuild score vs bf16).
