@@ -55,12 +55,12 @@ $/hour from the Vast instance card.
 
    ```bash
    uv run python scripts/ab_runs.py --config configs/quipu-moe-ab.toml --out results/ab \
-       --budget-usd 3 --usd-per-hour R
+       --budget-usd "$(python3 -c "print(round($(python3 -m quipu.spend show --usd-only) + 3, 2))")"        --usd-per-hour R
    ```
 
-   `--budget-usd 3` caps the ledger total, so the setup and the CPU box (steps 1-3)
-   already count against it: check `python3 -m quipu.spend show` first and run
-   `--dry-run` to see whether the run list fits what is left (`--shared-noise` runs
+   `--budget-usd` caps the ledger total, so the A/B budget is "spent so far + $3": the
+   A/B itself gets $3 whatever setup and the CPU box (steps 1-3) cost. Run `--dry-run`
+   first to see whether the run list fits (`--shared-noise` runs
    one seed re-run instead of three; off unless the owner chooses it). It writes
    `results/ab/summary.md` and `results/ab/winners.toml`; a budget stop (exit 4) still
    writes both, with the missing arms keeping the simpler option.

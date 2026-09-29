@@ -647,7 +647,10 @@ def main(argv: list[str] | None = None) -> int:
     a = sub.add_parser("adjust", help="set a named extra spend (same key = replaced)")
     a.add_argument("--key", required=True)
     a.add_argument("--usd", type=float, required=True)
-    sub.add_parser("show", help="print the spend so far")
+    sh = sub.add_parser("show", help="print the spend so far")
+    sh.add_argument("--usd-only", action="store_true",
+                    help="print only the spend in USD (for scripts, e.g. an A/B budget of "
+                         "'spent so far + 3')")
     t = sub.add_parser("tick", help="record that the box is still up")
     t.add_argument("--loop", type=float, metavar="SECONDS",
                    help="keep ticking every SECONDS (the ticker process `start` spawns "
@@ -683,6 +686,9 @@ def main(argv: list[str] | None = None) -> int:
             led.adjust(args.key, args.usd)
         elif args.cmd == "tick":
             led.tick()
+        if args.cmd == "show" and args.usd_only:
+            print(f"{led.spent_usd():.4f}")
+            return 0
         rate = led.usd_per_hour
         print(f"{led.path}: spent ${led.spent_usd():.2f} over {len(led.sessions)} box "
               f"session(s)" + (f", now ${rate:.2f}/h" if rate is not None else "")
