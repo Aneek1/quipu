@@ -1,4 +1,6 @@
-# quipu-moe: a K3-core mixture-of-experts model trained on a rented GPU
+# quipu-moe: a multilingual K3-core mixture-of-experts model trained on a rented GPU
+
+> **Amended 2026-09-29 (owner decision: multilingual).** §11 supersedes the vocabulary, data mix, tokenizer sample, evaluation and token budget stated elsewhere in this document.
 
 **Status:** design, awaiting owner review · **Date:** 2026-09-29 · **Branch:** `pipeline-114m` (pushed to `main` on approval)
 
@@ -142,3 +144,24 @@ Estimates assume ~50–70 TFLOPS effective of the box's measured 176.7 TFLOPS; t
 - Full model: parameter count within 1% of §3; a 50-step CPU/laptop-GPU smoke run decreases loss; checkpoint → resume is bit-identical in the next step.
 - Launcher: spend guard stops at the cap (fake clock); sync command built correctly; MoE health alert fires on a fake skewed histogram.
 - Data builder: achieved shares within ±1% on a small build; leakage guard drops a planted reference file.
+
+## 11. Amendment — multilingual (2026-09-29)
+
+The owner chose to make quipu-moe multilingual in the ten languages of their own language-identification model, `AneekC/lid-specialists-9plus1` (MIT): English, Indonesian, Malay, Simplified Chinese, Traditional Chinese, Japanese, Korean, Tamil, Hindi (Devanagari and romanised), romanised Urdu. Accepted trade-off: at ~135M active parameters, English and code will likely be somewhat weaker than an English-and-code-only model.
+
+**Vocabulary:** 48k (49,152) instead of 32k. Tied embeddings become 49,152 × 768 = 37.7M; active parameters ≈ 110M non-embedding + 37.7M ≈ 148M. The larger output layer adds ~9% compute.
+
+**Mix (of all training tokens):** 60% code (unchanged, §5); 28% English (FineWeb-Edu `sample-10BT`); 12% the other nine languages from FineWeb-2 — `ind_Latn`, `zsm_Latn`, `cmn_Hani` (split into Simplified and Traditional, below), `jpn_Jpan`, `kor_Hang`, `tam_Taml`, `hin_Deva`, `hin_Latn`, `urd_Latn` — about equal shares (~1.2–1.3% each), with a short language's remainder redistributed to the others and achieved shares reported.
+
+**Language-ID filtering (the owner's model):** the fastText specialist from `lid-specialists-9plus1` runs over every text document when shards are built:
+- a document is kept only if the specialist's label matches its source language (FineWeb-Edu must be English); mismatches are dropped and counted per language;
+- `cmn_Hani` is split by script into Simplified and Traditional using the specialist's zh-Hans / zh-Hant labels, and the two are balanced;
+- romanised Hindi and romanised Urdu are verified with the specialist (the confusion it was built to resolve);
+- the manifest records per-language kept/dropped counts and the model's revision hash; the model card credits it.
+
+**Tokenizer (§4):** trained on a sample in the same 60/28/12 proportions. Pre-tokenisation change: a newline together with the indentation that follows it forms one piece (e.g. "
+" + 8 spaces), so a code line costs one whitespace token rather than two. Gate additions to §4.3: characters per token for each of the ten languages reported, and for each non-English language the new tokenizer must beat GPT-2's characters per token (GPT-2 is poor at CJK, Tamil and Devanagari, so this should hold easily); English text stays within 5% of GPT-2; code whitespace share < 15% unchanged.
+
+**Evaluation (§7):** bits per byte reported per language (ten languages + code), plus two fixed prompts per language at each milestone.
+
+**Budget (§8):** the $20 cap is unchanged; with the 48k vocabulary the full run trims to ~8.3B tokens.
