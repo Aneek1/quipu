@@ -742,8 +742,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{led.spent_usd() + (args.plus or 0.0):.4f}")
             return 0
         rate = led.usd_per_hour
+        running = rate is not None and not led.current.get("ended")
         print(f"{led.path}: spent ${led.spent_usd():.2f} over {len(led.sessions)} box "
-              f"session(s)" + (f", now ${rate:.2f}/h" if rate is not None else "")
+              f"session(s)" + (f", now ${rate:.2f}/h" if running
+                               else ", no running box session" if led.sessions else "")
               + (f"; adjustments {led.adjustments}" if led.adjustments else ""))
         return 0
     except (LedgerError, ValueError) as exc:

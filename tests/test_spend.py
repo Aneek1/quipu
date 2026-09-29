@@ -247,6 +247,19 @@ def test_cli_start_show_and_adjust(tmp_path, capsys, fake_system):
     assert spend.main(["--ledger", str(path), "show"]) == 2
 
 
+
+def test_cli_show_after_stop_does_not_claim_a_running_rate(tmp_path, capsys, fake_system):
+    # After `spend stop` the box is not billed: "now $0.50/h" would say it still is.
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5"]) == 0
+    assert spend.main(["--ledger", str(path), "show"]) == 0
+    assert "now $0.50/h" in capsys.readouterr().out
+    assert spend.main(["--ledger", str(path), "stop"]) == 0
+    capsys.readouterr()
+    assert spend.main(["--ledger", str(path), "show"]) == 0
+    out = capsys.readouterr().out
+    assert "now $" not in out and "no running box session" in out
+
 # ---- two writers: the lock and the merge ------------------------------------------------
 
 def test_a_stale_in_memory_adjustment_never_overwrites_a_newer_disk_value(tmp_path):
