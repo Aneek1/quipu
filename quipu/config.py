@@ -36,7 +36,7 @@ class ModelConfig:
     expert_hidden: int = 0
     shared_experts: int = 0
     shared_hidden: int = 0
-    activation: str = "swiglu"           # "swiglu" | "situ_glu" (experts only)
+    activation: str = "swiglu"           # "swiglu" | "situ_glu" (situ_glu: moe only)
     situ_beta_gate: float = 4.0          # SiTU-GLU beta_1 (gate tanh bound)
     situ_beta_up: float = 25.0           # SiTU-GLU beta_2 (up tanh bound)
     attnres_blocks: int = 0              # Block Attention Residuals; 0 = plain residual
@@ -150,10 +150,18 @@ class Config:
     train: TrainConfig
 
 
+# Tables that are one value, not a section: an override replaces the whole table.
+# Merged key by key, an override could never drop a language, and a partial
+# override would silently keep the file's other weights.
+WHOLE_VALUE_TABLES = frozenset({"code_language_weights", "text_language_weights"})
+
+
 def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for key, value in over.items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
+        if key in WHOLE_VALUE_TABLES:
+            out[key] = value
+        elif isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _merge(out[key], value)
         else:
             out[key] = value
@@ -269,6 +277,9 @@ def _check_moe(model: ModelConfig) -> None:
         if set_fields:
             raise ValueError(f"kind 'dense' does not use {set_fields}; set them to 0 "
                              "or use kind 'moe'")
+        if model.activation != "swiglu":
+            raise ValueError(f"kind 'dense' is SwiGLU only; activation "
+                             f"{model.activation!r} applies to experts (kind 'moe')")
         return
     if not model.n_experts >= model.top_k >= 1:
         raise ValueError(f"kind 'moe' needs n_experts >= top_k >= 1, got n_experts "

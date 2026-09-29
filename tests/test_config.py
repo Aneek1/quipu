@@ -309,8 +309,11 @@ def test_quipu_moe_ab_is_the_full_config_at_8_layers_and_200m_tokens():
     assert ab.model == dataclasses.replace(full.model, n_layer=8)
     assert ab.data == full.data
     assert ab.train.total_tokens == 200_000_000
-    assert ab.train.batch_tokens == full.train.batch_tokens
-    assert (ab.train.optimizer, ab.train.budget_usd) == (full.train.optimizer, 20.0)
+    # Only the documented train differences: the A/B orchestrator guards spend.
+    assert ab.train == dataclasses.replace(
+        full.train, total_tokens=200_000_000, warmup_steps=40,
+        ckpt_dir="checkpoints-moe-ab", ckpt_every=100, ckpt_keep=1, eval_every=50,
+        milestones=(), budget_usd=0.0)
 
 
 def test_quipu_moe_smoke_is_tiny_and_switches_every_new_path_on():
@@ -362,6 +365,11 @@ def test_dense_refuses_moe_settings_it_would_ignore(field):
         load_config(CONFIG, overrides={"model": {field: 1}})
 
 
+def test_dense_refuses_situ_glu():
+    with pytest.raises(ValueError, match="activation"):
+        load_config(CONFIG, overrides={"model": {"activation": "situ_glu"}})
+
+
 @pytest.mark.parametrize(
     "overrides, match",
     [
@@ -387,13 +395,32 @@ def _weights(key="code_language_weights"):
 
 
 def _load_mix(**data):
-    """Load with these [data] settings on top of quipu-114m (whose weight tables are
-    empty) plus quipu-moe's language list. Overrides merge nested tables key by key,
-    so a table given here is exactly the table loaded; on top of quipu-moe a removed
-    key would silently come back from the file."""
-    smoke = load_config(MOE_SMOKE).data
-    base = {"code_languages": list(smoke.code_languages), "html_cap": smoke.html_cap}
-    return load_config(CONFIG, overrides={"data": base | data})
+    """The smoke config with these [data] overrides; weight tables replace whole."""
+    return load_config(MOE_SMOKE, overrides={"data": data})
+
+
+def test_a_weight_table_override_replaces_the_whole_table():
+    cfg = load_config(MOE_SMOKE, overrides={"data": {
+        "text_language_weights": {"eng_Latn": 1.0}}})
+    assert cfg.data.text_language_weights == {"eng_Latn": 1.0}
+
+
+def test_a_partial_code_weight_override_replaces_the_table_and_is_validated():
+    # Not merged into the file's table: only Python is left, which then fails the
+    # sum and the must-cover-code_languages rules instead of silently keeping the rest.
+    with pytest.raises(ValueError, match="sum to 1"):
+        load_config(MOE_SMOKE, overrides={"data": {"code_language_weights": {"Python": 0.35}}})
+    with pytest.raises(ValueError, match="code_languages"):
+        load_config(MOE_SMOKE, overrides={"data": {"code_language_weights": {"Python": 1.0}}})
+    ok = load_config(MOE_SMOKE, overrides={"data": {
+        "code_languages": ["Python", "Rust"],
+        "code_language_weights": {"Python": 0.75, "Rust": 0.25}}})
+    assert ok.data.code_language_weights == {"Python": 0.75, "Rust": 0.25}
+
+
+def test_other_sections_still_merge_key_by_key():
+    cfg = load_config(MOE_SMOKE, overrides={"model": {"top_k": 1}})
+    assert (cfg.model.top_k, cfg.model.n_experts) == (1, 8)
 
 
 @pytest.mark.parametrize(

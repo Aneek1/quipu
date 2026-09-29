@@ -1,7 +1,8 @@
 name = "quipu-moe"
 
 # Spec docs/superpowers/specs/2026-09-29-quipu-moe-design.md, section 3 with the
-# section 11 amendment (49,152-token vocabulary). ~0.98B total / ~148M active.
+# section 11 amendment (49,152-token vocabulary). ~1.0B total / ~149M active
+# (998.0M / 148.7M with the 49,152 vocabulary).
 #
 # The three A/B-tested switches (optimizer, attnres_blocks, activation; spec 6.1)
 # start at the simpler option. Each is flipped here only if its A/B run wins by

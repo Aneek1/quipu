@@ -3,6 +3,19 @@ name = "quipu-moe-ab"
 # The spec 6.1 scale-down: quipu-moe with 8 layers (same widths and expert layout,
 # ~55M active non-embedding) on 200M tokens. Each A/B arm overrides exactly one
 # setting (optimizer, attnres_blocks or activation) from this baseline.
+#
+# Every difference from configs/quipu-moe.toml:
+#   name          "quipu-moe-ab"
+#   n_layer       8 (not 16)
+#   total_tokens  200M, 381 steps (not 10.2B, 19,454 steps)
+#   warmup_steps  40 (not 500): 500 is longer than the whole 381-step run (load_config
+#                 refuses warmup >= steps); 40 is ~10% of the run, so most of the
+#                 steps the arms are compared on run past warmup
+#   ckpt_dir "checkpoints-moe-ab", ckpt_every 100, ckpt_keep 1, eval_every 50,
+#   milestones [] (run management for short throwaway runs)
+#   budget_usd    0 (no in-process guard): the A/B orchestrator guards spend
+#                 across all its runs (Tasks M8/M9)
+# The model widths, expert layout, data mix, optimizer settings and batch are the same.
 
 [model]
 kind       = "moe"
@@ -100,5 +113,5 @@ muon_momentum = 0.95
 muon_ns_steps = 5
 muon_per_head = true
 compile       = true
-budget_usd    = 20.0
-usd_per_hour  = 0.55          # the launcher passes the box's real rate
+budget_usd    = 0.0           # the A/B orchestrator guards spend, not each run
+usd_per_hour  = 0.55          # spec 8 estimate, as in quipu-moe.toml
