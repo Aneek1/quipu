@@ -29,11 +29,16 @@ expert load (min / max as a fraction of target, coefficient of variation, dead
 experts) and drop rate go to the run log under "moe". An expert outside
 [MOE_HEALTH_LOW, MOE_HEALTH_HIGH] x target load for more than MOE_HEALTH_WINDOW
 consecutive steps raises a health alert: a stderr line and an entry in the run
-log's "moe_health" list (the flag). Evaluation always runs loop dispatch.
+log's "moe_health" list (the flag). Evaluation always runs loop dispatch. The
+interval's summed counts and the health streaks are checkpointed, so a resume
+mid-interval logs the same "moe" entry the uninterrupted run would have.
 
-train.compile wraps the forward in torch.compile (backend COMPILE_BACKEND); where
-that cannot work (no Triton on CUDA, no C++ compiler for CPU inductor on Windows) it
-warns and trains eagerly. The un-compiled module is what is checkpointed.
+train.compile wraps the training forward in torch.compile (backend COMPILE_BACKEND);
+where that cannot work (no Triton on CUDA, no C++ compiler for CPU inductor on
+Windows) it warns and trains eagerly. Because torch.compile is lazy, one trial step
+on a synthetic batch runs at startup; a compile that fails there also falls back to
+eager (see Trainer._compile). Evaluation always runs the eager module, and the
+un-compiled module is what is checkpointed.
 """
 from __future__ import annotations
 
@@ -268,7 +273,15 @@ class Trainer:
 
     def _compile(self) -> None:
         """Wrap the forward in torch.compile, or warn and stay eager when it cannot
-        work here. The outcome is recorded in the run log under "compile"."""
+        work here. The outcome is recorded in the run log under "compile".
+
+        torch.compile is lazy: the real compile happens at the first forward, where a
+        failure would crash the run. So one trial step runs here on a synthetic batch
+        (_trial_compiled_step, which leaves no trace in RNG, gradients or the
+        balancer). If it raises, dynamo is reset and training runs eagerly ("fell
+        back: ..." in the run log). If it succeeds, dynamo's suppress_errors is set
+        so a later recompile failure (a new shape, say) runs that frame eagerly
+        instead of crashing a long run."""
         reason = _compile_unavailable(self.device)
         if reason is None:
             try:
@@ -276,12 +289,56 @@ class Trainer:
                 self.compiled = True
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}"
-        if reason is None:
-            self._safe_log(self.log.note, "compile", f"on ({COMPILE_BACKEND})")
+        if reason is not None:
+            print(f"warning: torch.compile unavailable ({reason}); training without it",
+                  file=sys.stderr, flush=True)
+            self._safe_log(self.log.note, "compile", f"skipped: {reason}")
             return
-        print(f"warning: torch.compile unavailable ({reason}); training without it",
-              file=sys.stderr, flush=True)
-        self._safe_log(self.log.note, "compile", f"skipped: {reason}")
+        import torch._dynamo as dynamo        # `as`: a bare import would shadow torch here
+        try:
+            self._trial_compiled_step()
+        except Exception as exc:
+            dynamo.reset()
+            self.forward_model = self.model
+            self.compiled = False
+            first = (str(exc).strip().splitlines() or [""])[0][:500]
+            failure = f"{type(exc).__name__}: {first}"
+            print(f"warning: torch.compile failed at the first forward ({failure}); "
+                  "falling back to eager training", file=sys.stderr, flush=True)
+            self._safe_log(self.log.note, "compile", f"fell back: {failure}")
+            return
+        dynamo.config.suppress_errors = True
+        self._safe_log(self.log.note, "compile", f"on ({COMPILE_BACKEND})")
+
+    def _trial_compiled_step(self) -> None:
+        """One forward + backward through forward_model on a synthetic batch (random
+        tokens on the training device, same autocast as train_step), to force the
+        lazy compile now. The data stream is not touched, and everything the step
+        changed is put back: RNG (CPU and CUDA), gradients, router scores and
+        last_stats. Raises whatever the compiled forward or backward raises."""
+        cfg, mcfg = self.train_cfg, self.model_cfg
+        use_amp = self.device.startswith("cuda")
+        rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if use_amp else None
+        was_training = self.model.training
+        try:
+            self.model.train()
+            x = torch.randint(mcfg.vocab_size, (cfg.micro_batch, mcfg.context),
+                              device=self.device)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                logits = self.forward_model(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), x.reshape(-1))
+            loss.backward()
+        finally:
+            self._zero_grad()
+            self.model.zero_grad(set_to_none=True)
+            if self.is_moe:
+                self.model.clear_balance_scores()
+                self.model.last_stats = [None] * mcfg.n_layer
+            torch.set_rng_state(rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            self.model.train(was_training)
 
     # ---- logging -------------------------------------------------------------
 
@@ -315,12 +372,15 @@ class Trainer:
 
     def _set_lrs(self, lr: float) -> float | None:
         """Every group of every optimizer to base_lr x the schedule factor. Returns
-        the Muon lr (None without Muon), for the log."""
-        factor = lr / self.train_cfg.lr
+        the Muon lr (None without Muon), for the log. A group whose base_lr is
+        train.lr gets `lr` itself: cfg.lr x (lr / cfg.lr) can differ from lr in the
+        last bit, and quipu-114m's AdamW must stay bit-identical to pre-M6."""
+        base = self.train_cfg.lr
+        factor = lr / base
         muon_lr = None
         for opt in self.optimizers:
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * factor
+                group["lr"] = lr if group["base_lr"] == base else group["base_lr"] * factor
                 if muon_lr is None and isinstance(opt, Muon):
                     muon_lr = group["lr"]
         return muon_lr
@@ -347,7 +407,10 @@ class Trainer:
                 n_layer, n_experts = self.model_cfg.n_layer, self.model_cfg.n_experts
                 step_counts = torch.zeros(n_layer, n_experts, dtype=torch.long, device=self.device)
                 step_dropped = torch.zeros(n_layer, dtype=torch.long, device=self.device)
-            total = 0.0
+            # The step's loss stays on the device (float64, so the sum is exactly the
+            # old per-micro-batch loss.item() / grad_accum sum) and is read back once
+            # per step: no host sync per micro-batch.
+            total_t = torch.zeros((), dtype=torch.float64, device=self.device)
             use_amp = self.device.startswith("cuda")
             for _ in range(cfg.grad_accum):
                 x, y = self.stream.next_batch()
@@ -358,7 +421,7 @@ class Trainer:
                 # Divide before backward so the accumulated gradient is the mean over
                 # the whole batch, not the sum over micro-batches.
                 (loss / cfg.grad_accum).backward()
-                total += loss.item() / cfg.grad_accum
+                total_t += loss.detach().double() / cfg.grad_accum
                 if self.is_moe:
                     # last_stats and the stashed scores cover this micro-batch only;
                     # summed here, the step's balance update and load logging see
@@ -368,6 +431,7 @@ class Trainer:
                     step_dropped += torch.stack([s.dropped for s in stats])
                     self.model.accumulate_balance_scores(self.balance_rows)
 
+            total = total_t.item()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
             if not (math.isfinite(total) and torch.isfinite(grad_norm)):
                 # One NaN/inf batch taken as a step would poison the weights and
@@ -506,6 +570,10 @@ class Trainer:
                 "optimizers": [opt.state_dict() for opt in self.optimizers],
                 "optimizer_kinds": [type(opt).__name__ for opt in self.optimizers],
                 "moe_health_streak": self._health_streak.clone() if self.is_moe else None,
+                # The expert-load interval so far (since the last eval_every step), so
+                # the first "moe" entry after a resume covers the whole interval.
+                "moe_interval": ((self._interval_counts.clone(), self._interval_dropped.clone())
+                                 if self.is_moe else None),
                 "stream": self.stream.state_dict(),
                 "skipped_steps": self.skipped_steps,
                 "torch_rng": torch.get_rng_state(),
@@ -601,6 +669,10 @@ class Trainer:
         apply_config_lrs(self.optimizers, self.train_cfg)
         if self.is_moe and state.get("moe_health_streak") is not None:
             self._health_streak = state["moe_health_streak"].clone()
+        if self.is_moe and state.get("moe_interval") is not None:
+            counts, dropped = state["moe_interval"]
+            self._interval_counts = counts.clone()
+            self._interval_dropped = dropped.clone()
         self.stream.load_state_dict(state["stream"])
         self.skipped_steps = int(state.get("skipped_steps", 0))   # absent before it existed
         torch.set_rng_state(state["torch_rng"])
@@ -657,8 +729,10 @@ class Trainer:
                     continue       # non-finite step skipped; nothing new to eval or save
                 if self.step % cfg.eval_every == 0 and self.val_stream is not None:
                     # estimate_loss runs MoE layers with loop dispatch (no drops) and
-                    # restores the training dispatch afterwards.
-                    val = estimate_loss(self.forward_model, self.val_stream,
+                    # restores the training dispatch afterwards. The eager module, not
+                    # the compiled one: eval mode, no_grad and loop dispatch would each
+                    # force a recompile (or a compile failure) mid-run.
+                    val = estimate_loss(self.model, self.val_stream,
                                         cfg.eval_batches, self.device)
                     self._safe_log(self.log.log_eval, self.step, val)
                     print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}", flush=True)

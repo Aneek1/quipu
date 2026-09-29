@@ -28,6 +28,14 @@ class Tokenizer:
     def decode(self, ids: list[int]) -> str:
         return self._enc.decode(ids)
 
+    def token_byte_lengths(self) -> list[int]:
+        """Raw UTF-8 byte length of every token id (bits per byte counts with it);
+        special tokens (<|endoftext|>) are 0 bytes of text."""
+        enc = self._enc
+        special = {enc.encode_single_token(s) for s in enc.special_tokens_set}
+        return [0 if i in special else len(enc.decode_single_token_bytes(i))
+                for i in range(enc.n_vocab)]
+
 
 def make_tokenizer(tokenizer: str = "gpt2"):
     """The tokenizer a config names: "gpt2" (quipu-114m) or a path to a tokenizer.json

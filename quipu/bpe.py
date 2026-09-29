@@ -150,6 +150,22 @@ class BPETokenizer:
     def decode(self, ids: list[int]) -> str:
         return self._plain.decode(list(ids), skip_special_tokens=False)
 
+    def token_byte_lengths(self) -> list[int]:
+        """Raw byte length of every token id (bits per byte counts with it). Tokens
+        are byte-level: each character of a vocabulary string stands for exactly one
+        byte (the ByteLevel alphabet), so the length is the string's length. Special
+        and other added tokens are 0 bytes of text."""
+        alphabet = set(pre_tokenizers.ByteLevel.alphabet())
+        added = set(self._plain.get_added_tokens_decoder())
+        lens = [0] * self.vocab_size
+        for piece, i in self._plain.get_vocab(with_added_tokens=True).items():
+            if i in added:
+                continue
+            if not alphabet.issuperset(piece):
+                raise ValueError(f"{self.path}: token {i} {piece!r} is not byte-level")
+            lens[i] = len(piece)
+        return lens
+
     def sha256(self) -> str:
         import hashlib
         return hashlib.sha256(self.path.read_bytes()).hexdigest()

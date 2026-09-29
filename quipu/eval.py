@@ -91,33 +91,37 @@ def bits_per_byte(
     decode to. Comparable across tokenizers, unlike loss per token.
 
     batches yields (x, y) token tensors of shape (B, T), y the next-token targets.
-    Bytes are counted per ROW of y: tokenizer.decode(row) then len(...encode()). A
-    row, not each token, because a byte-level BPE can split one character across
-    tokens, and decoding the pieces alone would count replacement characters.
+    Bytes are counted per TOKEN, from tokenizer.token_byte_lengths(): each token's
+    raw byte length (special tokens 0). Raw bytes, not decoded text: a byte-level
+    BPE can split one character across tokens (and across rows), and decoding a
+    fragment would count replacement characters instead of the bytes it holds.
     `device` defaults to the model's; amp as in estimate_loss (bf16 on CUDA only).
     """
     device = torch.device(device) if device is not None else _device_of(model)
+    lens = torch.as_tensor(tokenizer.token_byte_lengths(), dtype=torch.long, device=device)
     was_training = model.training
     model.eval()
-    nll = 0.0
-    n_bytes = 0
+    nll = torch.zeros((), dtype=torch.float64, device=device)
+    n_bytes = torch.zeros((), dtype=torch.long, device=device)
     try:
         with loop_dispatch(model), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=amp and device.type == "cuda"
         ):
             for x, y in batches:
+                y = y.to(device)
                 logits = model(x.to(device))
                 nll += F.cross_entropy(
-                    logits.float().reshape(-1, logits.size(-1)), y.to(device).reshape(-1),
+                    logits.float().reshape(-1, logits.size(-1)), y.reshape(-1),
                     reduction="sum",
-                ).item()
-                n_bytes += sum(len(tokenizer.decode(row).encode("utf-8")) for row in y.tolist())
+                ).double()
+                n_bytes += lens[y].sum()
     finally:
         if was_training:
             model.train()
-    if n_bytes == 0:
-        raise ValueError("bits_per_byte: the targets decode to 0 bytes")
-    return nll / (n_bytes * math.log(2))
+    total_bytes = int(n_bytes)
+    if total_bytes == 0:
+        raise ValueError("bits_per_byte: the targets hold 0 bytes")
+    return float(nll) / (total_bytes * math.log(2))
 
 
 @torch.no_grad()

@@ -299,7 +299,10 @@ def test_an_old_quipu_114m_checkpoint_still_loads(tmp_path):
 
 def test_checkpoints_hold_the_uncompiled_state_dict(tmp_path, monkeypatch):
     # Real dynamo, the "eager" backend: no Triton or C++ compiler needed.
+    import torch._dynamo as dynamo
+
     monkeypatch.setattr(train_mod, "COMPILE_BACKEND", "eager")
+    monkeypatch.setattr(dynamo.config, "suppress_errors", dynamo.config.suppress_errors)
     cfg = smoke(tmp_path, compile=True)
     trainer = build(tmp_path, cfg, make_data(tmp_path))
     assert trainer.compiled
@@ -320,6 +323,156 @@ def test_compile_falls_back_to_eager_with_a_warning(tmp_path, monkeypatch, capsy
     assert "torch.compile unavailable (no Triton here)" in capsys.readouterr().err
     assert logged(tmp_path)["compile"] == "skipped: no Triton here"
     assert math.isfinite(trainer.train_step())
+
+
+class _StubCompiled(nn.Module):
+    """Stands in for torch.compile's wrapper. Runs the real model (so router scores,
+    last_stats and RNG draws happen), then fails when `fail(self)` says so."""
+
+    def __init__(self, inner, fail):
+        super().__init__()
+        self.inner = inner
+        self.fail = fail
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        torch.rand(3)                                   # a draw the trial must undo
+        out = self.inner(x)
+        if self.fail(self):
+            raise RuntimeError("inductor exploded\nsecond line of a long trace")
+        return out
+
+
+@pytest.fixture
+def stub_compile(monkeypatch):
+    """Install a stub torch.compile; returns the list of stubs it built. The trainer
+    sets dynamo's suppress_errors after a good trial; monkeypatch puts it back."""
+    import torch._dynamo as dynamo
+
+    monkeypatch.setattr(train_mod, "_compile_unavailable", lambda device: None)
+    monkeypatch.setattr(dynamo.config, "suppress_errors", dynamo.config.suppress_errors)
+    built = []
+
+    def install(fail):
+        def fake_compile(model, backend=None):
+            stub = _StubCompiled(model, fail)
+            built.append(stub)
+            return stub
+        monkeypatch.setattr(torch, "compile", fake_compile)
+        return built
+    return install
+
+
+def _grads_and_scores_clean(trainer):
+    assert all(p.grad is None for p in trainer.model.parameters())
+    assert all(b.moe._step_scores == [] and b.moe._last_scores is None
+               for b in trainer.model.blocks)
+    assert trainer.model.last_stats == [None] * trainer.model_cfg.n_layer
+
+
+def test_a_compile_that_fails_at_the_first_forward_falls_back_to_eager(
+        tmp_path, stub_compile, capsys):
+    built = stub_compile(lambda stub: True)
+    data = make_data(tmp_path)
+    cfg = smoke(tmp_path / "a", compile=True)
+    a = build(tmp_path / "a", cfg, data)
+    assert built and built[0].calls == 1                    # the trial ran, and failed
+    assert not a.compiled and a.forward_model is a.model
+    assert "falling back" in capsys.readouterr().err
+    note = logged(tmp_path / "a")["compile"]
+    assert note.startswith("fell back: RuntimeError: inductor exploded")
+    _grads_and_scores_clean(a)
+    rng_a = torch.get_rng_state()
+
+    ref = build(tmp_path / "b", smoke(tmp_path / "b"), data)
+    assert torch.equal(torch.get_rng_state(), rng_a)
+    got = [a.train_step() for _ in range(3)]
+    expected = [ref.train_step() for _ in range(3)]
+    assert got == expected
+    assert built[0].calls == 1                              # never used again
+    for (k, v), (_, w) in zip(a.model.state_dict().items(), ref.model.state_dict().items()):
+        assert torch.equal(v, w), k
+
+
+def test_a_successful_compile_trial_leaves_rng_grads_and_balancer_untouched(
+        tmp_path, stub_compile):
+    built = stub_compile(lambda stub: False)
+    data = make_data(tmp_path)
+    ref = build(tmp_path / "b", smoke(tmp_path / "b"), data)
+    rng_ref = torch.get_rng_state()
+    a = build(tmp_path / "a", smoke(tmp_path / "a", compile=True), data)
+    assert torch.equal(torch.get_rng_state(), rng_ref)
+    assert a.compiled and a.forward_model is built[0] and built[0].calls == 1
+    import torch._dynamo as dynamo
+    assert dynamo.config.suppress_errors is True
+    _grads_and_scores_clean(a)
+    assert all(torch.equal(x, y) for x, y in zip(biases(a.model), biases(ref.model)))
+    assert logged(tmp_path / "a")["compile"] == "on (inductor)"
+    for (k, v), (_, w) in zip(a.model.state_dict().items(), ref.model.state_dict().items()):
+        assert torch.equal(v, w), k
+
+
+def test_evaluation_runs_the_eager_model_not_the_compiled_one(tmp_path, stub_compile):
+    # A compiled forward that only works in training mode: eval must never call it.
+    built = stub_compile(lambda stub: not stub.inner.training)
+    cfg = smoke(tmp_path, compile=True, eval_every=1)
+    trainer = build(tmp_path, cfg, make_data(tmp_path),
+                    val=make_data(tmp_path, name="val", seed=1))
+    assert trainer.compiled
+    trainer.train_cfg = dataclasses.replace(cfg.train, total_tokens=2 * cfg.train.batch_tokens)
+    trainer.run()
+    assert built[0].calls == 1 + 2 * cfg.train.grad_accum    # trial + training only
+    assert len(logged(tmp_path)["evals"]) == 2
+
+
+def test_dense_adamw_lr_is_exactly_the_schedule_lr(tmp_path):
+    # quipu-114m before M6 set group["lr"] = lr_at(step); base_lr x (lr / cfg.lr) can
+    # differ from lr in the last bit.
+    data = tmp_path / "data"
+    write_shard(data / "shard_000.bin",
+                np.random.RandomState(0).randint(0, 128, 8192).astype(np.uint16))
+    tcfg = _tiny_dense_train(tmp_path)
+    trainer = Trainer(model_cfg=_tiny_dense(), train_cfg=tcfg, shard_dir=data, device="cpu",
+                      run_dir=tmp_path / "runs", run_id="d")
+    lrs = [trainer.lr_at(s) for s in range(tcfg.steps + 1)]
+    lrs += [tcfg.lr * i / 997 for i in range(1, 998)]      # 13 of these lose a bit
+    assert any(tcfg.lr * (lr / tcfg.lr) != lr for lr in lrs)
+    for lr in lrs:
+        trainer._set_lrs(lr)
+        assert all(g["lr"] == lr for g in trainer.opt.param_groups), lr
+
+
+def test_apply_config_lrs_also_restores_muon_momentum_nesterov_and_ns_steps(tmp_path):
+    from quipu.optim import apply_config_lrs
+
+    cfg = smoke(tmp_path, muon_momentum=0.9, muon_ns_steps=3)
+    trainer = build(tmp_path, cfg, make_data(tmp_path))
+    muon = trainer.optimizers[0]
+    for g in muon.param_groups:
+        g.update(momentum=0.5, nesterov=False, ns_steps=7)
+    apply_config_lrs(trainer.optimizers, cfg.train)
+    assert all(g["momentum"] == 0.9 and g["nesterov"] is True and g["ns_steps"] == 3
+               for g in muon.param_groups)
+
+
+def test_resume_mid_interval_logs_the_same_expert_load_as_the_uninterrupted_run(tmp_path):
+    data = make_data(tmp_path)
+    ref_cfg = smoke(tmp_path / "ref", eval_every=4)
+    ref = build(tmp_path / "ref", ref_cfg, data)
+    for _ in range(4):
+        ref.train_step()
+
+    cfg = smoke(tmp_path, eval_every=4)
+    a = build(tmp_path, cfg, data)
+    for _ in range(2):
+        a.train_step()
+    a.save_checkpoint()
+    b = build(tmp_path, cfg, data, resume=True)
+    b.resume_from_latest()
+    for _ in range(2):
+        b.train_step()
+    assert logged(tmp_path)["moe"] == logged(tmp_path / "ref")["moe"]
 
 
 @pytest.mark.skipif(train_mod._compile_unavailable("cpu") is not None,
@@ -475,6 +628,18 @@ class _PieceTokenizer:
     def decode(self, ids):
         return "".join(self.pieces[i] for i in ids)
 
+    def token_byte_lengths(self):
+        return [len(p.encode("utf-8")) for p in self.pieces]
+
+
+class _ByteTokenizer:
+    """256 byte tokens plus an end-of-text token (id 256, 0 bytes)."""
+
+    eot = 256
+
+    def token_byte_lengths(self):
+        return [1] * 256 + [0]
+
 
 def test_bits_per_byte_equals_a_hand_computation():
     pieces = ["a", "é", "日本", "xyz"]                     # 1, 2, 6, 3 UTF-8 bytes
@@ -499,17 +664,56 @@ def test_bits_per_byte_equals_a_hand_computation():
     assert got == pytest.approx(expected, rel=1e-6)
 
 
-def test_bits_per_byte_counts_bytes_of_the_decoded_row_not_of_each_token():
+def test_bits_per_byte_counts_the_raw_bytes_of_each_token():
     # Two byte-level tokens that only form one character together: decoding them one
     # at a time would give two replacement characters (6 bytes), not 2 bytes.
-    class ByteTokenizer:
-        def decode(self, ids):
-            return bytes(ids).decode("utf-8", errors="replace")
-
-    table = torch.zeros(256, 256)
+    table = torch.zeros(257, 257)
     y = torch.tensor([[0xC3, 0xA9]])                            # "é"
-    got = bits_per_byte(_TableModel(table), [(torch.zeros_like(y), y)], ByteTokenizer())
-    assert got == pytest.approx(2 * math.log(256) / (2 * math.log(2)))
+    got = bits_per_byte(_TableModel(table), [(torch.zeros_like(y), y)], _ByteTokenizer())
+    assert got == pytest.approx(2 * math.log(257) / (2 * math.log(2)))
+
+
+def test_bits_per_byte_counts_a_character_split_across_rows_exactly():
+    # 24 bytes in two rows of 12; "日" (E6 97 A5) is cut 2 | 1 by the row boundary.
+    # Decoding each row would count a replacement character on each side: 27 bytes.
+    text = "abcdefghij日klmnopqrstu".encode("utf-8")
+    assert len(text) == 24 and text[10:13] == "日".encode("utf-8")
+    y = torch.tensor(list(text)).view(2, 12)
+    table = torch.zeros(257, 257)
+    got = bits_per_byte(_TableModel(table), [(torch.zeros_like(y), y)], _ByteTokenizer())
+    assert got == pytest.approx(24 * math.log(257) / (24 * math.log(2)))
+
+
+def test_bits_per_byte_counts_end_of_text_as_zero_bytes():
+    y = torch.tensor([[0x61, 256, 0x62, 0x63]])                 # "a" EOT "bc"
+    table = torch.zeros(257, 257)
+    got = bits_per_byte(_TableModel(table), [(torch.zeros_like(y), y)], _ByteTokenizer())
+    assert got == pytest.approx(4 * math.log(257) / (3 * math.log(2)))
+
+
+def test_gpt2_token_byte_lengths_are_the_raw_token_bytes():
+    from quipu.tokenizer import Tokenizer
+
+    tok = Tokenizer()
+    lens = tok.token_byte_lengths()
+    assert len(lens) == tok.vocab_size
+    assert lens[tok.eot] == 0
+    for text in ["hello world", "naïve café 日本語 🙂", "  def f(x):\n\treturn x"]:
+        ids = tok.encode(text)
+        assert sum(lens[i] for i in ids) == len(text.encode("utf-8")), text
+
+
+def test_bpe_token_byte_lengths_are_the_raw_token_bytes(tmp_path):
+    from quipu.bpe import SPECIAL_TOKENS, train_bpe
+
+    corpus = ["naïve café 日本語 🙂 def f(x):\n    return x"] * 20 + ["hello world"] * 20
+    tok = train_bpe(corpus, 300, tmp_path / "tok.json")
+    lens = tok.token_byte_lengths()
+    assert len(lens) == tok.vocab_size
+    assert all(lens[tok.special_id(s)] == 0 for s in SPECIAL_TOKENS)
+    for text in corpus[:1] + ["  indentation\n\t\tand ünïcödé 한국어"]:
+        ids = tok.encode(text)
+        assert sum(lens[i] for i in ids) == len(text.encode("utf-8")), text
 
 
 def test_bits_per_byte_runs_moe_with_loop_dispatch(monkeypatch):
@@ -520,8 +724,8 @@ def test_bits_per_byte_runs_moe_with_loop_dispatch(monkeypatch):
     y = torch.randint(0, cfg.vocab_size, (2, 16))
 
     class Tok:
-        def decode(self, ids):
-            return "ab" * len(ids)
+        def token_byte_lengths(self):
+            return [2] * cfg.vocab_size
 
     bpb = bits_per_byte(model, [(x, y)], Tok())
     assert set(seen) == {"loop"} and all(b.moe.dispatch == "padded" for b in model.blocks)

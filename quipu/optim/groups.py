@@ -41,6 +41,8 @@ from quipu.model import Attention
 from quipu.moe import ExpertBank, Router
 from quipu.optim.muon import Muon
 
+MUON_NESTEROV = True   # not a config field; every Muon group uses Nesterov momentum
+
 
 def _no_decay_ids(model: nn.Module) -> set[int]:
     """Every 1-D parameter, plus the model's own no-decay list when it has one."""
@@ -117,7 +119,7 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
 
     muon_common = {"lr": cfg.muon_lr, "base_lr": cfg.muon_lr, "momentum": cfg.muon_momentum,
                    "weight_decay": cfg.muon_weight_decay, "ns_steps": cfg.muon_ns_steps,
-                   "nesterov": True}
+                   "nesterov": MUON_NESTEROV}
     muon_groups = [
         {"params": ps, "head_dim": hd, "in_out": False, **muon_common}
         for hd, ps in muon_head.items()
@@ -141,16 +143,20 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
 def apply_config_lrs(optimizers: list[torch.optim.Optimizer], cfg: TrainConfig) -> None:
     """Re-set base_lr and weight_decay on every group from cfg, for use right after
     load_state_dict (which restores the checkpoint's values). Muon groups get
-    cfg.muon_lr / cfg.muon_weight_decay; AdamW groups cfg.lr, and cfg.weight_decay
-    for the decay group (tagged group["decay"] at build) while the no-decay group
-    stays at 0. group["lr"] is left alone: the LR schedule derives it from base_lr
-    before the next step."""
+    cfg.muon_lr / cfg.muon_weight_decay, and momentum / ns_steps / nesterov as
+    build_optimizers sets them; AdamW groups cfg.lr, and cfg.weight_decay for the
+    decay group (tagged group["decay"] at build) while the no-decay group stays at 0.
+    group["lr"] is left alone: the LR schedule derives it from base_lr before the
+    next step."""
     for opt in optimizers:
         is_muon = isinstance(opt, Muon)
         for group in opt.param_groups:
             if is_muon:
                 group["base_lr"] = cfg.muon_lr
                 group["weight_decay"] = cfg.muon_weight_decay
+                group["momentum"] = cfg.muon_momentum
+                group["ns_steps"] = cfg.muon_ns_steps
+                group["nesterov"] = MUON_NESTEROV
             else:
                 if "decay" not in group:
                     raise ValueError("AdamW group has no 'decay' tag; was it built by "
