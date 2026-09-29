@@ -110,6 +110,7 @@ MODEL_KINDS = ("dense", "moe")
 ACTIVATIONS = ("swiglu", "situ_glu")
 MOE_DISPATCHES = ("loop", "padded")
 OPTIMIZERS = ("adamw", "muon")
+PRECISIONS = ("bf16", "fp8")
 GPT2_TOKENIZER = "gpt2"
 # ModelConfig int fields that are 0 for a dense model.
 MOE_INT_FIELDS = ("n_experts", "top_k", "expert_hidden", "shared_experts", "shared_hidden",
@@ -157,6 +158,11 @@ class TrainConfig:
     # smaller effective lr, so its 0.1 does not carry over to this lr.
     muon_weight_decay: float = 0.01
     compile: bool = False                # torch.compile the model
+    # Matmul precision (spec section 12). "bf16": bf16 autocast, as quipu-114m.
+    # "fp8": additionally, attention q/k/v/o and the shared-expert linears run their
+    # matmuls in FP8 (quipu.fp8); kind "moe" on CUDA only. Kept for the full run only
+    # if A/B pair 4 shows >= 1.2x tokens/s with loss within seed noise.
+    precision: str = "bf16"              # "bf16" | "fp8"
     # Spend guard (spec section 6.4): stop cleanly once elapsed hours x usd_per_hour
     # reaches budget_usd. budget_usd 0 = no guard.
     budget_usd: float = 0.0
@@ -377,6 +383,7 @@ def _check_train_extras(train: TrainConfig) -> None:
     _check_bool("muon_per_head", train.muon_per_head)
     _check_positive("muon_weight_decay", train.muon_weight_decay, allow_zero=True)
     _check_bool("compile", train.compile)
+    _check_choice("precision", train.precision, PRECISIONS)
     _check_positive("budget_usd", train.budget_usd, allow_zero=True)
     _check_positive("usd_per_hour", train.usd_per_hour, allow_zero=True)
     if train.budget_usd > 0 and train.usd_per_hour == 0:
@@ -442,6 +449,9 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     _check_moe(model)
     _check_data_mix(data)
     _check_train_extras(train)
+    if train.precision == "fp8" and model.kind != "moe":
+        # Spec section 12: dense quipu-114m is unaffected by the FP8 option.
+        raise ValueError(f"precision 'fp8' applies to kind 'moe', got kind {model.kind!r}")
     _check_tokenizer(data, model)
 
     if train.batch_tokens % (train.micro_batch * model.context) != 0:

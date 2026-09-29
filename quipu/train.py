@@ -39,6 +39,12 @@ Windows) it warns and trains eagerly. Because torch.compile is lazy, one trial s
 on a synthetic batch runs at startup; a compile that fails there also falls back to
 eager (see Trainer._compile). Evaluation always runs the eager module, and the
 un-compiled module is what is checkpointed.
+
+train.precision "fp8" (spec section 12) converts attention q/k/v/o and the
+shared-expert linears to FP8 matmuls (quipu.fp8) right after the model is built,
+before the optimizers and the compile trial. The state_dict is bf16's key for key,
+so checkpoints and milestones are unchanged. FP8 on a device without FP8 tensor
+cores (or on CPU) is a usage error, exit 2.
 """
 from __future__ import annotations
 
@@ -61,6 +67,7 @@ import torch.nn.functional as F
 
 from quipu.config import Config, ModelConfig, TrainConfig, load_config
 from quipu.eval import estimate_loss
+from quipu.fp8 import Fp8Unsupported, apply_precision
 from quipu.fsio import replace_with_retry
 from quipu.loader import TokenStream
 from quipu.model_factory import build_model
@@ -216,7 +223,12 @@ class Trainer:
         # self.model is always the plain module: checkpoints, milestones, the
         # balancer and set_dispatch go through it. self.forward_model is what runs
         # the forward (the torch.compile wrapper when compile is on, else the same).
-        self.model = build_model(model_cfg).to(device)
+        # train.precision "fp8" swaps some linears for FP8 ones (quipu.fp8) here:
+        # before the optimizers are built and before compile, so both see the FP8
+        # model. Parameter names and objects are unchanged, so checkpoints load
+        # into either precision.
+        self.model = apply_precision(build_model(model_cfg).to(device),
+                                     train_cfg.precision, device)
         self.forward_model: nn.Module = self.model
         self.compiled = False
         self.is_moe = isinstance(self.model, QuipuMoE)
@@ -803,6 +815,8 @@ def main(argv: list[str] | None = None) -> None:
         raise UsageError(
             f"{exc}; drop --resume to start a new run, or check the run id"
         ) from exc
+    except Fp8Unsupported as exc:
+        raise UsageError(f"{exc}; set train.precision = \"bf16\" to train here") from exc
     if args.resume:
         trainer.resume_from_latest()
         print(

@@ -15,6 +15,7 @@ dependencies = [
     "pyflakes>=4.0.0",
     "tokenizers>=0.23.2",
     "fasttext-numpy2>=0.10.4 ; sys_platform == 'linux'",
+    "torchao>=0.18.0",
 ]
 
 [dependency-groups]
