@@ -85,7 +85,7 @@ Measured on held-out code (the code validation set) and text (FineWeb-Edu valida
 ## 6. Training
 
 ### 6.1 A/B runs (before the full run)
-A scaled-down model (8 layers, same widths, same expert layout) on ~300M tokens per run, fixed seeds, differing in exactly one setting:
+A scaled-down model (8 layers, same widths, same expert layout; ~55M active non-embedding) on ~200M tokens per run (~18 min each), fixed seeds, differing in exactly one setting:
 
 | Run | Compares | Kept if |
 |---|---|---|
@@ -95,7 +95,7 @@ A scaled-down model (8 layers, same widths, same expert layout) on ~300M tokens 
 
 The winner of each is re-run with a second seed to estimate noise; a difference smaller than that noise keeps the simpler option. All results (loss curves, throughput, spikes) go in the model card.
 
-Muon details: Muon (Newton–Schulz, 5 iterations) for all 2-D weight matrices except embeddings; for Q, K and V projections the momentum is split per head and orthogonalised per head. AdamW for embeddings, norms, router, biases. Learning rates for both are set from short sweeps in the A/B scale-down (3 values each).
+Muon details: Muon (Newton–Schulz, 5 iterations) for all 2-D weight matrices except embeddings; for Q, K and V projections the momentum is split per head and orthogonalised per head. AdamW for embeddings, norms, router, biases. Learning rates for both are set first from short sweeps on the scale-down (3 values each, ~100M tokens per run, ~9 min each).
 
 ### 6.2 Throughput gate
 A 15-minute full-size run measures tokens/second. The launcher prints projected hours and cost for 10B tokens. If projected cost exceeds the budget cap, the token target is reduced to fit, and the owner is shown the numbers before the long run starts.
@@ -125,10 +125,10 @@ New:
 | Item | Est. hours | Est. cost at ~$0.55/hr |
 |---|---|---|
 | Setup + data build | ~1.5–2 | ~$1 |
-| A/B runs (4–5 short runs) | ~2–3 | ~$1.5 |
+| LR sweeps (6 × ~9 min), A/B arms (6 × ~18 min), seed re-runs (3 × ~18 min) | ~3.5–4 | ~$2 |
 | Throughput gate | 0.25 | ~$0.15 |
 | Full run, 10B tokens | ~31–35 | ~$17–19 |
-| **Total** | | **~$20** (cap enforced) |
+| **Total** | | **~$21–23 before the cap; the $20 default cap trims the full run to ~9B tokens unless the owner raises it** |
 
 Estimates assume ~50–70 TFLOPS effective of the box's measured 176.7 TFLOPS; the throughput gate replaces them with measured numbers.
 
