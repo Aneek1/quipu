@@ -263,7 +263,8 @@ def test_quipu_114m_gets_the_dense_gpt2_adamw_defaults():
     assert (m.kind, m.n_experts, m.top_k, m.expert_hidden, m.shared_experts,
             m.shared_hidden, m.attnres_blocks) == ("dense", 0, 0, 0, 0, 0, 0)
     assert (m.activation, m.situ_beta_gate, m.situ_beta_up, m.balance_update_rate) == (
-        "swiglu", 4.0, 25.0, 1e-3)
+        "swiglu", 4.0, 25.0, 0.3)
+    assert (m.moe_dispatch, m.capacity_factor) == ("loop", 1.5)
     assert d.tokenizer == "gpt2"
     assert d.code_language_weights == {} and d.text_language_weights == {}
     assert (d.lid_model, d.lid_revision) == ("AneekC/lid-specialists-9plus1", "")
@@ -340,6 +341,10 @@ def test_moe_configs_have_weights_summing_to_one(path):
         ({"kind": "sparse"}, "kind"),
         ({"activation": "gelu"}, "activation"),
         ({"n_experts": 4, "top_k": 0}, "top_k"),
+        ({"n_experts": 4, "top_k": 1}, "top_k"),
+        ({"moe_dispatch": "scatter"}, "moe_dispatch"),
+        ({"capacity_factor": 0.0}, "capacity_factor"),
+        ({"capacity_factor": 0.9}, "capacity_factor"),
         ({"n_experts": 2, "top_k": 3}, "n_experts"),
         ({"expert_hidden": 0}, "expert_hidden"),
         ({"shared_experts": -1}, "shared_experts"),
@@ -363,6 +368,19 @@ def test_moe_model_guards(overrides, match):
 def test_dense_refuses_moe_settings_it_would_ignore(field):
     with pytest.raises(ValueError, match=field):
         load_config(CONFIG, overrides={"model": {field: 1}})
+
+
+def test_dense_refuses_padded_dispatch():
+    with pytest.raises(ValueError, match="moe_dispatch"):
+        load_config(CONFIG, overrides={"model": {"moe_dispatch": "padded"}})
+
+
+def test_moe_configs_balance_at_0_3_and_accept_padded_dispatch():
+    for path in (MOE, MOE_AB, MOE_SMOKE):
+        assert load_config(path).model.balance_update_rate == 0.3
+    m = load_config(MOE_SMOKE, overrides={"model": {"moe_dispatch": "padded",
+                                                    "capacity_factor": 2.0}}).model
+    assert (m.moe_dispatch, m.capacity_factor) == ("padded", 2.0)
 
 
 def test_dense_refuses_situ_glu():
@@ -419,8 +437,8 @@ def test_a_partial_code_weight_override_replaces_the_table_and_is_validated():
 
 
 def test_other_sections_still_merge_key_by_key():
-    cfg = load_config(MOE_SMOKE, overrides={"model": {"top_k": 1}})
-    assert (cfg.model.top_k, cfg.model.n_experts) == (1, 8)
+    cfg = load_config(MOE_SMOKE, overrides={"model": {"top_k": 3}})
+    assert (cfg.model.top_k, cfg.model.n_experts) == (3, 8)
 
 
 @pytest.mark.parametrize(

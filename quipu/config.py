@@ -40,7 +40,12 @@ class ModelConfig:
     situ_beta_gate: float = 4.0          # SiTU-GLU beta_1 (gate tanh bound)
     situ_beta_up: float = 25.0           # SiTU-GLU beta_2 (up tanh bound)
     attnres_blocks: int = 0              # Block Attention Residuals; 0 = plain residual
-    balance_update_rate: float = 1e-3    # Quantile Balancing bias EMA rate
+    balance_update_rate: float = 0.3     # Quantile Balancing bias EMA rate
+    # Routed-expert dispatch: "loop" runs each expert on its own contiguous slice;
+    # "padded" pads every slice to capacity ceil(capacity_factor * T * top_k / n)
+    # and runs all experts in one batched matmul, dropping overflow tokens.
+    moe_dispatch: str = "loop"           # "loop" | "padded"
+    capacity_factor: float = 1.5         # "padded" only
 
     @property
     def head_dim(self) -> int:
@@ -90,6 +95,7 @@ class DataConfig:
 ENGLISH_TEXT_KEY = "eng_Latn"
 MODEL_KINDS = ("dense", "moe")
 ACTIVATIONS = ("swiglu", "situ_glu")
+MOE_DISPATCHES = ("loop", "padded")
 OPTIMIZERS = ("adamw", "muon")
 GPT2_TOKENIZER = "gpt2"
 # ModelConfig int fields that are 0 for a dense model.
@@ -270,6 +276,11 @@ def _check_moe(model: ModelConfig) -> None:
     _check_positive("situ_beta_gate", model.situ_beta_gate)
     _check_positive("situ_beta_up", model.situ_beta_up)
     _check_fraction("balance_update_rate", model.balance_update_rate, allow_one=True)
+    _check_choice("moe_dispatch", model.moe_dispatch, MOE_DISPATCHES)
+    _check_positive("capacity_factor", model.capacity_factor)
+    if model.capacity_factor < 1:
+        # Below 1 tokens are dropped even under perfect balance.
+        raise ValueError(f"capacity_factor must be >= 1, got {model.capacity_factor!r}")
     if model.kind == "dense":
         # The dense model has no experts and no AttnRes; a non-zero value here
         # would be silently ignored, so it is refused instead.
@@ -280,9 +291,14 @@ def _check_moe(model: ModelConfig) -> None:
         if model.activation != "swiglu":
             raise ValueError(f"kind 'dense' is SwiGLU only; activation "
                              f"{model.activation!r} applies to experts (kind 'moe')")
+        if model.moe_dispatch != "loop":
+            raise ValueError(f"kind 'dense' has no experts to dispatch; moe_dispatch "
+                             f"{model.moe_dispatch!r} applies to kind 'moe'")
         return
-    if not model.n_experts >= model.top_k >= 1:
-        raise ValueError(f"kind 'moe' needs n_experts >= top_k >= 1, got n_experts "
+    # top_k >= 2: routing weights are renormalised over the chosen experts, so with
+    # one expert the weight is identically 1 and the router never gets a gradient.
+    if not model.n_experts >= model.top_k >= 2:
+        raise ValueError(f"kind 'moe' needs n_experts >= top_k >= 2, got n_experts "
                          f"{model.n_experts}, top_k {model.top_k}")
     if model.expert_hidden < 1:
         raise ValueError(f"kind 'moe' needs expert_hidden > 0, got {model.expert_hidden}")

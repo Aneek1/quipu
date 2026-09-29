@@ -6,8 +6,10 @@ Pieces, smallest first:
       h = (b1 * tanh(g / b1) * sigmoid(g)) * (b2 * tanh(u / b2)),  y = W_down h
   where g = W_gate x and u = W_up x. Near zero tanh(z / b) * b ~ z, so it is SwiGLU;
   for large inputs |h| <= b1 * b2, which keeps bf16 activations bounded.
-- ExpertBank: n experts stored as stacked weights ([n, d, h] gate/up, [n, h, d] down),
-  run on tokens already sorted by expert, one contiguous slice per expert.
+- ExpertBank: n experts stored as stacked weights ([n, d, h] gate/up, [n, h, d] down).
+  Two dispatches over tokens already sorted by expert: "loop" runs each expert on its
+  contiguous slice; "padded" pads every slice to a fixed capacity and runs all experts
+  in one batched matmul, dropping overflow.
 - Router: fp32 softmax scores; Top-k chosen on score + bias, weights taken from the
   unbiased scores and renormalised over the chosen k.
 - QuantileBalancer: the auxiliary-loss-free bias b. It never receives gradients; it is
@@ -16,8 +18,16 @@ Pieces, smallest first:
 
 Router and balancing math run in fp32 even under bf16 autocast: the Top-k decision
 and the quantile cutoffs compare scores that differ in the third decimal place.
+
+Determinism: the combine never scatters with atomics. Each (token, slot) pair is
+one row of the sorted buffer, so going back is an inverse permutation followed by a
+sum over the k slots of each token; the backward passes are the same two operations
+in reverse, and two identical steps give bit-identical gradients.
 """
 from __future__ import annotations
+
+import math
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -67,12 +77,20 @@ def make_ffn(activation: str, dim: int, hidden: int, beta_gate: float, beta_up: 
     raise ValueError(f"unknown activation {activation!r}")
 
 
+def _compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """The dtype autocast would run a matmul in, or x's own dtype outside autocast."""
+    if torch.is_autocast_enabled(x.device.type):
+        return torch.get_autocast_dtype(x.device.type)
+    return x.dtype
+
+
 class ExpertBank(nn.Module):
     """n independent gated experts held as three stacked weight tensors.
 
-    forward takes tokens already sorted by expert and the per-expert counts; expert e
-    runs on the contiguous slice [offset_e, offset_e + counts[e]). The only Python loop
-    is over experts (a handful of matmuls each), never over tokens."""
+    Both dispatches take tokens already sorted by expert, the routing weight of each
+    row, and return one output row per input row (weight already applied: h is scaled
+    by w before the down projection). The weights are cast to the compute dtype once
+    per forward, not once per expert."""
 
     def __init__(
         self,
@@ -108,19 +126,68 @@ class ExpertBank(nn.Module):
             return situ_glu(gate, up, self.beta_gate, self.beta_up)
         return swiglu(gate, up)
 
-    def forward(self, x_sorted: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
-        # One host sync for all offsets rather than one per expert.
+    def _weights(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.gate.to(dtype), self.up.to(dtype), self.down.to(dtype)
+
+    def forward_loop(
+        self, x_sorted: torch.Tensor, w_sorted: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
+        """Expert e runs on rows [offset_e, offset_e + counts[e]). The only Python loop
+        is over experts, never over tokens; one host sync reads all the counts."""
+        dtype = _compute_dtype(x_sorted)
+        # unbind, not gate[e] per expert: each gate[e] would backward into its own
+        # full-size zero [n, d, h] gradient (64 fills and adds of the whole bank);
+        # unbind's backward stacks the per-expert gradients once.
+        gate, up, down = (w.unbind(0) for w in self._weights(dtype))
+        x_sorted = x_sorted.to(dtype)
         sizes = counts.tolist()
-        chunks = torch.split(x_sorted, sizes, dim=0)
         outs = []
-        for e, chunk in enumerate(chunks):
-            if chunk.shape[0] == 0:
+        for e, (xs, ws) in enumerate(zip(torch.split(x_sorted, sizes), torch.split(w_sorted, sizes))):
+            if xs.shape[0] == 0:
                 continue
-            h = self.act(chunk @ self.gate[e], chunk @ self.up[e])
-            outs.append(h @ self.down[e])
+            h = self.act(xs @ gate[e], xs @ up[e]) * ws[:, None].to(dtype)
+            outs.append(h @ down[e])
         if not outs:
             return x_sorted.new_zeros(0, self.down.shape[-1])
         return torch.cat(outs, dim=0)
+
+    def forward_padded(
+        self,
+        x_sorted: torch.Tensor,
+        w_sorted: torch.Tensor,
+        expert_sorted: torch.Tensor,
+        counts: torch.Tensor,
+        capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All experts in one torch.bmm over [n, capacity, d]. Each expert keeps its
+        first `capacity` rows (token order, as sorted); rows past that are dropped and
+        get a zero output. No host sync: shapes depend only on n and capacity.
+        Returns (out, dropped) with dropped a 0-d tensor."""
+        n, N, d = self.n_experts, x_sorted.shape[0], x_sorted.shape[-1]
+        dtype = _compute_dtype(x_sorted)
+        gate, up, down = self._weights(dtype)
+        dev = x_sorted.device
+
+        offsets = torch.cumsum(counts, 0) - counts                         # [n]
+        slot = torch.arange(capacity, device=dev)
+        valid = slot[None, :] < counts[:, None]                             # [n, C]
+        # Gather each (expert, slot) from its sorted row; empty slots read a zero row
+        # appended at index N. Real rows are read at most once.
+        src = torch.where(valid, offsets[:, None] + slot[None, :], N)
+        x_pad = torch.cat([x_sorted.to(dtype), x_sorted.new_zeros(1, d, dtype=dtype)])
+        w_pad = torch.cat([w_sorted, w_sorted.new_zeros(1)])
+        xb = x_pad[src]                                                     # [n, C, d]
+        wb = w_pad[src].to(dtype)                                           # [n, C]
+
+        h = self.act(torch.bmm(xb, gate), torch.bmm(xb, up)) * wb[..., None]
+        ob = torch.bmm(h, down)                                             # [n, C, d]
+
+        # Back to one row per sorted input; overflow rows read an appended zero row.
+        pos = torch.arange(N, device=dev) - offsets[expert_sorted]
+        kept = pos < capacity
+        dst = torch.where(kept, expert_sorted * capacity + pos, n * capacity)
+        o_pad = torch.cat([ob.reshape(n * capacity, d), ob.new_zeros(1, d)])
+        return o_pad[dst], (~kept).sum()
 
 
 def select_experts(
@@ -132,7 +199,10 @@ def select_experts(
     each chosen expert's output counts."""
     idx = (scores + bias).topk(top_k, dim=-1).indices
     picked = scores.gather(-1, idx)
-    weights = picked / picked.sum(-1, keepdim=True)
+    # Softmax scores can underflow to 0 for all chosen experts when the bias forces
+    # far-down experts in; the clamp keeps that a 0 weight rather than a NaN.
+    denom = picked.sum(-1, keepdim=True).clamp_min(torch.finfo(picked.dtype).tiny)
+    weights = picked / denom
     return weights, idx
 
 
@@ -180,42 +250,65 @@ class QuantileBalancer(nn.Module):
     def update(self, scores: torch.Tensor) -> None:
         """One balancing step from a batch of unbiased router scores (T, n).
 
-        Token i's margin to expert j is m_ij = s_ij + b_j - alpha_i, where alpha_i is
-        the (k+1)-th largest biased score of token i: j is among token i's Top-k exactly
-        when m_ij > 0. The target load is q = k*T/n tokens per expert. Shifting b_j by
-        -c_j, where c_j is the (q+1)-th largest margin in column j, leaves exactly q
-        tokens with a positive margin. Every expert's cutoff moves every token's
-        alpha, so the step is taken as an EMA: b_j <- b_j - rate * c_j."""
+        Margins are two-sided, measured against the score that decides membership
+        from where each (token, expert) pair currently stands:
+          - expert j chosen for token i: m_ij = biased_ij - (k+1)-th biased score of
+            token i (> 0; how far b_j can fall before i is lost);
+          - expert j not chosen:        m_ij = biased_ij - k-th biased score of
+            token i (<= 0; how far b_j must rise before i is won).
+        So j holds token i exactly when m_ij > 0, and a starved expert that is every
+        token's runner-up sees negative margins and is raised (a one-sided margin
+        against the (k+1)-th score would be 0 for it and never move it).
+
+        The target load is q = k*T/n tokens per expert. Shifting b_j by -c_j, where
+        c_j is the (q+1)-th largest margin in column j, leaves q tokens with a
+        positive margin. Every expert's shift moves the others' thresholds, so the
+        step is taken as an EMA, b_j <- b_j - rate * c_j, and the bias is then
+        re-centred to mean 0 (adding a constant to every b_j never changes a Top-k,
+        so this only stops the biases drifting together).
+
+        Skipped when k >= n (every expert takes every token) or k*T < n (the batch is
+        too small for a per-expert target of at least one token)."""
         k, n = self.top_k, self.n_experts
-        if k >= n:
-            return  # every expert takes every token; nothing to balance
         s = scores.detach().float().reshape(-1, n)
         T = s.shape[0]
-        if T < 2:
+        if k >= n or k * T < n:
             return
         biased = s + self.bias
-        alpha = biased.topk(k + 1, dim=-1).values[:, -1]
-        margins = biased - alpha[:, None]
-        q = min(max(int(round(k * T / n)), 0), T - 1)
+        top = biased.topk(k + 1, dim=-1)
+        chosen = torch.zeros_like(biased, dtype=torch.bool).scatter_(1, top.indices[:, :k], True)
+        thr = torch.where(chosen, top.values[:, k:k + 1], top.values[:, k - 1:k])
+        margins = biased - thr
+        q = min(int(round(k * T / n)), T - 1)
         # (q+1)-th largest per column == value at 0-based rank q in descending order.
         cutoff = margins.topk(q + 1, dim=0).values[q]
         self.bias.sub_(self.update_rate * cutoff)
+        self.bias.sub_(self.bias.mean())
+
+
+class MoEStats(NamedTuple):
+    counts: torch.Tensor   # (n_experts,) tokens routed to each expert; sums to T * top_k
+    dropped: torch.Tensor  # 0-d; assignments dropped by the padded dispatch's capacity
 
 
 class MoELayer(nn.Module):
     """Shared experts (full width, always on) plus top_k of n_experts routed experts.
 
-    forward(x) -> (y, counts): y has x's shape; counts (n_experts,) is how many tokens
-    each routed expert processed in this call (sums to T * top_k). The batch's router
-    scores are kept so the trainer can call update_balance() after its optimizer step."""
+    forward(x) -> (y, MoEStats): y has x's shape (the autocast dtype under autocast,
+    else x's dtype). The batch's router scores are kept so the trainer can call
+    update_balance() after its optimizer step."""
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         if cfg.kind != "moe":
             raise ValueError(f"MoELayer needs kind 'moe', got {cfg.kind!r}")
+        if cfg.moe_dispatch not in ("loop", "padded"):
+            raise ValueError(f"unknown moe_dispatch {cfg.moe_dispatch!r}")
         d = cfg.d_model
         self.n_experts = cfg.n_experts
         self.top_k = cfg.top_k
+        self.dispatch = cfg.moe_dispatch
+        self.capacity_factor = float(cfg.capacity_factor)
         self.router = Router(d, cfg.n_experts, cfg.top_k)
         self.balancer = QuantileBalancer(cfg.n_experts, cfg.top_k, cfg.balance_update_rate)
         self.experts = ExpertBank(
@@ -232,31 +325,53 @@ class MoELayer(nn.Module):
             nn.init.normal_(ffn.down.weight, mean=0.0, std=INIT_STD / (2 * cfg.n_layer) ** 0.5)
         self._last_scores: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def capacity(self, n_tokens: int) -> int:
+        """Per-expert slots for the padded dispatch: ceil(factor * T * k / n)."""
+        return max(1, math.ceil(self.capacity_factor * n_tokens * self.top_k / self.n_experts))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, MoEStats]:
         shape = x.shape
-        xf = x.reshape(-1, shape[-1])
+        d = shape[-1]
+        xf = x.reshape(-1, d)
         T, k = xf.shape[0], self.top_k
 
         weights, idx, scores = self.router(xf, self.balancer.bias)
         self._last_scores = scores.detach()
 
-        # (token, expert, weight) triples, grouped by expert.
+        # Row r = t*k + slot of the flattened (token, slot) assignments; stable sort
+        # groups them by expert with tokens in order inside each group.
         flat_expert = idx.reshape(-1)
         order = torch.argsort(flat_expert, stable=True)
-        token_of = torch.arange(T, device=x.device).repeat_interleave(k)[order]
         counts = torch.bincount(flat_expert, minlength=self.n_experts)
+        w_sorted = weights.reshape(-1)[order]
+        # Gather through a (T, k, d) broadcast view rather than xf[order // k]: the
+        # backward of this index writes each row once (no duplicate-index
+        # accumulation), and the expand's backward is a plain sum over k.
+        xv = xf.unsqueeze(1).expand(T, k, d)
+        x_sorted = xv[order // k, order % k]
 
-        out = self.experts(xf[token_of], counts)
-        out = out.float() * weights.reshape(-1)[order, None]
-        y = torch.zeros(T, shape[-1], device=x.device, dtype=torch.float32)
-        y = y.index_add(0, token_of, out)
+        if self.dispatch == "padded":
+            out, dropped = self.experts.forward_padded(
+                x_sorted, w_sorted, flat_expert[order], counts, self.capacity(T))
+        else:
+            out = self.experts.forward_loop(x_sorted, w_sorted, counts)
+            dropped = counts.new_zeros(())
+
+        # Inverse permutation back to (token, slot) order, then sum the k slots in fp32.
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(order.numel(), device=order.device)
+        y = out[inv].view(T, k, d).sum(1, dtype=torch.float32)
         for ffn in self.shared:
             y = y + ffn(xf).float()
-        out_dtype = torch.get_autocast_dtype(x.device.type) if torch.is_autocast_enabled(x.device.type) else x.dtype
-        return y.to(out_dtype).reshape(shape), counts
+        return y.to(_compute_dtype(x)).reshape(shape), MoEStats(counts, dropped)
 
     def update_balance(self) -> None:
-        """Apply one Quantile Balancing step from the latest forward's scores."""
+        """Apply one Quantile Balancing step from the latest forward's scores.
+
+        Under gradient accumulation (M6) this is called once per optimizer step, so it
+        balances on the last micro-batch's scores only. That is a fair sample of the
+        router's current behaviour (a micro-batch is thousands of tokens) and keeps
+        the step cheap; the EMA rate smooths the batch-to-batch noise."""
         if self._last_scores is not None:
             self.balancer.update(self._last_scores)
             self._last_scores = None
