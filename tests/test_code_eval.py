@@ -317,6 +317,25 @@ def test_evaluate_end_to_end_on_a_tiny_model(tmp_path):
     assert chat["pass@1"] is None and chat["problems"] == 1
 
 
+def test_chat_prompt_is_the_user_turn_as_plain_text(tmp_path, monkeypatch):
+    cfg, tok = tiny_moe(tmp_path)
+    task = code_eval.humaneval_tasks([HE_ROW])[0]
+    task = code_eval.dataclasses.replace(
+        task, instruction=task.instruction + "\n=== FILE: a.py ===\nx = 1\n=== END FILE ===\n")
+    seen: list[list[int]] = []
+
+    def fake(model, ids, n, **kw):
+        seen.append(list(ids))
+        return [""] * n
+
+    monkeypatch.setattr(code_eval, "generate_batch", fake)
+    code_eval.evaluate(None, tok, [task], chat=True, samples=0, log=lambda _m: None)
+    sid = tok.special_id
+    assert seen == [[sid("<|user|>")] + tok.encode(task.instruction)
+                    + [sid("<|end|>"), sid("<|assistant|>")]]
+    assert not {sid("=== FILE: "), sid("=== END FILE ===")} & set(seen[0])
+
+
 def _row(table: str, *needles: str) -> list[str]:
     line = next(l for l in table.splitlines() if all(n in l for n in needles))
     return [c.strip() for c in line.strip().strip("|").split("|")]

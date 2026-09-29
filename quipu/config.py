@@ -207,7 +207,8 @@ class Config:
     train: TrainConfig
     # The files merged into this config, base first (inherit, inherit_if_present
     # that existed, then the file itself); just the file for a config without them.
-    layers: tuple[str, ...] = ()
+    # Not part of equality: two configs read from different files can be the same.
+    layers: tuple[str, ...] = dataclasses.field(default=(), compare=False)
 
 
 # Tables that are one value, not a section: an override replaces the whole table.

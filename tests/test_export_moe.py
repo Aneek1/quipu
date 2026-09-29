@@ -197,6 +197,49 @@ def test_chat_export_carries_the_chat_template(tmp_path):
     assert "chat model" in card and "base_model: AneekC/" in card
 
 
+REAL_TOKENIZER = ROOT / "artifacts" / "tokenizer" / "tokenizer.json"
+
+
+@pytest.mark.skipif(not REAL_TOKENIZER.exists(), reason="no trained tokenizer in artifacts/")
+def test_exported_tokenizer_keeps_file_markers_as_plain_text(tmp_path):
+    from quipu import chat
+    from quipu.bpe import SPECIAL_TOKENS, BPETokenizer
+
+    export_hf.tokenizer_files(tmp_path, REAL_TOKENIZER, 2048, chat=True)
+    spec = json.loads((tmp_path / "tokenizer.json").read_text(encoding="utf-8"))
+    src = json.loads(REAL_TOKENIZER.read_text(encoding="utf-8"))
+    added = {t["content"] for t in spec["added_tokens"]}
+    assert added == set(SPECIAL_TOKENS[:5])
+    # ids 5 and 6 stay in the vocabulary: ids and vocab size are unchanged
+    assert spec["model"]["vocab"] == src["model"]["vocab"]
+    assert spec["model"]["vocab"]["=== FILE: "] == 5
+    assert spec["model"]["vocab"]["=== END FILE ==="] == 6
+    for f in ("tokenizer_config.json", "special_tokens_map.json"):
+        got = json.loads((tmp_path / f).read_text(encoding="utf-8"))
+        assert got["additional_special_tokens"] == ["<|system|>", "<|user|>",
+                                                    "<|assistant|>", "<|end|>"]
+
+    msgs = [{"role": "system", "content": "You build apps."},
+            {"role": "user", "content": "Write a.py.\n=== FILE: a.py ===\nx = 1\n=== END FILE ===\n"},
+            {"role": "assistant", "content": "=== FILE: a.py ===\nprint('hi')\n=== END FILE ===\n"},
+            {"role": "user", "content": "Thanks."}]
+    want = chat.encode(BPETokenizer(REAL_TOKENIZER), msgs, add_generation_prompt=True)[0]
+    rendered = chat.render(msgs, add_generation_prompt=True)
+    try:
+        from transformers import PreTrainedTokenizerFast
+    except ImportError:
+        from tokenizers import Tokenizer as HFTokenizer
+        hf_tok = HFTokenizer.from_file(str(tmp_path / "tokenizer.json"))
+        encode = lambda s: hf_tok.encode(s, add_special_tokens=False).ids  # noqa: E731
+    else:
+        hf_tok = PreTrainedTokenizerFast.from_pretrained(str(tmp_path))
+        encode = lambda s: hf_tok(s, add_special_tokens=False)["input_ids"]  # noqa: E731
+    assert encode(rendered) == want
+    marker = encode("=== FILE: a.py ===\n")
+    assert 5 not in marker and 6 not in marker
+    assert not {5, 6} & set(encode(rendered))
+
+
 # ---- model card -------------------------------------------------------------------------
 
 def test_release_name_of_the_full_config_is_1B_A149M():

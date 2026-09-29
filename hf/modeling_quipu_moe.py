@@ -329,7 +329,7 @@ def load(repo_or_dir: str = "AneekC/quipu-moe-1B-A149M", weights: str = "model.s
 
 class Tokenizer:
     """tokenizer.json via the `tokenizers` package. encode() treats special-token
-    strings in the text as text; encode_chat() parses them."""
+    strings in the text as text; encode_with_special() parses them."""
 
     def __init__(self, path: str) -> None:
         from tokenizers import Tokenizer as HFTokenizer
@@ -400,7 +400,16 @@ def generate(model: QuipuMoE, tok: Tokenizer, prompt: str, max_new_tokens: int =
 
 def chat(model: QuipuMoE, tok: Tokenizer, messages: list[dict], max_new_tokens: int = 200,
          temperature: float = 0.0, top_k: int = 50, seed: int | None = None) -> str:
-    """The assistant's reply to a conversation (chat model), up to <|end|>."""
-    ids = tok.encode_with_special(render_chat(messages))
+    """The assistant's reply to a conversation (chat model), up to <|end|>.
+
+    Built turn by turn, as the fine-tune encoded it: role token + encode(content) +
+    <|end|>, then an open <|assistant|>. Content is plain text, never parsed for
+    special tokens, so "=== FILE: " and "=== END FILE ===" in it stay text."""
+    ids: list[int] = []
+    for m in messages:
+        ids.append(tok.special_id(f"<|{m['role']}|>"))
+        ids += tok.encode(m["content"]) if m["content"] else []
+        ids.append(tok.special_id("<|end|>"))
+    ids.append(tok.special_id("<|assistant|>"))
     return tok.decode(_continue(model, ids, max_new_tokens, temperature, top_k, seed,
                                 {tok.special_id("<|end|>"), tok.eot}))

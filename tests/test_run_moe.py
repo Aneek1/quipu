@@ -4,7 +4,6 @@ the CPU with a fake clock and a fake trainer (no torch model is built), except o
 test that drives a real child process through SIGINT / CTRL_BREAK."""
 from __future__ import annotations
 
-import dataclasses
 import importlib.util
 import json
 import os
@@ -240,9 +239,7 @@ def test_dump_toml_round_trips_the_resolved_config(tmp_path):
     assert tomllib.loads(text) == raw
     path = tmp_path / "run.toml"
     path.write_text(text, encoding="utf-8")
-    # the same config; only `layers` (which files it was read from) differs
-    assert dataclasses.replace(load_config(path), layers=()) == dataclasses.replace(
-        load_config(MOE), layers=())
+    assert load_config(path) == load_config(MOE)
 
 
 def test_winners_and_overrides_are_merged_and_launcher_keys_refused(tmp_path):

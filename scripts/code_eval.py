@@ -82,6 +82,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from quipu import chat as chat_format  # noqa: E402
 from quipu import model_card  # noqa: E402
 from quipu.eval import loop_dispatch  # noqa: E402
 from quipu.fsio import write_text_atomic  # noqa: E402
@@ -303,11 +304,6 @@ def build_program(task: Task, completion: str, chat: bool) -> str:
     return task.setup + code + "\n\n" + task.test
 
 
-def render_chat(user: str) -> str:
-    """Spec 13's chat format for one user turn, ready for the assistant's reply."""
-    return f"<|user|>{user}<|end|><|assistant|>"
-
-
 def protocol(chat: bool, samples: int, *, temperature: float = TEMPERATURE,
              top_p: float = TOP_P, max_new_tokens: int = MAX_NEW_TOKENS,
              timeout: float = TIMEOUT_S) -> dict[str, Any]:
@@ -518,7 +514,10 @@ def evaluate(model, tok, tasks: Sequence[Task], *, chat: bool = False, samples: 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         for i, task in enumerate(tasks):
             if chat:
-                ids = tok.encode_with_special(render_chat(task.instruction))
+                # Spec 13: the instruction is plain text (quipu.chat), so a FILE
+                # marker in it stays text, as in the SFT data.
+                ids = chat_format.encode(tok, [{"role": "user", "content": task.instruction}],
+                                         add_generation_prompt=True)[0]
             else:
                 ids = tok.encode(task.prompt)
             stops = () if chat else task.stop
@@ -624,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
             else Path(args.checkpoint))
     model = evalsets.load_model(cfg.model, path, device)
     tok = make_tokenizer(cfg.data.tokenizer)
-    if args.chat and not hasattr(tok, "encode_with_special"):
+    if args.chat and not hasattr(tok, "special_id"):
         print("error: --chat needs the BPE tokenizer with chat tokens", file=sys.stderr)
         return 2
     name = args.model_name or default_model_name(cfg, args.chat)

@@ -175,21 +175,29 @@ def tokenizer_files(out: Path, tokenizer_path: Path, context: int, chat: bool) -
     from quipu.bpe import SPECIAL_TOKENS, BPETokenizer
 
     tok = BPETokenizer(tokenizer_path)
-    shutil.copy2(tokenizer_path, out / "tokenizer.json")
+    # The FILE markers ("=== FILE: ", "=== END FILE ===", ids 5 and 6) are plain text
+    # everywhere (quipu.chat): drop them from added_tokens so an HF tokenizer never
+    # matches them in text. They stay in model.vocab, so ids and vocab size are unchanged.
+    markers = set(SPECIAL_TOKENS[5:])
+    spec = json.loads(Path(tokenizer_path).read_text(encoding="utf-8"))
+    spec["added_tokens"] = [t for t in spec.get("added_tokens", [])
+                            if t["content"] not in markers]
+    (out / "tokenizer.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    chat_specials = list(SPECIAL_TOKENS[1:5])          # system, user, assistant, end
     eos = "<|end|>" if chat else "<|endoftext|>"
     tcfg = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "model_max_length": context,
         "bos_token": None, "eos_token": eos, "pad_token": "<|endoftext|>", "unk_token": None,
         "clean_up_tokenization_spaces": False,
-        "additional_special_tokens": list(SPECIAL_TOKENS[1:]),
+        "additional_special_tokens": chat_specials,
     }
     if chat:
         tcfg["chat_template"] = CHAT_TEMPLATE
     (out / "tokenizer_config.json").write_text(json.dumps(tcfg, indent=2) + "\n", encoding="utf-8")
     (out / "special_tokens_map.json").write_text(json.dumps(
         {"eos_token": eos, "pad_token": "<|endoftext|>",
-         "additional_special_tokens": list(SPECIAL_TOKENS[1:])}, indent=2) + "\n", encoding="utf-8")
+         "additional_special_tokens": chat_specials}, indent=2) + "\n", encoding="utf-8")
     stop = [tok.special_id("<|end|>"), tok.eot] if chat else [tok.eot]
     (out / "generation_config.json").write_text(json.dumps(
         {"eos_token_id": stop if chat else stop[0], "pad_token_id": tok.eot,

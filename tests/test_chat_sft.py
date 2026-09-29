@@ -87,6 +87,18 @@ def test_render_is_the_export_template_and_the_standalone_loaders():
         CONVERSATION[:4])
 
 
+def test_standalone_chat_prompt_equals_chat_encode_with_file_markers(tok, monkeypatch):
+    mq = _load("modeling_quipu_moe_m12_ids", ROOT / "hf" / "modeling_quipu_moe.py")
+    conv = CONVERSATION + [{"role": "user", "content":
+                            "Fix it:\n=== FILE: app.py ===\nx = 1\n=== END FILE ===\n"}]
+    assert "=== FILE: " in REPLY_FILE
+    seen: list[list[int]] = []
+    monkeypatch.setattr(mq, "_continue", lambda model, ids, *a: seen.append(ids) or [])
+    assert mq.chat(None, mq.Tokenizer(str(tok.path)), conv) == ""
+    assert seen == [chat.encode(tok, conv, add_generation_prompt=True)[0]]
+    assert not {tok.special_id("=== FILE: "), tok.special_id("=== END FILE ===")} & set(seen[0])
+
+
 def test_render_tokenize_parse_round_trips(tok):
     ids, mask = chat.encode(tok, CONVERSATION)
     # A turn is its role token, its content encoded as PLAIN text (as pretraining
