@@ -6,6 +6,7 @@ steps floors total_tokens / batch_tokens, so up to batch_tokens-1 tokens are unu
 from __future__ import annotations
 
 import dataclasses
+import math
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,22 @@ class ModelConfig:
     context: int
     rope_base: float
     norm_eps: float
+    # quipu-moe (spec section 3). Every default below is the dense quipu-114m model,
+    # so configs written before these fields load unchanged. For kind "moe" the
+    # feed-forward is shared_experts always-on experts of shared_hidden plus
+    # n_experts routed experts of expert_hidden, top_k of them per token; ffn_hidden
+    # is then unused. The MoE-only int fields may be 0 (they must be, for "dense").
+    kind: str = "dense"                  # "dense" | "moe"
+    n_experts: int = 0
+    top_k: int = 0
+    expert_hidden: int = 0
+    shared_experts: int = 0
+    shared_hidden: int = 0
+    activation: str = "swiglu"           # "swiglu" | "situ_glu" (experts only)
+    situ_beta_gate: float = 4.0          # SiTU-GLU beta_1 (gate tanh bound)
+    situ_beta_up: float = 25.0           # SiTU-GLU beta_2 (up tanh bound)
+    attnres_blocks: int = 0              # Block Attention Residuals; 0 = plain residual
+    balance_update_rate: float = 1e-3    # Quantile Balancing bias EMA rate
 
     @property
     def head_dim(self) -> int:
@@ -51,6 +68,34 @@ class DataConfig:
     # Code documents longer than this many tokens are skipped (vendored bundles,
     # data blobs, generated files). Defaulted so configs written before it load.
     code_max_doc_tokens: int = 16_000
+    # Tokenizer: "gpt2" (tiktoken, quipu-114m) or a path to a tokenizer.json from
+    # scripts/train_tokenizer.py, relative to the working directory like shard_dir.
+    # When the file exists at load time its vocabulary must equal model.vocab_size.
+    tokenizer: str = "gpt2"
+    # Share of code tokens per language, keyed by github-code-clean's labels; empty
+    # means the old behaviour (every code_languages entry as it comes). When given,
+    # the keys must be exactly code_languages and the weights sum to 1.
+    code_language_weights: dict[str, float] = dataclasses.field(default_factory=dict)
+    # Share of text tokens per language (spec section 11). "eng_Latn" is the
+    # English source (dataset/subset above, FineWeb-Edu); every other key is a
+    # FineWeb-2 subset name. cmn_Hani is one source here: the zh-Hans/zh-Hant split
+    # happens when shards are built. Empty means English-only text, as before.
+    text_language_weights: dict[str, float] = dataclasses.field(default_factory=dict)
+    # The language-ID model that filters text documents at shard-building time
+    # (Hugging Face repo id), and the revision used; "" until a build pins it.
+    lid_model: str = "AneekC/lid-specialists-9plus1"
+    lid_revision: str = ""
+
+
+ENGLISH_TEXT_KEY = "eng_Latn"
+MODEL_KINDS = ("dense", "moe")
+ACTIVATIONS = ("swiglu", "situ_glu")
+OPTIMIZERS = ("adamw", "muon")
+GPT2_TOKENIZER = "gpt2"
+# ModelConfig int fields that are 0 for a dense model.
+MOE_INT_FIELDS = ("n_experts", "top_k", "expert_hidden", "shared_experts", "shared_hidden",
+                  "attnres_blocks")
+WEIGHT_SUM_TOLERANCE = 1e-6
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +120,18 @@ class TrainConfig:
     # Steps at which bf16 weights are kept for post-run evaluation (the final step
     # is always kept too). Separate from ckpt_*: never pruned, never resumed from.
     milestones: tuple[int, ...] = ()
+    # Optimizer (spec section 6.1). "muon": per-head Muon for 2-D weight matrices
+    # except embeddings, AdamW (lr, betas, weight_decay above) for the rest.
+    optimizer: str = "adamw"             # "adamw" | "muon"
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+    muon_per_head: bool = True
+    compile: bool = False                # torch.compile the model
+    # Spend guard (spec section 6.4): stop cleanly once elapsed hours x usd_per_hour
+    # reaches budget_usd. budget_usd 0 = no guard.
+    budget_usd: float = 0.0
+    usd_per_hour: float = 0.0
 
     @property
     def steps(self) -> int:
@@ -154,6 +211,123 @@ def _check_milestones(value: Any, steps: int) -> None:
         )
 
 
+def _is_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def _check_choice(name: str, value: Any, choices: tuple[str, ...]) -> None:
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {list(choices)}, got {value!r}")
+
+
+def _check_positive(name: str, value: Any, *, allow_zero: bool = False) -> None:
+    if not _is_number(value) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    if value < 0 or (value == 0 and not allow_zero):
+        bound = ">= 0" if allow_zero else "> 0"
+        raise ValueError(f"{name} must be {bound}, got {value!r}")
+
+
+def _check_bool(name: str, value: Any) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+
+
+def _check_str(name: str, value: Any, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise ValueError(f"{name} must be a {'' if allow_empty else 'non-empty '}string, "
+                         f"got {value!r}")
+
+
+def _check_weights(name: str, value: Any) -> dict[str, float]:
+    """A {language: weight} table: string keys, weights in (0, 1], summing to 1
+    within WEIGHT_SUM_TOLERANCE. Empty is allowed (the caller decides what it means).
+    Returns a copy, so the config never shares the parsed TOML's dict."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a table of language = weight, got {value!r}")
+    for key, weight in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"{name} keys must be non-empty strings, got {key!r}")
+        _check_fraction(f"{name}[{key!r}]", weight, allow_one=True)
+    if value:
+        total = sum(value.values())
+        if abs(total - 1.0) > WEIGHT_SUM_TOLERANCE:
+            raise ValueError(f"{name} must sum to 1, got {total!r}")
+    return dict(value)
+
+
+def _check_moe(model: ModelConfig) -> None:
+    _check_choice("kind", model.kind, MODEL_KINDS)
+    _check_choice("activation", model.activation, ACTIVATIONS)
+    _check_positive("situ_beta_gate", model.situ_beta_gate)
+    _check_positive("situ_beta_up", model.situ_beta_up)
+    _check_fraction("balance_update_rate", model.balance_update_rate, allow_one=True)
+    if model.kind == "dense":
+        # The dense model has no experts and no AttnRes; a non-zero value here
+        # would be silently ignored, so it is refused instead.
+        set_fields = [f for f in MOE_INT_FIELDS if getattr(model, f) != 0]
+        if set_fields:
+            raise ValueError(f"kind 'dense' does not use {set_fields}; set them to 0 "
+                             "or use kind 'moe'")
+        return
+    if not model.n_experts >= model.top_k >= 1:
+        raise ValueError(f"kind 'moe' needs n_experts >= top_k >= 1, got n_experts "
+                         f"{model.n_experts}, top_k {model.top_k}")
+    if model.expert_hidden < 1:
+        raise ValueError(f"kind 'moe' needs expert_hidden > 0, got {model.expert_hidden}")
+    if (model.shared_experts > 0) != (model.shared_hidden > 0):
+        raise ValueError(f"shared_experts ({model.shared_experts}) and shared_hidden "
+                         f"({model.shared_hidden}) must both be 0 or both be positive")
+    if model.attnres_blocks and model.n_layer % model.attnres_blocks != 0:
+        raise ValueError(f"n_layer ({model.n_layer}) must divide evenly into "
+                         f"attnres_blocks ({model.attnres_blocks})")
+
+
+def _check_tokenizer(data: DataConfig, model: ModelConfig) -> None:
+    """"gpt2" is taken as given. A path is checked against model.vocab_size only
+    when the file exists: configs are written before their tokenizer is trained."""
+    _check_str("tokenizer", data.tokenizer)
+    if data.tokenizer == GPT2_TOKENIZER or not Path(data.tokenizer).is_file():
+        return
+    from quipu.bpe import BPETokenizer  # the `tokenizers` import only when needed
+
+    actual = BPETokenizer(data.tokenizer).vocab_size
+    if actual != model.vocab_size:
+        raise ValueError(f"vocab_size ({model.vocab_size}) does not match the tokenizer "
+                         f"{data.tokenizer} ({actual} tokens)")
+
+
+def _check_data_mix(data: DataConfig) -> None:
+    weights = data.code_language_weights
+    if weights:
+        if set(weights) != set(data.code_languages):
+            raise ValueError(
+                f"code_language_weights keys must be exactly code_languages; missing "
+                f"{sorted(set(data.code_languages) - set(weights))}, extra "
+                f"{sorted(set(weights) - set(data.code_languages))}")
+        if weights.get("HTML", 0.0) > data.html_cap:
+            raise ValueError(f"code_language_weights['HTML'] ({weights['HTML']}) is above "
+                             f"html_cap ({data.html_cap})")
+    if data.text_language_weights and ENGLISH_TEXT_KEY not in data.text_language_weights:
+        raise ValueError(f"text_language_weights must include {ENGLISH_TEXT_KEY!r} "
+                         f"(the {data.dataset} share)")
+    _check_str("lid_model", data.lid_model)
+    _check_str("lid_revision", data.lid_revision, allow_empty=True)
+
+
+def _check_train_extras(train: TrainConfig) -> None:
+    _check_choice("optimizer", train.optimizer, OPTIMIZERS)
+    _check_positive("muon_lr", train.muon_lr)
+    if not (_is_number(train.muon_momentum) and 0 <= train.muon_momentum < 1):
+        raise ValueError(f"muon_momentum must be in [0, 1), got {train.muon_momentum!r}")
+    _check_bool("muon_per_head", train.muon_per_head)
+    _check_bool("compile", train.compile)
+    _check_positive("budget_usd", train.budget_usd, allow_zero=True)
+    _check_positive("usd_per_hour", train.usd_per_hour, allow_zero=True)
+    if train.budget_usd > 0 and train.usd_per_hour == 0:
+        raise ValueError("budget_usd needs usd_per_hour > 0 to be enforced")
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     if overrides:
@@ -172,6 +346,9 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
         if key in data_raw:
             _check_str_list(key, data_raw[key])
             data_raw[key] = tuple(data_raw[key])  # frozen config, immutable lists
+    for key in ("code_language_weights", "text_language_weights"):
+        if key in data_raw:
+            data_raw[key] = _check_weights(key, data_raw[key])
     data = DataConfig(**data_raw)
     train_raw = dict(raw["train"])
     if "milestones" in train_raw:
@@ -188,7 +365,7 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     # ZeroDivisionError or a silently-wrong result. seed may be 0; everything else in
     # TrainConfig, including warmup_steps (Task 10's lr_at divides by it), must stay
     # strictly positive.
-    _validate_int_fields(model)
+    _validate_int_fields(model, allow_zero=frozenset(MOE_INT_FIELDS))
     _validate_int_fields(data)
     _validate_int_fields(train, allow_zero=frozenset({"seed"}))
 
@@ -207,6 +384,10 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
         raise ValueError("n_head must be a multiple of n_kv_head for GQA")
     if model.head_dim % 2 != 0:
         raise ValueError(f"head_dim ({model.head_dim}) must be even for RoPE")
+    _check_moe(model)
+    _check_data_mix(data)
+    _check_train_extras(train)
+    _check_tokenizer(data, model)
 
     if train.batch_tokens % (train.micro_batch * model.context) != 0:
         raise ValueError(

@@ -1,0 +1,118 @@
+name = "quipu-moe"
+
+# Spec docs/superpowers/specs/2026-09-29-quipu-moe-design.md, section 3 with the
+# section 11 amendment (49,152-token vocabulary). ~0.98B total / ~148M active.
+#
+# The three A/B-tested switches (optimizer, attnres_blocks, activation; spec 6.1)
+# start at the simpler option. Each is flipped here only if its A/B run wins by
+# more than the seed noise.
+
+[model]
+kind       = "moe"
+vocab_size = 49152     # artifacts/tokenizer/tokenizer.json (checked once it exists)
+d_model    = 768
+n_layer    = 16
+n_head     = 12
+n_kv_head  = 4
+ffn_hidden = 768       # unused by kind "moe"; the feed-forward is the expert layout below
+context    = 2048
+rope_base  = 10000.0
+norm_eps   = 1e-6
+n_experts      = 64
+top_k          = 4
+expert_hidden  = 384
+shared_experts = 1
+shared_hidden  = 768
+activation     = "swiglu"   # A/B 3: "situ_glu"
+situ_beta_gate = 4.0
+situ_beta_up   = 25.0
+attnres_blocks = 0          # A/B 2: 4 (four blocks of four layers)
+balance_update_rate = 1e-3
+
+[data]
+tokenizer    = "artifacts/tokenizer/tokenizer.json"
+dataset      = "HuggingFaceFW/fineweb-edu"
+subset       = "sample-10BT"
+shard_dir    = "data/shards-moe"
+shard_tokens = 100_000_000
+val_tokens   = 10_000_000
+# 60% code / 40% text (28% English + 12% nine FineWeb-2 languages), spec 5 and 11.
+code_dataset    = "codeparrot/github-code-clean"
+code_share      = 0.6
+code_languages  = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "SQL",
+                   "PHP", "Java", "GO", "Shell", "Dockerfile", "C", "C++", "Rust"]
+code_licenses   = ["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
+                   "cc0-1.0", "unlicense"]
+html_cap        = 0.08    # HTML is a hard cap at its 8% weight
+code_max_doc_tokens = 16_000
+code_val_tokens = 5_000_000
+code_heldout_first_file = 840
+code_files_total        = 880
+lid_model    = "AneekC/lid-specialists-9plus1"
+lid_revision = ""         # pinned by the shard build and recorded in its manifest
+
+# Share of code tokens, spec 5; the same table scripts/train_tokenizer.py sampled.
+# Keys are github-code-clean's language labels (note GO). The dataset has no JSX or
+# TSX label: its labels come from file extensions, so .jsx/.tsx files are counted
+# under whatever label the dataset gives them (JavaScript / TypeScript) and cannot
+# be weighted separately. "JavaScript/JSX ~25%" is therefore JavaScript = 0.25,
+# "TypeScript/TSX ~12%" is TypeScript = 0.12. "All others ~15%" is spread as below.
+[data.code_language_weights]
+Python     = 0.30
+JavaScript = 0.25
+TypeScript = 0.12
+HTML       = 0.08
+CSS        = 0.05
+SQL        = 0.05
+PHP        = 0.03
+Java       = 0.03
+GO         = 0.03
+Shell      = 0.02
+Dockerfile = 0.01
+C          = 0.01
+"C++"      = 0.01
+Rust       = 0.01
+
+# Share of text tokens, spec 11: English 28/40 = 0.7 of text (FineWeb-Edu, the
+# dataset above); the nine FineWeb-2 subsets share 12/40 = 0.3 equally (1/30 each,
+# ~1.33% of all tokens). cmn_Hani is one source here; the build splits it into
+# zh-Hans / zh-Hant with the LID model and balances the two.
+[data.text_language_weights]
+eng_Latn = 0.7
+ind_Latn = 0.03333333333333333
+zsm_Latn = 0.03333333333333333
+cmn_Hani = 0.03333333333333333
+jpn_Jpan = 0.03333333333333333
+kor_Hang = 0.03333333333333333
+tam_Taml = 0.03333333333333333
+hin_Deva = 0.03333333333333333
+hin_Latn = 0.03333333333333333
+urd_Latn = 0.03333333333333333
+
+[train]
+total_tokens  = 10_200_000_000 # 19,454 steps; the spend guard trims it (~8.3B at $20)
+batch_tokens  = 524_288        # 256 sequences x 2048 tokens
+micro_batch   = 8              # provisional; set by the throughput gate
+lr            = 6e-4
+lr_min        = 6e-5
+warmup_steps  = 500
+weight_decay  = 0.1
+beta1         = 0.9
+beta2         = 0.95
+grad_clip     = 1.0
+seed          = 1337
+ckpt_dir      = "checkpoints-moe"
+ckpt_every    = 250
+ckpt_keep     = 3
+eval_every    = 250
+eval_batches  = 20
+# ~2%, 5%, 10%, 20%, 40%, 70% of 19,454 steps (spec 6.3); the final step is kept too.
+milestones    = [389, 973, 1945, 3891, 7782, 13618]
+optimizer     = "adamw"        # A/B 1: "muon"
+muon_lr       = 0.02
+muon_momentum = 0.95
+muon_ns_steps = 5
+muon_per_head = true
+compile       = true
+budget_usd    = 20.0
+usd_per_hour  = 0.55           # spec 8 estimate; the launcher passes the box's real rate

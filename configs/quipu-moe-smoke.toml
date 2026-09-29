@@ -1,0 +1,105 @@
+name = "quipu-moe-smoke"
+
+# Tiny quipu-moe for laptop and CPU tests. Unlike the full and A/B configs, every
+# new code path is switched on (SiTU-GLU, Block AttnRes, per-head Muon) so the
+# smoke run exercises them. The tokenizer path does not exist in the repo: tests
+# train a 512-token BPE in tmp_path and override data.tokenizer (and shard_dir /
+# ckpt_dir) to point there; the vocab check runs once the file exists.
+
+[model]
+kind       = "moe"
+vocab_size = 512
+d_model    = 128
+n_layer    = 2
+n_head     = 4
+n_kv_head  = 2
+ffn_hidden = 128       # unused by kind "moe"
+context    = 256
+rope_base  = 10000.0
+norm_eps   = 1e-6
+n_experts      = 8
+top_k          = 2
+expert_hidden  = 64
+shared_experts = 1
+shared_hidden  = 128
+activation     = "situ_glu"
+situ_beta_gate = 4.0
+situ_beta_up   = 25.0
+attnres_blocks = 2
+balance_update_rate = 1e-3
+
+[data]
+tokenizer    = "artifacts/tokenizer-smoke/tokenizer.json"
+dataset      = "HuggingFaceFW/fineweb-edu"
+subset       = "sample-10BT"
+shard_dir    = "data/shards-moe-smoke"
+shard_tokens = 1_000_000
+val_tokens   = 100_000
+code_dataset    = "codeparrot/github-code-clean"
+code_share      = 0.6
+code_languages  = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "SQL",
+                   "PHP", "Java", "GO", "Shell", "Dockerfile", "C", "C++", "Rust"]
+code_licenses   = ["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
+                   "cc0-1.0", "unlicense"]
+html_cap        = 0.08
+code_max_doc_tokens = 16_000
+code_val_tokens = 50_000
+code_heldout_first_file = 840
+code_files_total        = 880
+lid_model    = "AneekC/lid-specialists-9plus1"
+lid_revision = ""
+
+[data.code_language_weights]
+Python     = 0.30
+JavaScript = 0.25
+TypeScript = 0.12
+HTML       = 0.08
+CSS        = 0.05
+SQL        = 0.05
+PHP        = 0.03
+Java       = 0.03
+GO         = 0.03
+Shell      = 0.02
+Dockerfile = 0.01
+C          = 0.01
+"C++"      = 0.01
+Rust       = 0.01
+
+[data.text_language_weights]
+eng_Latn = 0.7
+ind_Latn = 0.03333333333333333
+zsm_Latn = 0.03333333333333333
+cmn_Hani = 0.03333333333333333
+jpn_Jpan = 0.03333333333333333
+kor_Hang = 0.03333333333333333
+tam_Taml = 0.03333333333333333
+hin_Deva = 0.03333333333333333
+hin_Latn = 0.03333333333333333
+urd_Latn = 0.03333333333333333
+
+[train]
+total_tokens  = 2_000_000     # 488 steps
+batch_tokens  = 4096          # 16 sequences x 256 tokens
+micro_batch   = 4
+lr            = 1e-3
+lr_min        = 1e-4
+warmup_steps  = 20
+weight_decay  = 0.1
+beta1         = 0.9
+beta2         = 0.95
+grad_clip     = 1.0
+seed          = 1337
+ckpt_dir      = "checkpoints-moe-smoke"
+ckpt_every    = 100
+ckpt_keep     = 2
+eval_every    = 100
+eval_batches  = 2
+milestones    = [100, 250]
+optimizer     = "muon"
+muon_lr       = 0.02
+muon_momentum = 0.95
+muon_ns_steps = 5
+muon_per_head = true
+compile       = false
+budget_usd    = 0.0           # no spend guard on the laptop
+usd_per_hour  = 0.0

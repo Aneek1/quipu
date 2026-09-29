@@ -1,0 +1,104 @@
+name = "quipu-moe-ab"
+
+# The spec 6.1 scale-down: quipu-moe with 8 layers (same widths and expert layout,
+# ~55M active non-embedding) on 200M tokens. Each A/B arm overrides exactly one
+# setting (optimizer, attnres_blocks or activation) from this baseline.
+
+[model]
+kind       = "moe"
+vocab_size = 49152
+d_model    = 768
+n_layer    = 8
+n_head     = 12
+n_kv_head  = 4
+ffn_hidden = 768       # unused by kind "moe"
+context    = 2048
+rope_base  = 10000.0
+norm_eps   = 1e-6
+n_experts      = 64
+top_k          = 4
+expert_hidden  = 384
+shared_experts = 1
+shared_hidden  = 768
+activation     = "swiglu"   # arm 3: "situ_glu"
+situ_beta_gate = 4.0
+situ_beta_up   = 25.0
+attnres_blocks = 0          # arm 2: 4 (four blocks of two layers)
+balance_update_rate = 1e-3
+
+[data]
+tokenizer    = "artifacts/tokenizer/tokenizer.json"
+dataset      = "HuggingFaceFW/fineweb-edu"
+subset       = "sample-10BT"
+shard_dir    = "data/shards-moe"   # the full run's shards; 200M tokens read from the front
+shard_tokens = 100_000_000
+val_tokens   = 10_000_000
+code_dataset    = "codeparrot/github-code-clean"
+code_share      = 0.6
+code_languages  = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "SQL",
+                   "PHP", "Java", "GO", "Shell", "Dockerfile", "C", "C++", "Rust"]
+code_licenses   = ["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
+                   "cc0-1.0", "unlicense"]
+html_cap        = 0.08
+code_max_doc_tokens = 16_000
+code_val_tokens = 5_000_000
+code_heldout_first_file = 840
+code_files_total        = 880
+lid_model    = "AneekC/lid-specialists-9plus1"
+lid_revision = ""
+
+# Same tables as configs/quipu-moe.toml (see the notes there, including JSX/TSX).
+[data.code_language_weights]
+Python     = 0.30
+JavaScript = 0.25
+TypeScript = 0.12
+HTML       = 0.08
+CSS        = 0.05
+SQL        = 0.05
+PHP        = 0.03
+Java       = 0.03
+GO         = 0.03
+Shell      = 0.02
+Dockerfile = 0.01
+C          = 0.01
+"C++"      = 0.01
+Rust       = 0.01
+
+[data.text_language_weights]
+eng_Latn = 0.7
+ind_Latn = 0.03333333333333333
+zsm_Latn = 0.03333333333333333
+cmn_Hani = 0.03333333333333333
+jpn_Jpan = 0.03333333333333333
+kor_Hang = 0.03333333333333333
+tam_Taml = 0.03333333333333333
+hin_Deva = 0.03333333333333333
+hin_Latn = 0.03333333333333333
+urd_Latn = 0.03333333333333333
+
+[train]
+total_tokens  = 200_000_000   # 381 steps
+batch_tokens  = 524_288
+micro_batch   = 8
+lr            = 6e-4
+lr_min        = 6e-5
+warmup_steps  = 40
+weight_decay  = 0.1
+beta1         = 0.9
+beta2         = 0.95
+grad_clip     = 1.0
+seed          = 1337
+ckpt_dir      = "checkpoints-moe-ab"
+ckpt_every    = 100
+ckpt_keep     = 1
+eval_every    = 50
+eval_batches  = 20
+milestones    = []
+optimizer     = "adamw"       # arm 1: "muon"
+muon_lr       = 0.02
+muon_momentum = 0.95
+muon_ns_steps = 5
+muon_per_head = true
+compile       = true
+budget_usd    = 20.0
+usd_per_hour  = 0.55          # the launcher passes the box's real rate

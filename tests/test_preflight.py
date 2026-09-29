@@ -224,6 +224,19 @@ def test_write_preflight_config_toml_round_trips(tmp_path):
     assert reloaded == cfg
 
 
+def test_write_preflight_config_toml_round_trips_language_weight_tables(tmp_path):
+    # quipu-moe's weight tables are dicts, with keys like "C++" that TOML must quote.
+    from quipu.config import load_config
+
+    cfg = load_config(Path(__file__).resolve().parent.parent / "configs" / "quipu-moe.toml")
+    toml_path = tmp_path / "config.toml"
+    preflight.write_preflight_config_toml(cfg, toml_path)
+
+    reloaded = load_config(toml_path)
+    assert reloaded == cfg
+    assert reloaded.data.code_language_weights["C++"] == 0.01
+
+
 # ---------------------------------------------------------------------------
 # check_milestone_eval_output
 # ---------------------------------------------------------------------------

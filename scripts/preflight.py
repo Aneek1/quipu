@@ -197,6 +197,9 @@ def write_preflight_config_toml(cfg: Config, path: Path) -> None:
             return json.dumps(value)
         if isinstance(value, (list, tuple)):
             return "[" + ", ".join(_lit(v) for v in value) + "]"
+        if isinstance(value, dict):
+            # Inline table with quoted keys ("C++" is not a bare TOML key).
+            return "{" + ", ".join(f"{json.dumps(k)} = {_lit(v)}" for k, v in value.items()) + "}"
         raise TypeError(f"cannot serialise {value!r} to TOML")
 
     lines = [f"name = {_lit(cfg.name)}", ""]
