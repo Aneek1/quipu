@@ -271,11 +271,15 @@ class CodeDocs:
                  licenses: Iterable[str], html_cap: float, max_doc_tokens: int,
                  html_warmup: int = HTML_CAP_WARMUP_TOKENS,
                  exclude: set[int] | frozenset[int] = frozenset(),
-                 record_hashes: bool = False, leak_guard: Any = None) -> None:
+                 record_hashes: bool = False, leak_guard: Any = None,
+                 decontam: Any = None) -> None:
         self._rows = rows
         # Data v2: a stepbuild LeakageGuard; a row copying a benchmark reference file
-        # is dropped (stats "dropped_leakage", not among CODE_STAT_KEYS).
+        # is dropped (stats "dropped_leakage", not among CODE_STAT_KEYS). And a
+        # quipu.decontam.Decontaminator: a row containing a HumanEval / MBPP problem is
+        # dropped (stats "dropped_contamination", "dropped_contamination_as:<name>").
         self._leak_guard = leak_guard
+        self._decontam = decontam
         self._tok = tok
         self.languages = frozenset(languages)
         if "HTML" not in self.languages:
@@ -318,6 +322,12 @@ class CodeDocs:
             if self._leak_guard is not None and self._leak_guard.find_file(code) is not None:
                 stats["dropped_leakage"] += 1
                 continue
+            if self._decontam is not None:
+                hit = self._decontam.find(code)
+                if hit is not None:
+                    stats["dropped_contamination"] += 1
+                    stats[f"dropped_contamination_as:{hit[0]}"] += 1
+                    continue
             ids = encode_document(code, self._tok)
             if ids is None:
                 stats["skipped_blank"] += 1
@@ -691,6 +701,13 @@ def build_all(root: Path, stream: Iterable[dict], *, val_tokens: int, train_toke
 # Held out, as for the tokenizer and its gate: val = the last sample-10BT file
 # (English, the trainer's loss); val_lang/<bucket> = FineWeb-2's test split; code_val
 # = github-code-clean files code_heldout_first_file.. (exact-dedup against train code).
+#
+# Decontamination (quipu/decontam.py): every code document (train and code_val) and
+# every validation text document (val, val_lang) that contains a HumanEval or MBPP
+# problem (whitespace-collapsed substring of >= 60 chars, or >= 50% of a solution's
+# 13-grams) is dropped, in the workers, before tokenisation. The benchmarks are read
+# at the config's pinned commits; the index's fingerprint is part of the resume
+# fingerprint, and the manifest's "decontamination" counts the drops per benchmark.
 
 TEXT_PREFIX = "text:"
 MIX_WORK = "_work"
@@ -963,27 +980,35 @@ def text_buckets(language: str, lid: bool) -> dict[str, float]:
 def _collect_text(runner: sm.Runner, rows: Iterable[dict], language: str, total: float,
                   store: sm.BucketStore, spec: MixSpec, *, lid: bool, slack: float,
                   stats: Counter | None = None,
-                  on_mark: Callable[[dict], None] | None = None
-                  ) -> tuple[sm.Collector, Counter]:
+                  on_mark: Callable[[dict], None] | None = None,
+                  check_text: bool = False) -> tuple[sm.Collector, Counter]:
+    """check_text: drop documents containing a benchmark problem (validation splits)."""
     stats = Counter() if stats is None else stats
     col = sm.Collector(text_buckets(language, lid), total, slack=slack, window=spec.window,
                        stall_windows=spec.stall_windows, stall_gain=spec.stall_gain,
                        store=store)
-    runner.collect(text_offers(rows, language), col, stats, on_mark=on_mark)
+    runner.collect(text_offers(rows, language), col, stats, on_mark=on_mark,
+                   check_text=check_text)
     return col, stats
 
 
 def _plain(stats: Counter) -> dict[str, Any]:
-    """A stats Counter as manifest JSON: "lid_dropped_as:<label>" keys nested."""
+    """A stats Counter as manifest JSON: "<name>:<sub>" keys nested (lid_dropped_as,
+    dropped_contamination_as)."""
     out: dict[str, Any] = {}
     for k in sorted(stats):
         if k == "last_file":
             continue
-        if k.startswith("lid_dropped_as:"):
-            out.setdefault("lid_dropped_as", {})[k.split(":", 1)[1]] = stats[k]
+        if ":" in k:
+            name, sub = k.split(":", 1)
+            out.setdefault(name, {})[sub] = stats[k]
         else:
             out[k] = stats[k]
     return out
+
+
+def _dropped_by_benchmark(stats: Any, benchmarks: Iterable[str]) -> dict[str, int]:
+    return {b: int(stats.get(f"dropped_contamination_as:{b}", 0)) for b in benchmarks}
 
 
 def _text_summary(col: sm.Collector, stats: Counter) -> dict[str, Any]:
@@ -1075,6 +1100,7 @@ def mix_fingerprint(spec: MixSpec, setup: sm.DocSetup,
             "max_chars": getattr(lid, "max_chars", sm.LID_MAX_CHARS),
             "model_sha256": (prov.get("lid") or {}).get("sha256")},
         "leakage_guard_files": getattr(setup.guard, "reference_files", None),
+        "decontamination": None if setup.decontam is None else setup.decontam.fingerprint(),
         "datasets": prov.get("sources"),
     }
     mix = {"train_tokens": spec.train_tokens, "code_share": spec.code_share,
@@ -1219,7 +1245,8 @@ def _val_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Path
     else:
         store.restore({})
         col, stats = _collect_text(runner, sources.text_val[sm.ENGLISH](), sm.ENGLISH,
-                                   spec.val_tokens, store, spec, lid=lid, slack=0.0)
+                                   spec.val_tokens, store, spec, lid=lid, slack=0.0,
+                                   check_text=True)
         state.set_phase("val", {"done": True, "store": store.snapshot(),
                                 "collector": col.snapshot(), "stats": stats})
     store.close()
@@ -1570,7 +1597,7 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
         cv_docs = CodeDocs(cv_rows, runner.tok, languages=tuple(cw),
                            licenses=spec.licenses, html_cap=spec.html_cap,
                            max_doc_tokens=spec.max_doc_tokens, exclude=hashes,
-                           leak_guard=setup.guard)
+                           leak_guard=setup.guard, decontam=setup.decontam)
         try:
             cv = write_split(root / "code_val", spec.code_val_tokens, spec.shard_tokens,
                              cv_docs, allow_short=True)
@@ -1591,7 +1618,7 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
             n = len(text_buckets(x, lid))
             lv_cols[x] = _collect_text(runner, sources.text_val[x](), x,
                                        spec.lang_val_tokens * n, lv_store, spec, lid=lid,
-                                       slack=0.0)
+                                       slack=0.0, check_text=True)
         lv_store.close()
         val_lang = {}
         for x in others:
@@ -1645,6 +1672,7 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
                     "dropped_train": code_stats.get("dropped_leakage", 0),
                     "dropped_code_val": code_val["dropped_leakage"]}
         if setup.guard is not None else None,
+        "dropped_contamination": code_stats.get("dropped_contamination", 0),
         "dedup": "code_val: exact content (blake2b-8) against every collected train "
                  "code document; near-duplicates remain",
         "dropped_as_duplicate": code_val["dropped_as_duplicate"],
@@ -1680,6 +1708,22 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
                             for x, s in collection["text"].items()},
             "warnings": lid_warnings,
         }
+    decontam_info = None
+    if setup.decontam is not None:
+        benches = setup.decontam.benchmarks
+        lv_stats: Counter = Counter()
+        for _, s in lv_cols.values():
+            lv_stats.update(s)
+        decontam_info = {
+            "index": setup.decontam.summary(),
+            "benchmarks": provenance.get("decontamination"),
+            "applied_to": "every code document (train and code_val) and the validation "
+                          "text (val, val_lang); not the train text",
+            "dropped": {"train_code": _dropped_by_benchmark(code_stats, benches),
+                        "code_val": _dropped_by_benchmark(cv_docs.stats, benches),
+                        "val": _dropped_by_benchmark(val_stats, benches),
+                        "val_lang": _dropped_by_benchmark(lv_stats, benches)},
+        }
     manifest: dict[str, Any] = {
         "format": "data v2 (scripts/build_shards.py build_mix)",
         "tokenizer": provenance.get("tokenizer"),
@@ -1687,6 +1731,7 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
         "dtype": "uint16 little-endian",
         "sources": provenance.get("sources", {}),
         "lid": lid_info,
+        "decontamination": decontam_info,
         "splits": {"val": val, "train": train, "code_val": code_val, "val_lang": val_lang},
         # The trainer's data (val + train); code_val and val_lang are for evaluation.
         "total_tokens": val["tokens"] + train["tokens"],
@@ -2211,8 +2256,21 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
                          f"the config says {d.dataset} {d.subset}")
     others = [x for x in tw if x != sm.ENGLISH]
     guard = LeakageGuard()
+    # HumanEval and MBPP (~0.2 MB), pinned: no code document or validation split may
+    # contain one of their problems (quipu/decontam.py).
+    from quipu import decontam as dc
+
+    bench_revs = {
+        dc.HUMANEVAL: _pinned(d.humaneval_revision,
+                              lambda: api.dataset_info(dc.HUMANEVAL_DATASET).sha,
+                              "humaneval_revision"),
+        dc.MBPP: _pinned(d.mbpp_revision, lambda: api.dataset_info(dc.MBPP_DATASET).sha,
+                         "mbpp_revision")}
+    decontam, bench_info = dc.load_benchmarks(bench_revs, hf_hub_download)
+    print(f"decontamination: {decontam.summary()['problems']} problems", flush=True)
     setup = sm.DocSetup(tokenizer=tok_factory, max_doc_tokens=d.code_max_doc_tokens,
-                        guard=guard, lid=lid, lid_threshold=args.lid_threshold)
+                        guard=guard, lid=lid, lid_threshold=args.lid_threshold,
+                        decontam=decontam)
 
     # Every dataset pinned to one commit (the config's), so every read agrees.
     fs = HfFileSystem()
@@ -2273,6 +2331,7 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
     provenance = {
         "tokenizer": tokenizer,
         "lid": lid_info,
+        "decontamination": bench_info,
         "sources": {
             "code": {"dataset": d.code_dataset, "revision": code_rev,
                      "files_total": d.code_files_total, "train_files": [0, max_files - 1],

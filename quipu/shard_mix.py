@@ -80,6 +80,7 @@ DEFERRED = "deferred"      # its bucket was full at submission: not tokenised (y
 BLANK = "blank"
 TOO_LONG = "too_long"
 LEAK = "leak"
+CONTAM = "contaminated"    # contains a benchmark problem (quipu.decontam)
 LID_DROP = "lid_drop"
 
 MARK = "mark"  # Offer.kind of a source's end-of-file marker (no document)
@@ -554,6 +555,7 @@ class Result(NamedTuple):
     label: str | None = None
     prob: float | None = None
     unsure: bool = False  # LID labelled it another language but below the threshold
+    detail: str | None = None  # CONTAM: the benchmark it contains
 
 
 def normalise_for_lid(text: str, max_chars: int = LID_MAX_CHARS) -> str:
@@ -631,22 +633,30 @@ class FastTextLid:
 class DocSetup:
     """What a worker needs, picklable: a zero-argument tokenizer factory (a module-level
     function or class, or functools.partial of one), the code length limit, and the
-    optional leakage guard (find_file) and language-ID classifier (predict)."""
+    optional leakage guard (find_file), benchmark decontaminator (find, e.g.
+    quipu.decontam.Decontaminator) and language-ID classifier (predict)."""
     tokenizer: Callable[[], Any]
     max_doc_tokens: int
     guard: Any = None
     lid: Any = None
     lid_threshold: float = DEFAULT_LID_THRESHOLD
+    decontam: Any = None
 
 
 def process_doc(kind: str, source: str, text: str, skip: frozenset[str], setup: DocSetup,
-                tok: Any) -> Result:
-    """Classify and tokenise one document (in a worker or, as fallback, in main)."""
+                tok: Any, check_text: bool = False) -> Result:
+    """Classify and tokenise one document (in a worker or, as fallback, in main).
+    Code is always checked against setup.decontam; text only when check_text (the
+    validation splits)."""
     if kind == CODE:
         if source in skip:
             return Result(source, DEFERRED, None)
         if setup.guard is not None and setup.guard.find_file(text) is not None:
             return Result(source, LEAK, None)
+        if setup.decontam is not None:
+            hit = setup.decontam.find(text)
+            if hit is not None:
+                return Result(source, CONTAM, None, detail=hit[0])
         ids = encode_document(text, tok)
         if ids is None:
             return Result(source, BLANK, None)
@@ -664,6 +674,10 @@ def process_doc(kind: str, source: str, text: str, skip: frozenset[str], setup: 
         unsure = not lid_accepts(source, label)
     if bucket in skip:
         return Result(bucket, DEFERRED, None, label, prob, unsure)
+    if check_text and setup.decontam is not None:
+        hit = setup.decontam.find(text)
+        if hit is not None:
+            return Result(bucket, CONTAM, None, label, prob, unsure, hit[0])
     ids = encode_document(text, tok)
     if ids is None:
         return Result(bucket, BLANK, None, label, prob, unsure)
@@ -688,11 +702,13 @@ def _ping() -> bool:
     return True
 
 
-def _run_job(job: tuple[int, list[tuple[str, str, str]], frozenset[str]]
-             ) -> tuple[int, list[Result]]:
-    seq, docs, skip = job
+Job = tuple[int, list[tuple[str, str, str]], frozenset[str], bool]
+
+
+def _run_job(job: Job) -> tuple[int, list[Result]]:
+    seq, docs, skip, check_text = job
     setup, tok = _WORKER["setup"], _WORKER["tok"]
-    return seq, [process_doc(k, s, t, skip, setup, tok) for k, s, t in docs]
+    return seq, [process_doc(k, s, t, skip, setup, tok, check_text) for k, s, t in docs]
 
 
 WORKER_DIED = ("a tokenising worker process died or failed to start (killed for memory? "
@@ -796,20 +812,23 @@ class Runner:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
-    def _local(self, job: tuple[int, list[tuple[str, str, str]], frozenset[str]]
-               ) -> tuple[int, list[Result]]:
-        seq, docs, skip = job
-        return seq, [process_doc(k, s, t, skip, self.setup, self.tok) for k, s, t in docs]
+    def _local(self, job: Job) -> tuple[int, list[Result]]:
+        seq, docs, skip, check_text = job
+        return seq, [process_doc(k, s, t, skip, self.setup, self.tok, check_text)
+                     for k, s, t in docs]
 
     def collect(self, offers: Iterable[Offer], collector: Collector, stats: Counter, *,
                 on_admit: Callable[[Offer, Result], None] | None = None,
-                on_mark: Callable[[dict], None] | None = None) -> None:
+                on_mark: Callable[[dict], None] | None = None,
+                check_text: bool = False) -> None:
         """Offer documents in order until collector.done or offers run out.
 
         Decision order per document (fixed, so the counts are deterministic too):
         text: dropped by LID; then over quota; code: over quota; then (both) leak,
-        too long, admitted. stats counts: offers, admitted, skipped_quota, lid_dropped,
-        lid_kept_unsure, dropped_leakage, skipped_too_long, skipped_blank. A MARK
+        benchmark contamination (code always, text with check_text), too long,
+        admitted. stats counts: offers, admitted, skipped_quota, lid_dropped,
+        lid_kept_unsure, dropped_leakage, dropped_contamination (and
+        dropped_contamination_as:<benchmark>), skipped_too_long, skipped_blank. A MARK
         offer adds its meta["counts"] to stats and calls on_mark(meta), in the same
         order. The offers iterator is closed when collection ends (a generator's
         read-ahead threads and downloads stop with it).
@@ -818,7 +837,7 @@ class Runner:
         try:
             if collector.done:
                 return
-            self._collect(offers_it, collector, stats, on_admit, on_mark)
+            self._collect(offers_it, collector, stats, on_admit, on_mark, check_text)
         finally:
             close = getattr(offers_it, "close", None)
             if close is not None:
@@ -826,18 +845,19 @@ class Runner:
 
     def _collect(self, offers: Iterator[Offer], collector: Collector, stats: Counter,
                  on_admit: Callable[[Offer, Result], None] | None,
-                 on_mark: Callable[[dict], None] | None) -> None:
+                 on_mark: Callable[[dict], None] | None, check_text: bool) -> None:
         pending: dict[int, tuple[list[Offer], frozenset[str]]] = {}
 
         def sent(o: Offer, skip: frozenset[str]) -> bool:
             # Code of a full language is not even sent; text goes out for its LID label.
             return o.kind != MARK and not (o.kind == CODE and o.source in skip)
 
-        def jobs() -> Iterator[tuple[int, list[tuple[str, str, str]], frozenset[str]]]:
+        def jobs() -> Iterator[Job]:
             for seq, batch in enumerate(batched(offers, self.batch_docs)):
                 skip = collector.full()
                 pending[seq] = (batch, skip)
-                yield seq, [(o.kind, o.source, o.text) for o in batch if sent(o, skip)], skip
+                yield (seq, [(o.kind, o.source, o.text) for o in batch if sent(o, skip)], skip,
+                       check_text)
 
         fn = _run_job if self.pool is not None else self._local
         results_it = ordered_map(fn, jobs(), self.pool, self.ahead)
@@ -855,14 +875,15 @@ class Runner:
                         res = Result(offer.source, DEFERRED, None)
                     else:
                         res = next(it)
-                    self._decide(offer, res, collector, stats, on_admit)
+                    self._decide(offer, res, collector, stats, on_admit, check_text)
                     if collector.done:
                         return
         finally:
             results_it.close()
 
     def _decide(self, offer: Offer, res: Result, collector: Collector, stats: Counter,
-                on_admit: Callable[[Offer, Result], None] | None) -> None:
+                on_admit: Callable[[Offer, Result], None] | None,
+                check_text: bool = False) -> None:
         stats["offers"] += 1
         if isinstance(offer.meta, dict):  # the source's filter counts leading up to it
             stats.update(offer.meta.get("counts") or {})
@@ -881,9 +902,13 @@ class Runner:
                 return
             if res.status == DEFERRED:  # wanted after all: tokenise it here
                 res = process_doc(offer.kind, offer.source, offer.text, frozenset(),
-                                  self.setup, self.tok)
+                                  self.setup, self.tok, check_text)
             if res.status == LEAK:
                 stats["dropped_leakage"] += 1
+                return
+            if res.status == CONTAM:
+                stats["dropped_contamination"] += 1
+                stats[f"dropped_contamination_as:{res.detail}"] += 1
                 return
             if res.status == TOO_LONG:
                 stats["skipped_too_long"] += 1

@@ -98,8 +98,11 @@ Defaults: `--workers` = cores - 1, at most 8; `--download-workers 6` (whole code
 files are downloaded ahead into `data/shards-moe/_work/dl`, each deleted once read);
 `--lid-threshold 0.0` (any language-ID mismatch is dropped).
 
-What it does, in order: loads the tokenizer (its vocabulary must be 49,152) and the
-LID model (so a broken install fails in seconds), the English val split, code (a
+What it does, in order: loads the tokenizer (its vocabulary must be 49,152), the
+LID model (so a broken install fails in seconds) and HumanEval + MBPP at their pinned
+commits (~0.2 MB; any code or validation document containing one of their problems
+is dropped, counted per benchmark under `decontamination` in the manifest), the
+English val split, code (a
 checkpoint after every code file; from the 20th file on it projects the code mix at
 the file cap and stops with an explanation if the projection misses at 5 file ends in
 a row, with 1 pp more room before file 60; the code shares are checked again the

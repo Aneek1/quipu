@@ -98,6 +98,11 @@ class DataConfig:
     code_revision: str = ""
     text_revision: str = ""
     fineweb2_revision: str = ""
+    # Data v2: the benchmark commits the shard build decontaminates against
+    # (quipu/decontam.py: openai/openai_humaneval, google-research-datasets/mbpp
+    # "sanitized"); "" = the Hub's current commit (the build prints a warning).
+    humaneval_revision: str = ""
+    mbpp_revision: str = ""
 
 
 ENGLISH_TEXT_KEY = "eng_Latn"
@@ -359,7 +364,8 @@ def _check_data_mix(data: DataConfig) -> None:
                          f"(the {data.dataset} share)")
     _check_str("lid_model", data.lid_model)
     _check_str("lid_revision", data.lid_revision, allow_empty=True)
-    for name in ("code_revision", "text_revision", "fineweb2_revision"):
+    for name in ("code_revision", "text_revision", "fineweb2_revision", "humaneval_revision",
+                 "mbpp_revision"):
         _check_str(name, getattr(data, name), allow_empty=True)
 
 

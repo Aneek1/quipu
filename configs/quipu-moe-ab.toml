@@ -63,6 +63,10 @@ lid_revision = "117966eb565a5e3c2ee1f1ce7b56848726b56982"  # AneekC/lid-speciali
 code_revision     = "c48d40f9e70f0196f8236901ee35807f7d6c44c0"  # github-code-clean
 text_revision     = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"  # fineweb-edu
 fineweb2_revision = "af9c13333eb981300149d5ca60a8e9d659b276b9"  # fineweb-2
+# Decontamination (quipu/decontam.py): code documents and the validation splits that
+# contain a HumanEval or MBPP problem are dropped; the benchmark commits, pinned.
+humaneval_revision = "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544"  # openai/openai_humaneval (MIT)
+mbpp_revision      = "4bb6404fdc6cacfda99d4ac4205087b89d32030c"  # google-research-datasets/mbpp (CC-BY-4.0)
 
 # Same tables as configs/quipu-moe.toml (see the notes there, including JSX/TSX).
 [data.code_language_weights]

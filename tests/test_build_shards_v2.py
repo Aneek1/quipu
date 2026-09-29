@@ -1475,3 +1475,235 @@ def test_a_build_killed_inside_english_resumes_from_its_next_file(tmp_path, work
     assert log["starts"] == [0, partial["files"]]
     same_output(tmp_path / "ref", tmp_path / "b")
     assert _strip(m) == _strip(ref)
+
+
+# ------------------------------------------------------------------ decontamination
+
+from quipu import decontam as dc  # noqa: E402
+
+HE_PROMPT = '''from typing import List
+
+
+def rolling_window_peaks(readings: List[float], width: int) -> List[float]:
+    """ Return the largest reading in every window of `width` consecutive readings.
+    >>> rolling_window_peaks([1.0, 3.0, 2.0, 5.0], 2)
+    [3.0, 3.0, 5.0]
+    """
+'''
+HE_SOLUTION = '''    peaks_found = []
+    for start_index in range(len(readings) - width + 1):
+        window_slice = readings[start_index:start_index + width]
+        peaks_found.append(max(window_slice))
+    return peaks_found
+'''
+MBPP_TEXT = "Write a function to merge overlapping calendar intervals and count the merged blocks."
+MBPP_CODE = '''def merge_calendar_blocks(intervals):
+    ordered_blocks = sorted(intervals, key=lambda pair: pair[0])
+    merged_blocks = [list(ordered_blocks[0])]
+    for block_start, block_end in ordered_blocks[1:]:
+        if block_start <= merged_blocks[-1][1]:
+            merged_blocks[-1][1] = max(merged_blocks[-1][1], block_end)
+        else:
+            merged_blocks.append([block_start, block_end])
+    return len(merged_blocks), merged_blocks'''
+SHORT_MBPP = "def add_two(a, b):\n    return a + b"
+
+
+def planted_problems():
+    return [dc.Problem(dc.HUMANEVAL, "HumanEval/900", (HE_PROMPT, HE_SOLUTION), HE_SOLUTION),
+            dc.Problem(dc.MBPP, "901", (MBPP_CODE, MBPP_TEXT), MBPP_CODE),
+            dc.Problem(dc.MBPP, "902", (SHORT_MBPP, "Write a function to add two numbers."),
+                       SHORT_MBPP)]
+
+
+def planted_decontam():
+    return dc.Decontaminator(planted_problems(), revisions={dc.HUMANEVAL: "a" * 40,
+                                                            dc.MBPP: "b" * 40})
+
+
+def _respaced(code):
+    """The same code with other whitespace: tabs, trailing spaces, blank lines."""
+    lines = [line.replace("    ", "\t") + "   " for line in code.splitlines()]
+    return "\n\n".join(lines)
+
+
+def test_decontam_drops_a_humaneval_solution_with_other_whitespace():
+    d = planted_decontam()
+    doc = "import os\n\ndef helper():\n    pass\n\n" + _respaced(HE_SOLUTION) + "\n# end\n"
+    assert d.find(doc) == (dc.HUMANEVAL, "HumanEval/900", "substring")
+    assert d.find(HE_PROMPT.replace("\n", "\r\n") + "    pass\n")[:2] == (
+        dc.HUMANEVAL, "HumanEval/900")
+
+
+def test_decontam_drops_a_doc_with_most_of_an_mbpp_solutions_13_grams():
+    d = planted_decontam()
+    toks = dc.tokens(MBPP_CODE)
+    grams = dc.ngrams(toks)
+    lines = MBPP_CODE.splitlines()
+    part = "\n".join(lines[:6])  # about 60% of the solution, not the whole of it
+    got = len(grams & dc.ngrams(dc.tokens(part))) / len(grams)
+    assert 0.5 <= got < 0.8, got
+    assert dc.collapse(MBPP_CODE) not in dc.collapse(part)
+    doc = "# utilities\nimport sys\n" + part + "\n    return None\n\nprint(sys.argv)\n"
+    assert d.find(doc) == (dc.MBPP, "901", "ngrams")
+    # Under half of the 13-grams: kept.
+    few = "\n".join(lines[:3])
+    assert len(grams & dc.ngrams(dc.tokens(few))) / len(grams) < 0.5
+    assert d.find("# utilities\n" + few + "\n    pass\n") is None
+
+
+def test_decontam_keeps_common_short_snippets_and_the_mbpp_text_is_a_needle():
+    d = planted_decontam()
+    assert d.find("def add(a, b):\n    return a + b\n") is None
+    assert d.find(SHORT_MBPP + "\n") is None  # under 60 characters and 13 tokens
+    assert d.find("x = 1\n") is None and d.find("") is None
+    assert d.find(f"# {MBPP_TEXT}\ndef f():\n    pass\n") == (dc.MBPP, "901", "substring")
+
+
+def test_decontam_prefilter_never_misses_a_match():
+    """The anchor prefilter only skips work: with it off every problem is checked,
+    and the answers are the same."""
+    d = planted_decontam()
+    docs = [_respaced(HE_SOLUTION), HE_PROMPT, "\n".join(MBPP_CODE.splitlines()[:6]),
+            "def add(a, b): return a + b", MBPP_CODE[:200], "peaks_found = []"]
+    for doc in docs:
+        assert d.find(doc) == d.find(doc, prefilter=False), doc[:40]
+
+
+def test_decontam_is_picklable_and_fingerprinted():
+    import pickle
+
+    d = planted_decontam()
+    again = pickle.loads(pickle.dumps(d))
+    assert again.fingerprint() == d.fingerprint()
+    assert again.find(HE_SOLUTION) == d.find(HE_SOLUTION)
+    other = dc.Decontaminator(planted_problems()[:2], revisions=d.revisions)
+    assert other.fingerprint() != d.fingerprint()
+    s = d.summary()
+    assert s["problems"] == {dc.HUMANEVAL: 1, dc.MBPP: 2}
+    assert s["revisions"] == {dc.HUMANEVAL: "a" * 40, dc.MBPP: "b" * 40}
+
+
+def test_load_benchmarks_reads_humaneval_and_all_mbpp_sanitized_splits(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    he = [{"task_id": "HumanEval/0", "prompt": HE_PROMPT, "canonical_solution": HE_SOLUTION,
+           "test": "", "entry_point": "rolling_window_peaks"}]
+    calls = []
+
+    def download(repo, filename, **kw):
+        calls.append((repo, filename, kw.get("repo_type"), kw.get("revision")))
+        p = tmp_path / repo.replace("/", "_") / filename
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if repo == dc.HUMANEVAL_DATASET:
+            rows = he
+        else:
+            split = filename.split("/")[1].split("-")[0]
+            rows = [{"source_file": "x", "task_id": 100 + len(split), "prompt": MBPP_TEXT,
+                     "code": MBPP_CODE, "test_imports": [], "test_list": []}]
+        pq.write_table(pa.Table.from_pylist(rows), p)
+        return str(p)
+    d, info = dc.load_benchmarks({dc.HUMANEVAL: "a" * 40, dc.MBPP: "b" * 40}, download)
+    assert d.summary()["problems"] == {dc.HUMANEVAL: 1, dc.MBPP: 4}
+    assert {c[1] for c in calls if c[0] == dc.MBPP_DATASET} == {
+        f"sanitized/{s}-00000-of-00001.parquet" for s in ("prompt", "test", "train",
+                                                          "validation")}
+    assert all(c[2] == "dataset" for c in calls)
+    assert info[dc.HUMANEVAL]["revision"] == "a" * 40 and info[dc.MBPP]["revision"] == "b" * 40
+    assert info[dc.MBPP]["license"] == "CC-BY-4.0" and info[dc.HUMANEVAL]["license"] == "MIT"
+    assert len(info[dc.MBPP]["sha256"]) == 4
+    with pytest.raises(ValueError, match="pinned"):
+        dc.load_benchmarks({dc.HUMANEVAL: "", dc.MBPP: "b" * 40}, download)
+
+
+def _planted_world(extra_val=()):
+    """world() with planted benchmark copies in code train, code val and English val."""
+    src = world(lid=True, code_val_extra=[
+        {"code": "# copied\n" + _respaced(HE_SOLUTION), "language": "Python", "license": "mit",
+         "path": "v/he.py", "file": 900}])
+    rows = code_rows(12_000)
+    planted = [
+        {"code": "import os\n" + _respaced(HE_SOLUTION) + "\n# x\n", "language": "Python",
+         "license": "mit", "path": "a/he.py", "file": 0},
+        {"code": "# utils\n" + "\n".join(MBPP_CODE.splitlines()[:6]) + "\n    return 0\n",
+         "language": "Python", "license": "mit", "path": "a/mbpp.py", "file": 1},
+        {"code": f"// {MBPP_TEXT}\nfunction f() {{ return 1; }}\n", "language": "JavaScript",
+         "license": "mit", "path": "a/m.js", "file": 1},
+        {"code": "def add(a, b):\n    return a + b\n", "language": "Python", "license": "mit",
+         "path": "a/add.py", "file": 1},
+    ]
+    rows[5:5] = planted[:1]
+    rows[600:600] = planted[1:]
+    src = src._replace(code_train=from_file(rows))
+    val = list(src.text_val["eng_Latn"]())
+    val.insert(3, {"text": "@eng_Latn:0.95 A copied answer: " + HE_SOLUTION})
+    src.text_val["eng_Latn"] = lambda: iter(val)
+    return src
+
+
+def test_the_build_drops_planted_benchmark_problems_and_counts_them(tmp_path):
+    s = sm.DocSetup(tokenizer=CharTok, max_doc_tokens=2_000, lid=FakeLid(), lid_threshold=0.5,
+                    decontam=planted_decontam())
+    m = bs.build_mix(tmp_path, spec(), _planted_world(), s)
+    dropped = m["decontamination"]["dropped"]
+    assert dropped["train_code"] == {dc.HUMANEVAL: 1, dc.MBPP: 2}
+    assert dropped["code_val"] == {dc.HUMANEVAL: 1, dc.MBPP: 0}
+    assert dropped["val"] == {dc.HUMANEVAL: 1, dc.MBPP: 0}
+    assert m["decontamination"]["index"]["revisions"] == {dc.HUMANEVAL: "a" * 40,
+                                                          dc.MBPP: "b" * 40}
+    assert m["code"]["stats"]["dropped_contamination"] == 3
+    docs = [d for split in ("train", "code_val", "val") for d in decode_docs(tmp_path / split)]
+    assert not any("peaks_found.append" in d or "merged_blocks" in d or MBPP_TEXT in d
+                   for d in docs)
+    assert any(d.startswith("def add(a, b):") for d in decode_docs(tmp_path / "train"))
+
+
+def test_decontamination_is_the_same_with_1_and_3_workers(tmp_path):
+    def s(workers):
+        return spec(workers=workers, batch_docs=8)
+    su = sm.DocSetup(tokenizer=CharTok, max_doc_tokens=2_000, lid=FakeLid(), lid_threshold=0.5,
+                     decontam=planted_decontam())
+    m1 = bs.build_mix(tmp_path / "w1", s(1), _planted_world(), su)
+    m3 = bs.build_mix(tmp_path / "w3", s(3), _planted_world(), su)
+    same_output(tmp_path / "w1", tmp_path / "w3")
+    strip = ("build_started", "build_finished", "build_seconds", "workers")
+    assert ({k: v for k, v in m1.items() if k not in strip}
+            == {k: v for k, v in m3.items() if k not in strip})
+    assert m1["decontamination"]["dropped"]["train_code"][dc.HUMANEVAL] == 1
+
+
+@pytest.mark.skipif(not TOKENIZER_JSON.is_file(), reason="artifacts/tokenizer/tokenizer.json absent")
+def test_run_mix_loads_the_benchmarks_at_the_pinned_revisions(monkeypatch):
+    import huggingface_hub
+
+    from quipu.config import load_config
+
+    monkeypatch.chdir(ROOT)
+    cfg = load_config(ROOT / "configs" / "quipu-moe.toml")
+    fake_hub(monkeypatch)
+    calls = []
+
+    class Stop(Exception):
+        pass
+
+    def download(repo, filename, **kw):
+        calls.append((repo, filename, kw.get("repo_type"), kw.get("revision")))
+        raise Stop()
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    with pytest.raises(Stop):
+        bs.run_mix(cfg, bs.build_parser().parse_args([]))
+    assert calls == [(dc.HUMANEVAL_DATASET, dc.BENCHMARKS[dc.HUMANEVAL]["files"][0], "dataset",
+                      cfg.data.humaneval_revision)]
+
+
+def test_a_changed_decontamination_index_cannot_be_resumed(tmp_path):
+    src = _planted_world()
+    code, _ = crash_code_at(src.code_train, at_file=2)
+    s = sm.DocSetup(tokenizer=CharTok, max_doc_tokens=2_000, decontam=planted_decontam())
+    with pytest.raises(Crash):
+        bs.build_mix(tmp_path, spec(**RESUME_SPEC), src._replace(code_train=code), s)
+    other = dc.Decontaminator(planted_problems()[:1], revisions={})
+    with pytest.raises(sm.ResumeError, match="decontamination"):
+        bs.build_mix(tmp_path, spec(**RESUME_SPEC), src,
+                     sm.DocSetup(tokenizer=CharTok, max_doc_tokens=2_000, decontam=other))

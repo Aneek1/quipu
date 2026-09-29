@@ -346,6 +346,11 @@ def test_moe_configs_share_the_code_weights_and_pinned_revisions():
         assert (d.code_revision, d.text_revision, d.fineweb2_revision) == (
             full.code_revision, full.text_revision, full.fineweb2_revision), path
         assert d.lid_revision == full.lid_revision, path
+        assert (d.humaneval_revision, d.mbpp_revision) == (
+            full.humaneval_revision, full.mbpp_revision), path
+    # The decontamination benchmarks' commits (quipu/decontam.py).
+    assert (full.humaneval_revision, full.mbpp_revision) == (
+        "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544", "4bb6404fdc6cacfda99d4ac4205087b89d32030c")
     # The LID model's commit, pinned so every build filters with the same model.
     assert (full.lid_model, full.lid_revision) == (
         "AneekC/lid-specialists-9plus1", "117966eb565a5e3c2ee1f1ce7b56848726b56982")
