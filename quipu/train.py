@@ -13,14 +13,37 @@ post-run evaluation to see how the model changed over the run.
 Exit codes of `python -m quipu.train` (the weekend launcher decides whether to retry
 from these; see run_main): 0 completed, 1 any other crash, 2 a usage/config error,
 3 the non-finite stop, 130 an interrupt.
+
+Models and optimizers (quipu-moe, M6): the model comes from build_model (dense
+Quipu or QuipuMoE) and the optimizers from build_optimizers (one AdamW, or Muon +
+AdamW). Every optimizer is stepped, and the LR schedule scales every group by the
+same factor: group lr = group base_lr x lr_at(step) / train.lr. Checkpoints hold
+every optimizer's state under "optimizers"; the pre-M6 format (one AdamW under
+"optimizer") still loads.
+
+MoE models, per optimizer step: expert counts and padded-dispatch drops are summed
+over all the step's micro-batches, and the router scores of every micro-batch are
+stashed (capped at BALANCE_SAMPLE_TOKENS per step) so the Quantile Balancing update
+after the optimizer step sees the whole step. Every eval_every steps the per-layer
+expert load (min / max as a fraction of target, coefficient of variation, dead
+experts) and drop rate go to the run log under "moe". An expert outside
+[MOE_HEALTH_LOW, MOE_HEALTH_HIGH] x target load for more than MOE_HEALTH_WINDOW
+consecutive steps raises a health alert: a stderr line and an entry in the run
+log's "moe_health" list (the flag). Evaluation always runs loop dispatch.
+
+train.compile wraps the forward in torch.compile (backend COMPILE_BACKEND); where
+that cannot work (no Triton on CUDA, no C++ compiler for CPU inductor on Windows) it
+warns and trains eagerly. The un-compiled module is what is checkpointed.
 """
 from __future__ import annotations
 
 import ctypes
 import dataclasses
+import importlib.util
 import json
 import math
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -28,13 +51,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from quipu.config import Config, ModelConfig, TrainConfig, load_config
 from quipu.eval import estimate_loss
 from quipu.fsio import replace_with_retry
 from quipu.loader import TokenStream
-from quipu.model import Quipu
+from quipu.model_factory import build_model
+from quipu.model_moe import QuipuMoE
+from quipu.optim import Muon, apply_config_lrs, build_optimizers
 from quipu.runlog import RunLog
 
 LATEST = "latest.pt"
@@ -42,6 +68,20 @@ MILESTONE_DIR = "milestones"
 PRINT_EVERY = 10
 MAX_NONFINITE_STREAK = 3
 _CKPT_NAME = re.compile(r"^step_(\d+)\.pt$")
+
+# MoE health alert: an expert below LOW or above HIGH times its target load (k*T/n
+# assignments per step) for more than WINDOW consecutive steps. Trainer attributes
+# moe_health_low / _high / _window start from these (tests shrink the window).
+MOE_HEALTH_LOW = 0.1
+MOE_HEALTH_HIGH = 3.0
+MOE_HEALTH_WINDOW = 500
+# Router-score rows kept per layer per step for the balance update (spread evenly
+# over the micro-batches). 65,536 x 64 experts x 4 bytes = 16 MiB a layer; the whole
+# 524k-token step would be 128 MiB a layer, 2 GiB over 16 layers.
+BALANCE_SAMPLE_TOKENS = 65_536
+# torch.compile backend for train.compile. Tests use "eager" to run real dynamo
+# without Triton or a C++ compiler.
+COMPILE_BACKEND = "inductor"
 
 EXIT_OK = 0
 EXIT_CRASH = 1
@@ -103,6 +143,37 @@ def _bf16_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return out
 
 
+def _compile_unavailable(device: str) -> str | None:
+    """Why torch.compile cannot work here with COMPILE_BACKEND, or None if it can.
+    torch.compile itself is lazy (failures surface at the first forward), so the
+    known blockers are checked up front."""
+    try:
+        import torch._dynamo
+        if not torch._dynamo.is_dynamo_supported():
+            return f"dynamo does not support Python {sys.version_info.major}.{sys.version_info.minor}"
+    except Exception as exc:          # a broken install is a reason, not a crash
+        return f"torch._dynamo unusable: {exc}"
+    if COMPILE_BACKEND != "inductor":
+        return None
+    if str(device).startswith("cuda"):
+        if importlib.util.find_spec("triton") is None:
+            return "Triton is not installed (inductor needs it on CUDA)"
+    elif sys.platform == "win32" and shutil.which("cl") is None:
+        return "no MSVC cl.exe on PATH (inductor needs a C++ compiler on CPU)"
+    return None
+
+
+def _load_optimizer_state(opt: torch.optim.Optimizer, state: dict[str, Any]) -> None:
+    """load_state_dict, keeping group keys the checkpoint lacks. A pre-M6 checkpoint's
+    AdamW groups have no base_lr or decay tag; load_state_dict replaces each group
+    wholesale with the saved one, so the built values are put back for those keys."""
+    built = [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
+    opt.load_state_dict(state)
+    for group, extra in zip(opt.param_groups, built):
+        for key, value in extra.items():
+            group.setdefault(key, value)
+
+
 def _atomic_save(obj: Any, path: Path) -> None:
     """torch.save to a temp name beside `path`, then swap it in. A kill mid-write
     leaves at worst a stray .tmp, never a truncated checkpoint at the final path."""
@@ -137,27 +208,37 @@ class Trainer:
         self.skipped_steps = 0      # cumulative non-finite skips, checkpointed
         self.ckpt_dir = Path(train_cfg.ckpt_dir)
 
-        self.model = Quipu(model_cfg).to(device)
+        # self.model is always the plain module: checkpoints, milestones, the
+        # balancer and set_dispatch go through it. self.forward_model is what runs
+        # the forward (the torch.compile wrapper when compile is on, else the same).
+        self.model = build_model(model_cfg).to(device)
+        self.forward_model: nn.Module = self.model
+        self.compiled = False
+        self.is_moe = isinstance(self.model, QuipuMoE)
         self.stream = TokenStream(shard_dir, train_cfg.micro_batch, model_cfg.context)
         self.val_stream = (
             TokenStream(val_dir, train_cfg.micro_batch, model_cfg.context) if val_dir else None
         )
 
-        # Weight decay on matrices only (p.dim() >= 2). RMSNorm gains are excluded:
-        # decaying them shrinks the residual scale rather than regularising anything.
-        # The tied embedding IS decayed, deliberately: it is also the output
-        # projection (lm_head), and decaying it matches GPT-2/nanoGPT for tied
-        # embeddings.
-        decay = [p for p in self.model.parameters() if p.dim() >= 2]
-        no_decay = [p for p in self.model.parameters() if p.dim() < 2]
-        self.opt = torch.optim.AdamW(
-            [
-                {"params": decay, "weight_decay": train_cfg.weight_decay},
-                {"params": no_decay, "weight_decay": 0.0},
-            ],
-            lr=train_cfg.lr,
-            betas=(train_cfg.beta1, train_cfg.beta2),
-        )
+        # optimizer "adamw" is quipu-114m's grouping exactly: weight decay on
+        # matrices only (the tied embedding included, as GPT-2/nanoGPT), none on
+        # RMSNorm gains. "muon" adds Muon for the hidden weight matrices; see
+        # quipu.optim.groups. self.opt is the AdamW, which is always built and
+        # always last (under "adamw" it is the only optimizer).
+        self.optimizers = build_optimizers(self.model, train_cfg)
+        self.opt = self.optimizers[-1]
+
+        self.moe_health_low = MOE_HEALTH_LOW
+        self.moe_health_high = MOE_HEALTH_HIGH
+        self.moe_health_window = MOE_HEALTH_WINDOW
+        self.last_step_counts: torch.Tensor | None = None     # [n_layer, n_experts], CPU
+        self.last_step_dropped: torch.Tensor | None = None    # [n_layer], CPU
+        if self.is_moe:
+            shape = (model_cfg.n_layer, model_cfg.n_experts)
+            self._health_streak = torch.zeros(shape, dtype=torch.long)
+            self._interval_counts = torch.zeros(shape, dtype=torch.long)
+            self._interval_dropped = torch.zeros(model_cfg.n_layer, dtype=torch.long)
+            self.balance_rows = max(1, BALANCE_SAMPLE_TOKENS // train_cfg.grad_accum)
         # dataclasses.asdict copies; vars() would hand out the frozen config's live
         # __dict__. Not wrapped in _safe_log: a bad log path at startup should fail
         # loudly, before hours of compute are spent.
@@ -182,6 +263,25 @@ class Trainer:
             self.log = RunLog(run_dir, run_id, config, resume=resume)
         except ValueError as exc:
             raise RunLogUnreadable(str(exc)) from exc
+        if train_cfg.compile:
+            self._compile()
+
+    def _compile(self) -> None:
+        """Wrap the forward in torch.compile, or warn and stay eager when it cannot
+        work here. The outcome is recorded in the run log under "compile"."""
+        reason = _compile_unavailable(self.device)
+        if reason is None:
+            try:
+                self.forward_model = torch.compile(self.model, backend=COMPILE_BACKEND)
+                self.compiled = True
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+        if reason is None:
+            self._safe_log(self.log.note, "compile", f"on ({COMPILE_BACKEND})")
+            return
+        print(f"warning: torch.compile unavailable ({reason}); training without it",
+              file=sys.stderr, flush=True)
+        self._safe_log(self.log.note, "compile", f"skipped: {reason}")
 
     # ---- logging -------------------------------------------------------------
 
@@ -209,11 +309,26 @@ class Trainer:
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return cfg.lr_min + (cfg.lr - cfg.lr_min) * cosine
 
+    def _zero_grad(self) -> None:
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    def _set_lrs(self, lr: float) -> float | None:
+        """Every group of every optimizer to base_lr x the schedule factor. Returns
+        the Muon lr (None without Muon), for the log."""
+        factor = lr / self.train_cfg.lr
+        muon_lr = None
+        for opt in self.optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * factor
+                if muon_lr is None and isinstance(opt, Muon):
+                    muon_lr = group["lr"]
+        return muon_lr
+
     def train_step(self) -> float:
         cfg = self.train_cfg
         lr = self.lr_at(self.step)
-        for group in self.opt.param_groups:
-            group["lr"] = lr
+        muon_lr = self._set_lrs(lr)
 
         t0 = time.perf_counter()
         # If anything escapes before opt.step() (Ctrl+C mid-step, most likely), the
@@ -221,28 +336,46 @@ class Trainer:
         # interrupt checkpoint does not skip them.
         start = self.stream.state_dict()
         stepped = False
+        step_counts = step_dropped = None
         try:
             self.model.train()
-            self.opt.zero_grad(set_to_none=True)
+            self._zero_grad()
+            if self.is_moe:
+                # Scores left over from an abandoned step or an eval forward must
+                # not reach this step's balance update.
+                self.model.clear_balance_scores()
+                n_layer, n_experts = self.model_cfg.n_layer, self.model_cfg.n_experts
+                step_counts = torch.zeros(n_layer, n_experts, dtype=torch.long, device=self.device)
+                step_dropped = torch.zeros(n_layer, dtype=torch.long, device=self.device)
             total = 0.0
             use_amp = self.device.startswith("cuda")
             for _ in range(cfg.grad_accum):
                 x, y = self.stream.next_batch()
                 x, y = x.to(self.device), y.to(self.device)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    logits = self.model(x)
+                    logits = self.forward_model(x)
                     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1))
                 # Divide before backward so the accumulated gradient is the mean over
                 # the whole batch, not the sum over micro-batches.
                 (loss / cfg.grad_accum).backward()
                 total += loss.item() / cfg.grad_accum
+                if self.is_moe:
+                    # last_stats and the stashed scores cover this micro-batch only;
+                    # summed here, the step's balance update and load logging see
+                    # every micro-batch.
+                    stats = self.model.last_stats
+                    step_counts += torch.stack([s.counts for s in stats])
+                    step_dropped += torch.stack([s.dropped for s in stats])
+                    self.model.accumulate_balance_scores(self.balance_rows)
 
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
             if not (math.isfinite(total) and torch.isfinite(grad_norm)):
                 # One NaN/inf batch taken as a step would poison the weights and
                 # AdamW's moments, and every later checkpoint (retention would then
                 # prune the clean ones). Skip it: step and lr stay where they are.
-                self.opt.zero_grad(set_to_none=True)
+                self._zero_grad()
+                if self.is_moe:
+                    self.model.clear_balance_scores()   # nor the balancer
                 self.nonfinite_streak += 1
                 self.skipped_steps += 1
                 print(
@@ -260,7 +393,12 @@ class Trainer:
                 return total
             self.nonfinite_streak = 0
             stepped = True
-            self.opt.step()
+            for opt in self.optimizers:
+                opt.step()
+            if self.is_moe:
+                # After the weights move, from the scores the forwards captured:
+                # no extra forward.
+                self.model.update_balance()
         except BaseException:
             # Once opt.step() has started the weights may already reflect these
             # batches, so rewinding would train on them twice; only rewind before.
@@ -269,16 +407,19 @@ class Trainer:
             raise
         # Free the gradients now rather than at the next step: eval and checkpointing
         # run in between, and VRAM headroom at micro_batch 4 is ~480 MiB.
-        self.opt.zero_grad(set_to_none=True)
+        self._zero_grad()
         self.step += 1
+        extra = {} if muon_lr is None else {"muon_lr": muon_lr}
         # wraps > 0 means the model is re-reading data; it must be visible in the log.
         self._safe_log(
             self.log.log_step,
             step=self.step, train_loss=total, lr=lr,
             tokens=self.step * cfg.batch_tokens,
             wraps=self.stream.wraps, grad_norm=float(grad_norm),
-            skipped=self.skipped_steps,
+            skipped=self.skipped_steps, **extra,
         )
+        if self.is_moe:
+            self._record_moe_step(step_counts.cpu(), step_dropped.cpu())
         if self.step % PRINT_EVERY == 0:
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
@@ -292,6 +433,65 @@ class Trainer:
             print(line, flush=True)
         return total
 
+    # ---- MoE expert load -----------------------------------------------------
+
+    def _record_moe_step(self, counts: torch.Tensor, dropped: torch.Tensor) -> None:
+        """One taken step's expert counts [n_layer, n_experts] and drops [n_layer],
+        summed over its micro-batches: health tracking every step, load statistics
+        every eval_every steps."""
+        self.last_step_counts, self.last_step_dropped = counts, dropped
+        self._interval_counts += counts
+        self._interval_dropped += dropped
+        self._track_moe_health(counts)
+        if self.step % self.train_cfg.eval_every == 0:
+            layers = self._load_stats(self._interval_counts, self._interval_dropped)
+            self._safe_log(self.log.log_moe, self.step, layers)
+            print(f"moe step {self.step}: " + "  ".join(
+                f"L{l} load {s['load_min']:.2f}-{s['load_max']:.2f} cv {s['load_cv']:.2f} "
+                f"dead {s['dead']} drop {s['drop_rate']:.1%}"
+                for l, s in enumerate(layers)), flush=True)
+            self._interval_counts.zero_()
+            self._interval_dropped.zero_()
+
+    @staticmethod
+    def _load_stats(counts: torch.Tensor, dropped: torch.Tensor) -> list[dict[str, Any]]:
+        """Per layer: min / max expert load as a fraction of the target (the mean,
+        k*T/n assignments), coefficient of variation (population std / mean), dead
+        experts (no tokens at all), and the fraction of assignments the padded
+        dispatch dropped."""
+        out = []
+        for c, d in zip(counts.double(), dropped.tolist()):
+            total = float(c.sum())
+            mean = total / c.numel()
+            safe = mean if mean > 0 else 1.0
+            out.append({
+                "load_min": float(c.min()) / safe,
+                "load_max": float(c.max()) / safe,
+                "load_cv": float(c.std(unbiased=False)) / safe,
+                "dead": int((c == 0).sum()),
+                "drop_rate": d / total if total > 0 else 0.0,
+            })
+        return out
+
+    def _track_moe_health(self, counts: torch.Tensor) -> None:
+        """Count consecutive steps each expert spends outside [low, high] x target
+        load; alert once per episode, on the step the streak passes the window."""
+        c = counts.double()
+        target = (c.sum(-1, keepdim=True) / c.shape[-1]).clamp_min(1e-12)
+        load = c / target
+        bad = (load < self.moe_health_low) | (load > self.moe_health_high)
+        self._health_streak = torch.where(bad, self._health_streak + 1, 0)
+        for l, e in (self._health_streak == self.moe_health_window + 1).nonzero().tolist():
+            alert = {"step": self.step, "layer": l, "expert": e,
+                     "load": float(load[l, e]), "streak": int(self._health_streak[l, e])}
+            print(
+                f"warning: MoE health: layer {l} expert {e} at {alert['load']:.0%} of its "
+                f"target load for {alert['streak']} consecutive steps (step {self.step}; "
+                f"band {self.moe_health_low:.0%}-{self.moe_health_high:.0%})",
+                file=sys.stderr, flush=True,
+            )
+            self._safe_log(self.log.add_alert, "moe_health", alert)
+
     # ---- checkpoints ---------------------------------------------------------
 
     def save_checkpoint(self) -> Path:
@@ -300,8 +500,12 @@ class Trainer:
         _atomic_save(
             {
                 "step": self.step,
+                # The plain module's state_dict (no "_orig_mod." prefixes under
+                # compile). It includes every Quantile Balancing bias: a buffer.
                 "model": self.model.state_dict(),
-                "optimizer": self.opt.state_dict(),
+                "optimizers": [opt.state_dict() for opt in self.optimizers],
+                "optimizer_kinds": [type(opt).__name__ for opt in self.optimizers],
+                "moe_health_streak": self._health_streak.clone() if self.is_moe else None,
                 "stream": self.stream.state_dict(),
                 "skipped_steps": self.skipped_steps,
                 "torch_rng": torch.get_rng_state(),
@@ -374,9 +578,29 @@ class Trainer:
         # Load to CPU: set_rng_state needs CPU ByteTensors, and model/optimizer
         # load_state_dict move their tensors to the right device themselves.
         state = torch.load(path, map_location="cpu", weights_only=False)
+        if "optimizers" in state:
+            saved_opts = state["optimizers"]
+            kinds = list(state.get("optimizer_kinds") or [])
+        else:                                   # pre-M6 (quipu-114m): one AdamW
+            saved_opts = [state["optimizer"]]
+            kinds = ["AdamW"]
+        mine = [type(opt).__name__ for opt in self.optimizers]
+        if kinds != mine or len(saved_opts) != len(self.optimizers):
+            raise UsageError(
+                f"checkpoint {path} holds optimizer state for {kinds}, but train.optimizer "
+                f"{self.train_cfg.optimizer!r} builds {mine}; resume with the config the "
+                "run was started with"
+            )
         self.step = state["step"]
-        self.model.load_state_dict(state["model"])
-        self.opt.load_state_dict(state["optimizer"])
+        self.model.load_state_dict(
+            {k.removeprefix("_orig_mod."): v for k, v in state["model"].items()})
+        for opt, saved in zip(self.optimizers, saved_opts):
+            _load_optimizer_state(opt, saved)
+        # load_state_dict brought back the checkpoint's base_lr / weight_decay; the
+        # config wins (a deliberate LR change on resume must take effect).
+        apply_config_lrs(self.optimizers, self.train_cfg)
+        if self.is_moe and state.get("moe_health_streak") is not None:
+            self._health_streak = state["moe_health_streak"].clone()
         self.stream.load_state_dict(state["stream"])
         self.skipped_steps = int(state.get("skipped_steps", 0))   # absent before it existed
         torch.set_rng_state(state["torch_rng"])
@@ -432,7 +656,10 @@ class Trainer:
                 if self.step == before:
                     continue       # non-finite step skipped; nothing new to eval or save
                 if self.step % cfg.eval_every == 0 and self.val_stream is not None:
-                    val = estimate_loss(self.model, self.val_stream, cfg.eval_batches, self.device)
+                    # estimate_loss runs MoE layers with loop dispatch (no drops) and
+                    # restores the training dispatch afterwards.
+                    val = estimate_loss(self.forward_model, self.val_stream,
+                                        cfg.eval_batches, self.device)
                     self._safe_log(self.log.log_eval, self.step, val)
                     print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}", flush=True)
                 # Milestone before checkpoint: a resume from checkpoint N starts after

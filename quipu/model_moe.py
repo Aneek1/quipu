@@ -27,9 +27,10 @@ later ones. Evaluation and generation should run with loop dispatch
 (set_dispatch("loop"), or build with moe_dispatch "loop").
 
 After every forward, last_stats holds one quipu.moe.MoEStats per layer (a fixed
-slot per layer, overwritten, so a checkpoint recompute never adds entries); after
-its optimizer step the trainer calls update_balance() to move every layer's Quantile
-Balancing bias.
+slot per layer, overwritten, so a checkpoint recompute never adds entries). The
+trainer sums last_stats over the micro-batches of a step itself, and calls
+accumulate_balance_scores() after each micro-batch and update_balance() after the
+optimizer step, so every layer's Quantile Balancing bias moves on the whole step.
 """
 from __future__ import annotations
 
@@ -120,8 +121,20 @@ class QuipuMoE(nn.Module):
             x = self.attnres(x, lambda i, h: self._sublayer(i, h, cos, sin))
         return self.lm_head(self.norm(x))
 
+    def accumulate_balance_scores(self, max_rows: int | None = None) -> None:
+        """Stash every layer's router scores from the latest forward for the next
+        update_balance() (once per micro-batch under gradient accumulation; see
+        MoELayer.accumulate_balance_scores for max_rows)."""
+        for block in self.blocks:
+            block.moe.accumulate_balance_scores(max_rows)
+
+    def clear_balance_scores(self) -> None:
+        for block in self.blocks:
+            block.moe.clear_balance_scores()
+
     def update_balance(self) -> None:
-        """One Quantile Balancing step in every layer, from its latest forward."""
+        """One Quantile Balancing step in every layer, from the scores stashed since
+        the last update (the whole optimizer step), or else its latest forward."""
         for block in self.blocks:
             block.moe.update_balance()
 

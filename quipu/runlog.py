@@ -77,8 +77,25 @@ class RunLog:
         self.record["evals"].append({"step": step, "val_loss": val_loss})
         self._flush()
 
+    def log_moe(self, step: int, layers: list[dict[str, Any]]) -> None:
+        """Per-layer expert-load statistics for the interval ending at `step`."""
+        self.record.setdefault("moe", []).append({"step": step, "layers": layers})
+        self._flush()
+
+    def add_alert(self, key: str, alert: dict[str, Any]) -> None:
+        """Append to a record-level alert list (e.g. "moe_health"); the key only
+        exists once something has fired, so its presence is the flag. Each alert
+        carries the "step" it fired at, for truncate_to."""
+        self.record.setdefault(key, []).append(alert)
+        self._flush()
+
+    def note(self, key: str, value: Any) -> None:
+        """Set one record-level value (e.g. "compile": how the model was compiled)."""
+        self.record[key] = value
+        self._flush()
+
     def truncate_to(self, step: int) -> None:
-        """Drop steps/evals logged after `step`.
+        """Drop steps/evals (and MoE entries and alerts) logged after `step`.
 
         Task 10 calls this right after load_checkpoint: steps logged past the
         last saved checkpoint are about to be re-run from that checkpoint and
@@ -86,6 +103,13 @@ class RunLog:
         """
         self.record["steps"] = [s for s in self.record["steps"] if s["step"] <= step]
         self.record["evals"] = [e for e in self.record["evals"] if e["step"] <= step]
+        for key in ("moe", "moe_health"):
+            if key in self.record:
+                kept = [e for e in self.record[key] if e["step"] <= step]
+                if kept:
+                    self.record[key] = kept
+                else:
+                    del self.record[key]
         self._flush()
 
     def finish(self, status: str) -> None:

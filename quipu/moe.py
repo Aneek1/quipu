@@ -334,6 +334,7 @@ class MoELayer(nn.Module):
             nn.init.normal_(ffn.up.weight, mean=0.0, std=INIT_STD)
             nn.init.normal_(ffn.down.weight, mean=0.0, std=INIT_STD / (2 * cfg.n_layer) ** 0.5)
         self._last_scores: torch.Tensor | None = None
+        self._step_scores: list[torch.Tensor] = []
 
     @property
     def dispatch(self) -> str:
@@ -385,13 +386,37 @@ class MoELayer(nn.Module):
             y = y + ffn(xf).float()
         return y.to(_compute_dtype(x)).reshape(shape), MoEStats(counts, dropped)
 
-    def update_balance(self) -> None:
-        """Apply one Quantile Balancing step from the latest forward's scores.
+    def accumulate_balance_scores(self, max_rows: int | None = None) -> None:
+        """Stash the latest forward's router scores for this optimizer step's balance
+        update. Under gradient accumulation the trainer calls this once per
+        micro-batch, so update_balance() sees the whole step, not the last micro-batch.
 
-        Under gradient accumulation (M6) this is called once per optimizer step, so it
-        balances on the last micro-batch's scores only. That is a fair sample of the
-        router's current behaviour (a micro-batch is thousands of tokens) and keeps
-        the step cheap; the EMA rate smooths the batch-to-batch noise."""
-        if self._last_scores is not None:
+        max_rows caps what one micro-batch keeps (memory: T x n_experts fp32 per
+        micro-batch per layer): every stride-th token, stride = ceil(T / max_rows),
+        starting at an offset that rotates with the micro-batch index so successive
+        micro-batches do not all sample the same positions. Deterministic, so a
+        resumed run balances exactly as the uninterrupted one did."""
+        s = self._last_scores
+        if s is None:
+            return
+        if max_rows is not None and s.shape[0] > max_rows:
+            stride = math.ceil(s.shape[0] / max_rows)
+            # A copy: the strided view would keep the whole (T, n) tensor alive.
+            s = s[len(self._step_scores) % stride :: stride].clone()
+        self._step_scores.append(s)
+        self._last_scores = None
+
+    def clear_balance_scores(self) -> None:
+        """Drop stashed and latest scores (a skipped or abandoned step)."""
+        self._step_scores = []
+        self._last_scores = None
+
+    def update_balance(self) -> None:
+        """Apply one Quantile Balancing step: from every score stashed by
+        accumulate_balance_scores() since the last update when there are any, else
+        from the latest forward's. Scores are consumed either way."""
+        if self._step_scores:
+            self.balancer.update(torch.cat(self._step_scores))
+        elif self._last_scores is not None:
             self.balancer.update(self._last_scores)
-            self._last_scores = None
+        self.clear_balance_scores()
