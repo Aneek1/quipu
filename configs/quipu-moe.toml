@@ -28,7 +28,7 @@ activation     = "swiglu"   # A/B 3: "situ_glu"
 situ_beta_gate = 4.0
 situ_beta_up   = 25.0
 attnres_blocks = 0          # A/B 2: 4 (four blocks of four layers)
-attnres_checkpoint = true   # recompute the depth mix in backward (AttnRes only)
+attnres_checkpoint = false  # recompute the depth mix in backward (AttnRes only); measure on the 5090 before enabling
 balance_update_rate = 0.3
 
 [data]

@@ -40,7 +40,7 @@ class ModelConfig:
     situ_beta_gate: float = 4.0          # SiTU-GLU beta_1 (gate tanh bound)
     situ_beta_up: float = 25.0           # SiTU-GLU beta_2 (up tanh bound)
     attnres_blocks: int = 0              # Block Attention Residuals; 0 = plain residual
-    attnres_checkpoint: bool = True      # recompute the AttnRes depth mix in backward
+    attnres_checkpoint: bool = False     # recompute the AttnRes depth mix in backward (CPU: +14% time, ~no memory saved)
     balance_update_rate: float = 0.3     # Quantile Balancing bias EMA rate
     # Routed-expert dispatch: "loop" runs each expert on its own contiguous slice;
     # "padded" pads every slice to capacity ceil(capacity_factor * T * top_k / n)

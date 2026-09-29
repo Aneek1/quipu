@@ -265,7 +265,7 @@ def test_quipu_114m_gets_the_dense_gpt2_adamw_defaults():
     assert (m.activation, m.situ_beta_gate, m.situ_beta_up, m.balance_update_rate) == (
         "swiglu", 4.0, 25.0, 0.3)
     assert (m.moe_dispatch, m.capacity_factor) == ("loop", 1.5)
-    assert m.attnres_checkpoint is True
+    assert m.attnres_checkpoint is False
     assert d.tokenizer == "gpt2"
     assert d.code_language_weights == {} and d.text_language_weights == {}
     assert (d.lid_model, d.lid_revision) == ("AneekC/lid-specialists-9plus1", "")
