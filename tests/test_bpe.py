@@ -121,6 +121,21 @@ def test_punctuation_does_not_swallow_the_newline_and_indent_that_follow(tok):
     assert [tok.decode([i]) for i in ids][-3:] == ["\n" + " " * 8, "return", " total"]
 
 
+def test_a_long_chinese_run_is_cut_into_pieces_of_at_most_3_characters():
+    run = "我们今天在北京大学图书馆里读了很多关于历史的书"[:20]
+    assert len(run) == 20
+    pieces = _pieces(run)
+    assert "".join(pieces) == run and all(1 <= len(p) <= 3 for p in pieces)
+    assert pieces[:2] == [run[:3], run[3:6]]  # left to right
+
+
+def test_mixed_latin_cjk_and_digits_split_sensibly():
+    assert _pieces("Tokyo東京タワー2026") == ["Tokyo", "東京タ", "ワー", "2", "0", "2", "6"]
+    assert _pieces("ラーメン") == ["ラーメ", "ン"]  # the long-vowel mark is part of the run
+    assert _pieces("한국어 문장입니다。") == ["한국어", " 문장입", "니다", "。"]
+    assert _pieces("café au lait") == ["café", " au", " lait"]  # non-CJK words untouched
+
+
 def test_indic_combining_marks_stay_inside_their_word():
     assert _pieces("தமிழ் மொழி हिन्दी भाषा") == ["தமிழ்", " மொழி", " हिन्दी", " भाषा"]
 

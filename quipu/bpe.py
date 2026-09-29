@@ -15,8 +15,11 @@ this order at each position (the leftmost alternative that matches wins):
                      more tokens than with GPT-2;
   3. TAB_RUN         1 to 16 tabs;
   4. DIGIT           every digit alone;
-  5. GPT-4o-style word and punctuation alternatives: contractions; an optional
-     non-letter then letters AND combining marks (so Tamil and Devanagari vowel
+  5. CJK             1 to 3 Han/Hiragana/Katakana/Hangul characters (an optional
+                     leading space kept, so Korean words keep their space the way
+                     " the" does); a longer run is cut left to right. See CJK_CLASS;
+  6. GPT-4o-style word and punctuation alternatives: contractions; an optional
+     non-letter then (non-CJK) letters AND combining marks (so Tamil and Devanagari vowel
      signs stay inside their word); punctuation runs, which never swallow a
      following newline (it belongs to NEWLINE_INDENT); any other non-newline
      whitespace.
@@ -54,11 +57,20 @@ SPACE_RUN = r" {2,16}"
 TAB_RUN = r"\t{1,16}"
 DIGIT = r"\p{N}"
 CONTRACTION = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
-WORD = r"[^\r\n\p{L}\p{M}\p{N}]?[\p{L}\p{M}]+"
+# Han, Hiragana, Katakana (with the prolonged sound mark U+30FC, which is script
+# Common) and Hangul. Chinese and Japanese are written without spaces, so an
+# uncapped run is a whole clause: nearly every pre-token is unique and the
+# trainer's word table outgrew this laptop's RAM (3.5 GB and rising at 467 of
+# 500 MB). Capped at 3 characters, cut left to right, the pieces repeat and BPE
+# can still learn every 1-3 character word.
+CJK_CLASS = r"\p{Han}\p{Hiragana}\p{Katakana}\x{30FC}\p{Hangul}"
+CJK_MAX = 3
+CJK = r" ?[" + CJK_CLASS + r"]{1," + str(CJK_MAX) + "}"
+WORD = r"[^\r\n\p{L}\p{M}\p{N}]?[[\p{L}\p{M}]&&[^" + CJK_CLASS + r"]]+"
 PUNCT = r" ?[^\s\p{L}\p{M}\p{N}]+"
 OTHER_SPACE = r"[^\S\r\n]+(?!\S)|[^\S\r\n]+"
-PRE_TOKENIZER_RULES = (NEWLINE_INDENT, SPACE_RUN, TAB_RUN, DIGIT, CONTRACTION, WORD, PUNCT,
-                       OTHER_SPACE)
+PRE_TOKENIZER_RULES = (NEWLINE_INDENT, SPACE_RUN, TAB_RUN, DIGIT, CONTRACTION, CJK, WORD,
+                       PUNCT, OTHER_SPACE)
 
 
 def build_pre_tokenizer() -> pre_tokenizers.PreTokenizer:

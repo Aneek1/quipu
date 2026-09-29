@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -397,7 +398,16 @@ def main() -> None:
     parser.add_argument("--english-share", type=float, default=ENGLISH_SHARE)
     parser.add_argument("--max-code-files", type=int, default=MAX_CODE_FILES)
     parser.add_argument("--low-priority", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--threads", type=int, default=4,
+                        help="RAYON_NUM_THREADS for the trainer (default 4; see below)")
     args = parser.parse_args()
+    # The tokenizers trainer pre-tokenises and counts words on a rayon pool, and each
+    # thread keeps its own partial word counts until they are merged, so peak memory
+    # grows with the thread count. 4 threads bounded the laptop run; the pool reads
+    # this once, when it is first used, so it must be set before training starts.
+    # An explicit RAYON_NUM_THREADS in the environment wins.
+    os.environ.setdefault("RAYON_NUM_THREADS", str(args.threads))
+    print(f"RAYON_NUM_THREADS={os.environ['RAYON_NUM_THREADS']}", flush=True)
     if args.low_priority:
         print(f"below-normal priority set: {bs.lower_priority()}", flush=True)
     other_share = 1 - args.code_share - args.english_share
@@ -498,6 +508,7 @@ def main() -> None:
                      "by_language": fw2_summary, "bytes": int(fw2_bytes),
                      "lid_filter": None},
         "train_seconds": seconds,
+        "rayon_threads": os.environ.get("RAYON_NUM_THREADS"),
     }
     write_text_atomic(out.with_name("sample_manifest.json"), json.dumps(manifest, indent=2))
     print(json.dumps({"tokenizer_sha256": manifest["tokenizer"]["sha256"],
