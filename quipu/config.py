@@ -390,6 +390,67 @@ def _check_train_extras(train: TrainConfig) -> None:
         raise ValueError("budget_usd needs usd_per_hour > 0 to be enforced")
 
 
+OVERRIDE_SECTIONS = {"model": ModelConfig, "data": DataConfig, "train": TrainConfig}
+
+
+def _override_value(key: str, annotation: str, text: str) -> Any:
+    """One --override value, typed by its dataclass field's annotation (a string
+    under `from __future__ import annotations`). str fields take the text as it is
+    (so a Windows path needs no quoting; a TOML-quoted string is unquoted); every
+    other type is parsed as a TOML value and must have that type."""
+    base = annotation.split("[", 1)[0].strip()
+    if base == "str":
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+            return tomllib.loads(f"v = {text}")["v"]
+        return text
+    try:
+        value = tomllib.loads(f"v = {text}")["v"]
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"override {key}: {text!r} is not a valid {base} value") from exc
+    ok = {
+        "int": not isinstance(value, bool) and isinstance(value, int),
+        "float": _is_number(value),
+        "bool": isinstance(value, bool),
+        "tuple": isinstance(value, list),
+        "list": isinstance(value, list),
+        "dict": isinstance(value, dict),
+    }.get(base)
+    if not ok:
+        raise ValueError(f"override {key}: {text!r} is not a valid {base} value")
+    return float(value) if base == "float" else value
+
+
+def parse_overrides(items: list[str]) -> dict[str, Any]:
+    """`--override` flags ("section.key=value", or "name=value") → the nested dict
+    load_config takes. Each value is typed by its dataclass field (ModelConfig,
+    DataConfig or TrainConfig): "train.lr=1.2e-3" is a float, "train.seed=7" an int,
+    "train.compile=false" a bool, "train.milestones=[]" a list, "model.activation=
+    situ_glu" a string. An unknown section or key, or a value of the wrong type, is
+    a ValueError; the rest of the validation is load_config's, as for the TOML."""
+    out: dict[str, Any] = {}
+    for item in items:
+        key, sep, text = item.partition("=")
+        key, text = key.strip(), text.strip()
+        if not sep or not key:
+            raise ValueError(f"override {item!r} must look like section.key=value")
+        if key == "name":
+            out["name"] = _override_value(key, "str", text)
+            continue
+        parts = key.split(".")
+        if len(parts) != 2 or parts[0] not in OVERRIDE_SECTIONS:
+            raise ValueError(
+                f"override {key!r} must be section.key with section one of "
+                f"{sorted(OVERRIDE_SECTIONS)} (or 'name')"
+            )
+        section, field = parts
+        fields = {f.name: f.type for f in dataclasses.fields(OVERRIDE_SECTIONS[section])}
+        if field not in fields:
+            raise ValueError(f"override {key!r}: [{section}] has no field {field!r}")
+        annotation = fields[field] if isinstance(fields[field], str) else fields[field].__name__
+        out.setdefault(section, {})[field] = _override_value(key, annotation, text)
+    return out
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     if overrides:

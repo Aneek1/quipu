@@ -65,7 +65,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from quipu.config import Config, ModelConfig, TrainConfig, load_config
+from quipu.config import Config, ModelConfig, TrainConfig, load_config, parse_overrides
 from quipu.eval import estimate_loss
 from quipu.fp8 import Fp8Unsupported, apply_precision
 from quipu.fsio import replace_with_retry
@@ -791,10 +791,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
                         help="auto = cuda if usable, else cpu")
+    parser.add_argument("--run-dir", default="results/runs",
+                        help="where the run log <run-id>.json goes")
+    parser.add_argument("--override", action="append", default=[], metavar="SECTION.KEY=VALUE",
+                        help="override one config value, typed by its field "
+                             "(e.g. train.lr=1.2e-3, model.activation=situ_glu); repeatable")
     args = parser.parse_args(argv)
 
     try:
-        cfg: Config = load_config(args.config)
+        cfg: Config = load_config(args.config, parse_overrides(args.override))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise UsageError(f"bad config {args.config!r}: {exc}") from exc
     device = _pick_device(args.device)
@@ -803,12 +808,12 @@ def main(argv: list[str] | None = None) -> None:
             model_cfg=cfg.model, train_cfg=cfg.train,
             shard_dir=Path(cfg.data.shard_dir) / "train",
             val_dir=Path(cfg.data.shard_dir) / "val",
-            device=device, run_dir="results/runs", run_id=args.run_id,
+            device=device, run_dir=args.run_dir, run_id=args.run_id,
             resume=args.resume,
         )
     except FileExistsError as exc:
         raise UsageError(
-            f"run id {args.run_id!r} already has a log in results/runs; pass --resume "
+            f"run id {args.run_id!r} already has a log in {args.run_dir}; pass --resume "
             "to continue it or choose a new --run-id"
         ) from exc
     except RunLogUnreadable as exc:
