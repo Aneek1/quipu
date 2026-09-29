@@ -1,8 +1,13 @@
 """The A/B runs for quipu-moe (spec sections 6.1 and 12, plan Task M8).
 
     python -m quipu.spend start --usd-per-hour 0.55      # once, when the box starts
+    AB=$(python -m quipu.spend show --plus 3) || exit 1  # spent so far + $3; fails closed
     python scripts/ab_runs.py --config configs/quipu-moe-ab.toml --out results/ab \\
-        --budget-usd 3 --usd-per-hour 0.55 [--with-fp8] [--shared-noise] [--dry-run]
+        --budget-usd "$AB" --usd-per-hour 0.55 [--with-fp8] [--shared-noise] [--dry-run]
+
+(--budget-usd caps the ledger's total, so "spent so far + 3" gives the A/B its own
+$3. `show --plus` exits non-zero, printing nothing, when the ledger is missing, has
+no box session or is corrupt, so the budget is never computed from $0.)
 
 What runs, in order (every run is `python -m quipu.train` with --override flags):
 1. LR sweeps at SWEEP_TOKENS (100M): AdamW lr in ADAMW_LRS, then Muon muon_lr in
@@ -65,13 +70,19 @@ Money (the box is billed per hour; the credit is not refundable):
   time; once one is seen, later stops wait max(--stop-grace-s, 3 x the longest save
   seen), and summary.md reports each run's longest save. The run is "stopped_budget": not
   cached, its checkpoint kept, so the next invocation (with more budget) resumes it.
-  The orchestrator then exits 4. Backstop: each attempt is launched with
-  train.budget_usd = the budget left then less the grace reserve and
-  train.usd_per_hour = the box rate, so a trainer the orchestrator left behind (it
-  died) checkpoints and exits 4 on its own (quipu.train's spend backstop; the runner
-  reads exit 4 as stopped_budget). train.budget_usd / usd_per_hour and the per-run
-  bookkeeping keys (RESERVED_OVERRIDES) are refused as --override. `spend stop`
-  refuses while the orchestrator is ticking the ledger (its ticks are tagged).
+  The orchestrator then exits 4. If the orchestrator dies (SIGKILL), its trainer
+  finds out at its next output line (the pipe is gone: quipu.train's orphan stop),
+  checkpoints and exits 130; its remaining output is appended to the run's log
+  (logs/<run id>.log, which the runner tees every line to, flushed, and names in
+  $QUIPU_TRAIN_LOG). Backstop: each attempt is also launched with train.budget_usd
+  = the budget left then less half the grace reserve (the other half is slack past
+  the deadline, so a live orchestrator always stops the run first) and
+  train.usd_per_hour = the box rate; the trainer checkpoints and exits 4 on it (the
+  runner reads exit 4 as stopped_budget), and a signal during that checkpoint is
+  ignored. train.budget_usd / usd_per_hour and the per-run bookkeeping keys
+  (RESERVED_OVERRIDES) are refused as --override. `spend stop` refuses while the
+  orchestrator is ticking the ledger (its ticks are tagged); the tag is released
+  when the orchestrator exits, so `spend stop` right after it succeeds.
 - Stopping: Ctrl+C, SIGTERM and SIGHUP (POSIX; the first of these two raises, a
   repeat is ignored) all take the same path: the running child (in its own session,
   so a terminal hangup never reaches it) is sent the interrupt and given the grace
@@ -664,14 +675,18 @@ class Orchestrator:
 
     def backstop_overrides(self) -> list[str]:
         """The trainer's own spend backstop for one attempt (quipu.train, exit 4): the
-        budget left now less the grace reserve, at the box rate, timed from the
-        trainer's start. The orchestrator's deadline stops the run first; this only
-        matters if the orchestrator died and left the trainer running. None without
-        a budget (a run then keeps the config's budget_usd 0)."""
+        budget left now less the grace reserve, plus half of it back as slack, at the
+        box rate, timed from the trainer's start. The slack puts the backstop beyond
+        the orchestrator's deadline (spend + the grace reserve), so a live
+        orchestrator always stops the run first; the backstop only matters if the
+        orchestrator died and the trainer did not notice (it normally does: an
+        orphan stop at its next output line, quipu.train), and then it still keeps
+        half the grace for its checkpoint. None without a budget (a run then keeps
+        the config's budget_usd 0)."""
         rate = self.guard.usd_per_hour
         if self.guard.budget_usd is None or not rate or rate <= 0:
             return []
-        left = self.guard.budget_usd - self.guard.spent() - self.guard.reserve_usd()
+        left = self.guard.budget_usd - self.guard.spent() - 0.5 * self.guard.reserve_usd()
         return [f"train.budget_usd={round(max(left, 0.01), 4)!r}",
                 f"train.usd_per_hour={float(rate)!r}"]
 
@@ -1391,6 +1406,8 @@ class SubprocessRunner:
         saves: list[float] = []
         budget_hit = threading.Event()
         done = threading.Event()
+        # An orphaned trainer (the orchestrator died) goes on writing to the same log.
+        env[childproc.TRAIN_LOG_ENV] = os.path.abspath(ctx.log_path)
         t0 = time.monotonic()
         proc = subprocess.Popen(
             args, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -1419,6 +1436,7 @@ class SubprocessRunner:
             with open(ctx.log_path, "a", encoding="utf-8") as log:
                 for line in proc.stdout:
                     log.write(line)
+                    log.flush()             # on disk now: a killed orchestrator loses none
                     self.echo(line.rstrip("\n"))
                     if any(mark in line.lower() for mark in OOM_MARKERS):
                         oom = True
@@ -1544,7 +1562,9 @@ def install_stop_signals(echo: Callable[[str], None] = _echo) -> dict[int, Any]:
 
 def run_until_stopped(o: "Orchestrator") -> int:
     """o.run() with the stop signals installed: 0, EXIT_BUDGET, or EXIT_INTERRUPTED
-    after Ctrl+C / SIGTERM / SIGHUP (summary and winners written either way)."""
+    after Ctrl+C / SIGTERM / SIGHUP (summary and winners written either way).
+    However it ends, the orchestrator's tag is released from the ledger, so `spend
+    stop` right after it needs no --force."""
     previous = install_stop_signals()
     try:
         return o.run()
@@ -1557,6 +1577,11 @@ def run_until_stopped(o: "Orchestrator") -> int:
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        try:
+            o.ledger.release_tool()
+        except (OSError, LedgerError) as exc:
+            _echo(f"[ab] warning: could not release the spend ledger ({exc}); `spend stop` "
+                  "refuses for 2 minutes (or pass --force)")
 
 
 # ---- CLI --------------------------------------------------------------------------------------

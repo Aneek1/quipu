@@ -64,14 +64,22 @@ What it does, in order (everything lands in --out, default results/moe):
    has cost so far (setup, shards, the A/B runs, earlier invocations), so a restart
    with a larger --budget-usd resumes where it stopped. A box session ended under the
    launcher (`spend stop --force`) is a budget stop too.
-   Backstop, if the launcher dies: every trainer it launches gets train.budget_usd =
-   the budget left at launch less the reserve (the gate: at most GATE_BACKSTOP_FACTOR
-   x the gate's cost) and train.usd_per_hour = the box rate, so an orphaned trainer
-   checkpoints and exits 4 on its own before it can overrun (quipu/train.py). The
+   If the launcher dies (SIGKILL, OOM): the trainer's output is a pipe to it, so the
+   trainer's next output line (step lines every 10 steps) fails, which quipu.train
+   takes as an orphan stop: it checkpoints and exits 130, appending its remaining
+   output to the attempt's log (logs/gate.log, logs/train_N.log: the launcher tees
+   every line there, flushed, and names the file in $QUIPU_TRAIN_LOG). Backstop,
+   should it not notice: every trainer it launches gets train.budget_usd = the
+   budget left at launch less the reserve, plus half the stop grace as slack past
+   the guard's threshold (the gate: at most GATE_BACKSTOP_FACTOR x the gate's cost)
+   and train.usd_per_hour = the box rate; it checkpoints and exits 4 on that. The
+   slack means a live launcher's guard always stops the trainer first, and a signal
+   that reaches a trainer already writing its backstop checkpoint is ignored. The
    trainer runs in a session of its own (POSIX; a process group on Windows), so a
    terminal hangup never reaches it directly; SIGTERM / SIGHUP to the launcher take
    Ctrl+C's path: the trainer is sent the interrupt and given its grace to write its
-   checkpoint, then the launcher exits 130.
+   checkpoint, then the launcher exits 130. However the launcher exits, it releases
+   its tag in the ledger, so `spend stop` right after it needs no --force.
 6. At the end: scripts/milestone_eval.py on the run config, and summary.md. summary.md
    is written only when the run is over (completed, stopped by the guard, or failed
    for good); sync.sh stops syncing when it appears. plan.json then records
@@ -517,6 +525,8 @@ class SubprocessChild:
         saves: list[float] = []
         stop: list[str] = []
         done = threading.Event()
+        # An orphaned trainer (this launcher died) goes on writing to the same log.
+        env[childproc.TRAIN_LOG_ENV] = os.path.abspath(log_path)
         started = self.clock()
         proc = subprocess.Popen(
             cmd, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -544,6 +554,7 @@ class SubprocessChild:
             with open(log_path, "a", encoding="utf-8") as log:
                 for line in proc.stdout:
                     log.write(line)
+                    log.flush()             # on disk now: a killed launcher loses none
                     self.echo(line.rstrip("\n"))
                     m = STEP_LINE.match(line.strip())
                     if m:
@@ -686,6 +697,14 @@ class Launcher:
 
     def spent(self) -> float:
         return self.ledger.spent_usd()
+
+    def _backstop_slack_usd(self) -> float:
+        """Half the child's stop grace in box time: the trainer's backstop is set this
+        far beyond the guard's threshold, so a live launcher always stops the trainer
+        first (its SIGINT is then the only stop) and an orphan still keeps half the
+        grace for its checkpoint."""
+        grace = getattr(self.run_child, "effective_grace_s", STOP_GRACE_S)
+        return 0.5 * grace / 3600 * self.rate
 
     # -- helpers --
 
@@ -834,8 +853,10 @@ class Launcher:
                 f"stopped by the budget before the gate: spent ${self.spent():.2f} + gate "
                 f"${gate_usd:.2f} + reserve ${self.reserve:.2f} > ${self.budget:.2f}"))
         # The trainer's own backstop, should the launcher die during the gate: at most
-        # GATE_BACKSTOP_FACTOR x the gate's cost, never past the budget less the reserve.
-        backstop = min(self.budget - self.spent() - self.reserve, GATE_BACKSTOP_FACTOR * gate_usd)
+        # GATE_BACKSTOP_FACTOR x the gate's cost, never past the budget less the reserve
+        # (plus the slack that lets a live launcher stop it first).
+        backstop = min(self.budget - self.spent() - self.reserve + self._backstop_slack_usd(),
+                       GATE_BACKSTOP_FACTOR * gate_usd)
         self._write_run_config(with_train(
             self.raw, total_tokens=cfg_total, milestones=[],
             ckpt_dir=self.ckpt_dir.as_posix(), budget_usd=round(max(backstop, 0.01), 4),
@@ -1064,7 +1085,7 @@ class Launcher:
                           f"${per_min:.4f}/min (${self.rate:.2f}/h); spent ${spent:.2f} of "
                           f"${self.budget:.2f}")
                 next_print = now + self.wait_print_s
-            step_usd = self.batch_tokens / self.plan["tokens_per_s"] / 3600 * self.rate
+            step_usd = self.batch_tokens / self._tps_plan() / 3600 * self.rate
             startup_usd = self.plan["startup_s"] / 3600 * self.rate
             if spent + self.reserve + startup_usd + step_usd > self.budget + 1e-9:
                 self.plan["notes"].append(f"{_now_iso()}: the wait for GO used up the budget")
@@ -1120,9 +1141,10 @@ class Launcher:
                     f"${self._margin(steps, start, planned_tps):.2f} + reserve "
                     f"${self.reserve:.2f} > ${self.budget:.2f}"))
             # Written for every attempt: the trainer's backstop is the budget left NOW
-            # (less the reserve), timed from its own start, so no attempt, orphaned or
-            # not, can spend past it.
-            backstop = self.budget - self.spent() - self.reserve
+            # (less the reserve, plus half the stop grace so the guard, above, always
+            # stops a trainer first while the launcher lives), timed from its own
+            # start, so no attempt, orphaned or not, can spend past it.
+            backstop = self.budget - self.spent() - self.reserve + self._backstop_slack_usd()
             self._write_run_config(with_train(
                 self.raw, total_tokens=plan["total_tokens"], milestones=plan["milestones"],
                 ckpt_dir=self.ckpt_dir.as_posix(), budget_usd=round(max(backstop, 0.01), 4),
@@ -1430,13 +1452,24 @@ def main(argv: list[str] | None = None) -> int:
 def run_until_stopped(launcher: Launcher, ledger: Ledger) -> int:
     """launcher.run() with the ledger ticker and the stop signals: SIGTERM / SIGHUP
     (POSIX) take Ctrl+C's path, so the trainer is interrupted and checkpoints before
-    the launcher exits 130."""
+    the launcher exits 130. However it ends, the launcher's tag is released from the
+    ledger, so `spend stop` right after it needs no --force."""
     previous = childproc.install_stop_signals(_echo, "[moe]")
     try:
         with Ticker(ledger):
             return launcher.run()
     finally:
         childproc.restore_signals(previous)
+        release_tool(ledger, _echo, "[moe]")
+
+
+def release_tool(ledger: Ledger, echo: Callable[[str], None], tag: str) -> None:
+    """Ledger.release_tool, never raising (the tool is exiting anyway)."""
+    try:
+        ledger.release_tool()
+    except (OSError, LedgerError) as exc:
+        echo(f"{tag} warning: could not release the spend ledger ({exc}); `spend stop` "
+             "refuses for 2 minutes (or pass --force)")
 
 
 if __name__ == "__main__":

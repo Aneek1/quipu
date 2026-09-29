@@ -47,10 +47,19 @@ ledger anchors spend to the box, not to a process or an --out directory:
 - A missing ledger is an empty one. An unreadable or corrupt one is a LedgerError:
   never a silent $0. A read that meets a Windows replace in progress is retried.
 
+- A tool releases its tag when it exits (Ledger.release_tool, in a finally in
+  run_moe and ab_runs), so `spend stop` right after it succeeds without --force.
+  A tool that dies without releasing it (SIGKILL) blocks `stop` for TOOL_ACTIVE_S.
+- For shell substitutions, `show --usd-only` (spent) and `show --plus USD` (spent +
+  USD) print one number with 4 decimals and fail closed: exit 2 and nothing on stdout
+  if the ledger is missing, has no box session, or is corrupt. So
+  `AB=$(python3 -m quipu.spend show --plus 3) || exit 1` never budgets from $0.
+
 API: Ledger.load(path=None, clock=time.time), .start_session(rate), .ensure_session
 (rate), .tick(), .tick_if_due(every), .adjust(key, usd), .end_session(),
-.spent_usd(now=None), .remaining(budget, now=None), .usd_per_hour; Ticker(ledger).
-CLI: python -m quipu.spend [--ledger F] start|stop|show|adjust|tick.
+.release_tool(), .spent_usd(now=None), .remaining(budget, now=None), .usd_per_hour;
+Ticker(ledger).
+CLI: python -m quipu.spend [--ledger F] start|stop|show [--usd-only|--plus USD]|adjust|tick.
 """
 from __future__ import annotations
 
@@ -266,12 +275,17 @@ class Ledger:
 
     # -- changes (each is one locked transaction on the file) --
 
-    def _update(self, change: Callable[[list[dict[str, Any]], dict[str, float]], Any]) -> Any:
+    def _update(self, change: Callable[[list[dict[str, Any]], dict[str, float]], Any],
+                write_unless_false: bool = False) -> Any:
         """Under the file lock: read what is on disk now, apply `change` to it (and
-        nothing else this process holds in memory), write it, and adopt it."""
+        nothing else this process holds in memory), write it, and adopt it. With
+        write_unless_false, a change that returns False wrote nothing."""
         with self._lock, _file_lock(lock_path(self.path), self.lock_timeout_s):
             sessions, adjustments = self._read(self.path)
             result = change(sessions, adjustments)
+            if write_unless_false and result is False:
+                self.sessions, self.adjustments = sessions, adjustments
+                return result
             self._write(sessions, adjustments)
             self.sessions, self.adjustments = sessions, adjustments
             self._known_start = sessions[-1]["box_start"] if sessions else None
@@ -383,6 +397,28 @@ class Ledger:
 
         tool = self.tool
         self._last_tick = self._update(change)
+
+    def release_tool(self) -> bool:
+        """This tool is exiting: clear the latest session's tool / tool_seen, so
+        `spend stop` right after it does not refuse (TOOL_ACTIVE_S) or need --force.
+        Only when the tag is this process's own tool name: another tool still running
+        keeps its tag. The session's box time (last_seen) is not touched. True if a
+        tag was cleared; a missing ledger is left unwritten."""
+        tool = self.tool
+        if not tool:
+            return False
+
+        def change(sessions: list[dict[str, Any]], adj: dict[str, float]) -> bool:
+            if not sessions or sessions[-1].get("tool") != tool:
+                return False
+            sessions[-1].pop("tool", None)
+            sessions[-1].pop("tool_seen", None)
+            return True
+
+        with self._lock:
+            if not self.path.exists():
+                return False
+            return self._update(change, write_unless_false=True)
 
     def active_tool(self, now: float | None = None,
                     within_s: float = TOOL_ACTIVE_S) -> tuple[str, float] | None:
@@ -648,9 +684,15 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--key", required=True)
     a.add_argument("--usd", type=float, required=True)
     sh = sub.add_parser("show", help="print the spend so far")
-    sh.add_argument("--usd-only", action="store_true",
-                    help="print only the spend in USD (for scripts, e.g. an A/B budget of "
-                         "'spent so far + 3')")
+    for_scripts = sh.add_mutually_exclusive_group()
+    for_scripts.add_argument("--usd-only", action="store_true",
+                             help="print only the spend in USD (4 dp); exit 2, printing "
+                                  "nothing, if the ledger is missing, has no box session "
+                                  "or is unreadable")
+    for_scripts.add_argument("--plus", type=float, metavar="USD",
+                             help="print spent + USD (4 dp), e.g. an A/B budget of 'spent "
+                                  "so far + 3': AB=$(python3 -m quipu.spend show --plus 3) "
+                                  "|| exit 1. Fails closed like --usd-only")
     t = sub.add_parser("tick", help="record that the box is still up")
     t.add_argument("--loop", type=float, metavar="SECONDS",
                    help="keep ticking every SECONDS (the ticker process `start` spawns "
@@ -686,8 +728,18 @@ def main(argv: list[str] | None = None) -> int:
             led.adjust(args.key, args.usd)
         elif args.cmd == "tick":
             led.tick()
-        if args.cmd == "show" and args.usd_only:
-            print(f"{led.spent_usd():.4f}")
+        if args.cmd == "show" and (args.usd_only or args.plus is not None):
+            # For a shell substitution: never a silent $0 (a missing ledger is empty
+            # to the tools, but a budget made from it would be the whole box budget).
+            if args.plus is not None and (not math.isfinite(args.plus) or args.plus < 0):
+                raise ValueError(f"--plus must be a finite amount >= 0, got {args.plus!r}")
+            if not led.path.is_file() or not led.sessions:
+                raise LedgerError(
+                    f"spend ledger {led.path} has no box session"
+                    + ("" if led.path.is_file() else " (the file does not exist)")
+                    + ": run `python3 -m quipu.spend start --usd-per-hour R` first (or pass "
+                      "--ledger / $" + ENV_VAR + ")")
+            print(f"{led.spent_usd() + (args.plus or 0.0):.4f}")
             return 0
         rate = led.usd_per_hour
         print(f"{led.path}: spent ${led.spent_usd():.2f} over {len(led.sessions)} box "

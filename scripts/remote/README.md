@@ -54,12 +54,17 @@ $/hour from the Vast instance card.
    inside `tmux`, with the A/B budget of spec section 8:
 
    ```bash
+   AB=$(python3 -m quipu.spend show --plus 3) || exit 1
    uv run python scripts/ab_runs.py --config configs/quipu-moe-ab.toml --out results/ab \
-       --budget-usd "$(python3 -c "print(round($(python3 -m quipu.spend show --usd-only) + 3, 2))")"        --usd-per-hour R
+       --budget-usd "$AB" --usd-per-hour R
    ```
 
    `--budget-usd` caps the ledger total, so the A/B budget is "spent so far + $3": the
-   A/B itself gets $3 whatever setup and the CPU box (steps 1-3) cost. Run `--dry-run`
+   A/B itself gets $3 whatever setup and the CPU box (steps 1-3) cost. `show --plus 3`
+   prints spent + 3 and **fails closed**: if the ledger is missing, has no box
+   session or is corrupt it prints nothing and exits non-zero, and `|| exit 1` stops
+   there (it closes the shell or tmux window: go back to step 1) instead of handing
+   the A/B a budget computed from $0. Run `--dry-run`
    first to see whether the run list fits (`--shared-noise` runs
    one seed re-run instead of three; off unless the owner chooses it). It writes
    `results/ab/summary.md` and `results/ab/winners.toml`; a budget stop (exit 4) still
@@ -96,14 +101,21 @@ $/hour from the Vast instance card.
    (interrupt checkpoint, exit 4) if spend + the next eval interval + the reserve
    would pass the budget. **A crash in the gate is not retried**: the launcher exits
    (summary.md says why); fix the cause and run the same command again. The trainer
-   runs in its own session: if the launcher is killed or its terminal hangs up
-   (SIGTERM/SIGHUP take the Ctrl+C path: the trainer checkpoints, exit 130), and
-   should the launcher die outright, every trainer carries its own backstop
-   (`train.budget_usd` = the budget left at its launch less the reserve): it
-   checkpoints and exits 4 on its own before it can overrun. `python -m quipu.spend
-   stop` refuses while the launcher or ab_runs is ticking the ledger (within the
-   last 2 minutes; `--force` overrides, and the launcher treats a session ended
-   under it as a budget stop). At the end it runs milestone_eval and writes
+   runs in its own session: if the launcher is stopped or its terminal hangs up
+   (SIGTERM/SIGHUP take the Ctrl+C path: the trainer checkpoints, exit 130). Should
+   the launcher die outright (SIGKILL, OOM), the trainer's next output line hits the
+   dead pipe: it checkpoints and exits 130 on its own (an orphan stop), appending
+   the rest of its output to the attempt's log in `results/moe/logs/` (the launcher
+   writes every line there as it arrives, so nothing before the death is lost
+   either). Behind that, every trainer carries its own backstop (`train.budget_usd`
+   = the budget left at its launch less the reserve, plus half the stop grace so the
+   live launcher's guard always stops it first): it checkpoints and exits 4, and a
+   signal arriving during that checkpoint is ignored. `python -m quipu.spend stop`
+   refuses while the launcher or ab_runs is ticking the ledger (within the last 2
+   minutes; `--force` overrides, and the launcher treats a session ended under it
+   as a budget stop). Both release the ledger when they exit, so `spend stop` right
+   after one has finished works without `--force`; only a tool that was SIGKILLed
+   blocks it for the 2 minutes. At the end it runs milestone_eval and writes
    `results/moe/summary.md`, and plan.json records the run as completed, so the same
    command again does nothing. Run it again after any other stop: it reuses
    `results/moe/plan.json` and resumes (a larger `--budget-usd` continues a run the
@@ -127,10 +139,17 @@ $/hour from the Vast instance card.
 7. **After pretraining**: its evaluation, then the chat SFT (M12) in the same session
    (paid from the reserve), then its evaluation. **The SFT runs under the same
    ledger guard**: launch it the way run_moe launches the trainer (spend guard + its
-   own session), or at the least with the trainer's backstop set to what is left,
-   `--override train.budget_usd=<budget left - copy-back margin> --override
-   train.usd_per_hour=R` (check `python3 -m quipu.spend show` first); never with
-   `train.budget_usd 0`.
+   own session), or at the least with the trainer's backstop set to what is left of
+   the $20, less a copy-back margin (here $0.10), computed so that it fails closed:
+
+   ```bash
+   SPENT=$(python3 -m quipu.spend show --usd-only) || exit 1
+   LEFT=$(python3 -c "import sys; left = round(20 - $SPENT - 0.10, 4); \
+   print(left) if left > 0 else sys.exit('nothing left of the budget')") || exit 1
+   # then the SFT trainer with: --override train.budget_usd=$LEFT --override train.usd_per_hour=R
+   ```
+
+   Never with `train.budget_usd 0` (no backstop at all).
 8. **Copy everything back** (sync.sh's final cycle, plus the SFT outputs), verify on
    the laptop (the checkpoints load; sha256 against the box), get the owner's
    go-ahead, then destroy the box (section 5).

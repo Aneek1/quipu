@@ -518,3 +518,212 @@ def test_a_resumed_trainer_over_budget_at_once_does_not_rewrite_its_checkpoint(
     monkeypatch.setattr(Trainer, "__init__", late_init)
     assert run_main(_budgeted(config, 0.5, 3.6) + ["--resume"]) == EXIT_BUDGET
     assert saved == []                       # checkpoint 5 is already on disk
+
+
+# ---- a signal during the budget-stop checkpoint is ignored (the launcher's SIGINT) -------------
+
+def test_a_sigint_during_the_budget_stop_checkpoint_is_ignored(in_tmp, monkeypatch, capsys):
+    # The backstop fires at step 7 and starts its checkpoint; the launcher's guard
+    # sends SIGINT mid-save (twice). The save must complete and the exit stay 4.
+    import signal
+    import time as time_mod
+
+    before = signal.getsignal(signal.SIGINT)
+    clock = StepClock()
+    monkeypatch.setattr(train_mod, "_clock", clock)
+    real_step, real_save = Trainer.train_step, train_mod._atomic_save
+    state = {"sent": 0}
+
+    def timed_step(self):
+        loss = real_step(self)
+        clock.t += 1.0
+        return loss
+
+    def slow_save(obj, path):
+        # The backstop's checkpoint (not milestone 7, written to milestones/ first).
+        if clock.t >= 7 and path.name.startswith("step_") and path.parent.name == "ckpt":
+            time_mod.sleep(0.2)
+            for _ in range(2):
+                state["sent"] += 1
+                signal.raise_signal(signal.SIGINT)
+        real_save(obj, path)
+
+    monkeypatch.setattr(Trainer, "train_step", timed_step)
+    monkeypatch.setattr(train_mod, "_atomic_save", slow_save)
+    assert run_main(_budgeted(tiny_config(in_tmp), 0.0065, 3.6)) == EXIT_BUDGET
+    assert state["sent"] == 2
+    ckpt = in_tmp / "ckpt"
+    assert (ckpt / "step_000007.pt").exists() and (ckpt / "latest.pt").exists()
+    assert json.loads(run_log(in_tmp).read_text(encoding="utf-8"))["status"] == "stopped_budget"
+    out = capsys.readouterr()
+    assert "checkpoint step 7 saved in" in out.out
+    assert out.err.count("during the stop's checkpoint; ignored") == 2
+    assert signal.getsignal(signal.SIGINT) is before
+    assert train_mod._stopping is False                      # reset for the next run_main
+
+
+# ---- an orphaned trainer: its output pipe is gone (the launcher died) --------------------------
+
+class DeadPipe:
+    """The trainer's stdout: a pipe to the launcher, which dies (`dead`): from then
+    on every write fails with `exc`."""
+
+    def __init__(self, exc: OSError) -> None:
+        self.exc, self.dead, self.writes, self.text = exc, False, 0, []
+
+    def write(self, s):
+        if self.dead:
+            self.writes += 1
+            raise self.exc
+        self.text.append(s)
+        return len(s)
+
+    def flush(self):
+        if self.dead:
+            raise self.exc
+
+
+def _dies_at(step_no, monkeypatch, dead, streams=("stdout", "stderr")):
+    for name in streams:
+        monkeypatch.setattr(sys, name, dead)
+    real_step = Trainer.train_step
+
+    def step(self):
+        loss = real_step(self)
+        if self.step == step_no:
+            dead.dead = True                      # the launcher died here
+        return loss
+    monkeypatch.setattr(Trainer, "train_step", step)
+
+
+@pytest.mark.parametrize("exc", [BrokenPipeError(32, "Broken pipe"),
+                                 OSError(5, "Input/output error")])
+def test_an_orphaned_trainer_checkpoints_and_exits_130(in_tmp, monkeypatch, exc):
+    import errno
+    assert exc.errno in (errno.EPIPE, errno.EIO)
+    dead = DeadPipe(exc)
+    _dies_at(3, monkeypatch, dead)
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_INTERRUPTED
+    record = json.loads(run_log(in_tmp).read_text(encoding="utf-8"))
+    assert record["status"] == "interrupted"
+    last = record["steps"][-1]["step"]
+    assert 3 <= last < 20                                   # stopped, not run to the end
+    ckpt = in_tmp / "ckpt"
+    assert (ckpt / f"step_{last:06d}.pt").exists() and (ckpt / "latest.pt").exists()
+    assert dead.writes >= 1
+    assert train_mod._orphaned is None and train_mod._stopping is False
+
+
+def test_an_orphaned_trainer_writes_the_rest_of_its_output_to_the_launchers_log(
+        in_tmp, monkeypatch):
+    log = in_tmp / "logs" / "train_1.log"
+    log.parent.mkdir()
+    log.write_text("what the launcher wrote\n", encoding="utf-8")
+    monkeypatch.setenv(train_mod.LOG_ENV, str(log))
+    _dies_at(3, monkeypatch, DeadPipe(BrokenPipeError(32, "Broken pipe")))
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_INTERRUPTED
+    text = log.read_text(encoding="utf-8")
+    assert text.startswith("what the launcher wrote\n")    # appended, never truncated
+    assert "orphaned" in text and "checkpoint step" in text
+
+
+def test_a_real_error_writing_stdout_is_not_taken_for_an_orphan(in_tmp, monkeypatch, capsys):
+    # A full disk behind a redirected stdout is a crash (exit 1), not a quiet stop.
+    import errno
+    _dies_at(9, monkeypatch, DeadPipe(OSError(errno.ENOSPC, "No space left on device")),
+             streams=("stdout",))
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_CRASH
+    assert "No space left" in capsys.readouterr().err
+
+
+def test_a_broken_pipe_that_is_not_a_stdout_write_is_a_crash(in_tmp, monkeypatch, capsys):
+    # Only writes to stdout / stderr count: a BrokenPipeError from anywhere else (a
+    # data loader's socket, say) is an ordinary crash.
+    def broken(self):
+        raise BrokenPipeError(32, "Broken pipe (a socket)")
+    monkeypatch.setattr(Trainer, "train_step", broken)
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_CRASH
+    assert "a socket" in capsys.readouterr().err
+    assert not (in_tmp / "ckpt" / "latest.pt").exists()
+
+
+ORPHAN_PARENT = r'''
+import subprocess, sys
+from pathlib import Path
+pid_out, child, *argv = sys.argv[1:]
+proc = subprocess.Popen([sys.executable, child, *argv], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, start_new_session=True)
+Path(pid_out).write_text(str(proc.pid))
+for line in proc.stdout:          # the launcher: reads the trainer's output until killed
+    pass
+'''
+
+ORPHAN_CHILD = r'''
+import sys, time
+from pathlib import Path
+import quipu.train as t
+rc_out, progress = Path(sys.argv[1]), Path(sys.argv[2])
+real_step = t.Trainer.train_step
+def step(self):
+    loss = real_step(self)
+    progress.write_text(str(self.step))
+    print(f"step {self.step} (a line every step: the dead pipe is found at once)", flush=True)
+    time.sleep(0.05)
+    return loss
+t.Trainer.train_step = step
+rc = t.run_main(sys.argv[3:])
+rc_out.write_text(str(rc))
+sys.exit(rc)
+'''
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: SIGKILL to the launcher, EPIPE to the trainer")
+def test_the_real_trainer_checkpoints_and_exits_130_when_its_launcher_is_killed(tmp_path):
+    import signal
+    import time as time_mod
+
+    config = tiny_config(tmp_path)
+    parent, child = tmp_path / "parent.py", tmp_path / "child.py"
+    parent.write_text(ORPHAN_PARENT, encoding="utf-8")
+    child.write_text(ORPHAN_CHILD, encoding="utf-8")
+    pid_out, rc_out, progress = tmp_path / "pid", tmp_path / "rc", tmp_path / "progress"
+    log = tmp_path / "train.log"
+    pythonpath = os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")]))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONUTF8="1", PYTHONPATH=pythonpath)
+    env[train_mod.LOG_ENV] = str(log)
+    # 400 steps at >= 0.05 s each: far longer than the test waits.
+    launcher = subprocess.Popen(
+        [sys.executable, str(parent), str(pid_out), str(child), str(rc_out), str(progress),
+         *args(config, "--override", "train.total_tokens=12800")],
+        cwd=tmp_path, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    trainer_pid = None
+    try:
+        deadline = time_mod.monotonic() + 240
+        while time_mod.monotonic() < deadline:
+            text = progress.read_text() if progress.exists() else ""
+            if text and int(text) >= 3:
+                break
+            assert launcher.poll() is None, "the launcher exited early"
+            time_mod.sleep(0.05)
+        trainer_pid = int(pid_out.read_text())
+        launcher.send_signal(signal.SIGKILL)                   # kill -9 the launcher
+        launcher.wait(timeout=30)
+        deadline = time_mod.monotonic() + 120
+        while not rc_out.exists() and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.1)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.wait()
+        if trainer_pid is not None and not rc_out.exists():
+            try:
+                os.kill(trainer_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    assert rc_out.read_text() == str(EXIT_INTERRUPTED)
+    record = json.loads(run_log(tmp_path).read_text(encoding="utf-8"))
+    assert record["status"] == "interrupted"
+    last = record["steps"][-1]["step"]
+    assert last < 400
+    assert (tmp_path / "ckpt" / f"step_{last:06d}.pt").exists()
+    assert "orphaned" in log.read_text(encoding="utf-8")

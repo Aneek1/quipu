@@ -10,6 +10,10 @@ and stop cleanly, shared so both behave the same.
   interrupt and given its grace to write its checkpoint. Only the first one raises:
   a repeat (a hangup followed by a supervisor's SIGTERM) must not cut the child's
   checkpoint short.
+- TRAIN_LOG_ENV: both tools tee the trainer's output (a pipe) to the attempt's log
+  file, flushed line by line, and pass that file's path in this variable. If the
+  tool dies, the trainer's next write to the dead pipe is an orphan stop
+  (quipu.train: checkpoint, exit 130) and its remaining output is appended there.
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ import threading
 from typing import Any, Callable
 
 STOP_SIGNALS = ("SIGTERM", "SIGHUP")
+TRAIN_LOG_ENV = "QUIPU_TRAIN_LOG"
 
 
 def popen_kwargs(posix: bool = os.name != "nt") -> dict[str, Any]:

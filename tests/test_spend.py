@@ -523,3 +523,108 @@ def test_cli_start_no_ticker_installs_nothing(tmp_path, fake_system):
     assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5",
                        "--no-ticker"]) == 0
     assert fake_system.runs == [] and fake_system.spawned == []
+
+
+# ---- show --plus / --usd-only fail closed (an A/B budget from a shell substitution) ------------
+
+def test_show_plus_prints_spent_plus_the_amount(tmp_path, monkeypatch, capsys):
+    clock = FakeClock()
+    monkeypatch.setattr(spend.time, "time", clock)
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.36",
+                       "--no-ticker"]) == 0
+    assert spend.main(["--ledger", str(path), "adjust", "--key", "cpu-box", "--usd", "0.5"]) == 0
+    clock.t += 1000                                           # $0.10 of box time
+    capsys.readouterr()
+    assert spend.main(["--ledger", str(path), "show", "--plus", "3"]) == 0
+    assert capsys.readouterr().out.strip() == "3.6000"
+    assert spend.main(["--ledger", str(path), "show", "--usd-only"]) == 0
+    assert capsys.readouterr().out.strip() == "0.6000"
+
+
+@pytest.mark.parametrize("flags", [["--plus", "3"], ["--usd-only"]])
+def test_show_for_scripts_fails_closed_on_a_missing_ledger(tmp_path, capsys, flags):
+    # `AB=$(python3 -m quipu.spend show --plus 3) || exit 1`: a missing ledger must not
+    # read as $0 spent (the A/B would get the whole box budget), and print nothing.
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "show", *flags]) != 0
+    out = capsys.readouterr()
+    assert out.out == "" and "no box session" in out.err
+
+
+@pytest.mark.parametrize("flags", [["--plus", "3"], ["--usd-only"]])
+def test_show_for_scripts_fails_closed_on_a_ledger_without_a_session(tmp_path, capsys, flags):
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "adjust", "--key", "x", "--usd", "1"]) == 0
+    capsys.readouterr()
+    assert spend.main(["--ledger", str(path), "show", *flags]) != 0
+    out = capsys.readouterr()
+    assert out.out == "" and "no box session" in out.err
+
+
+@pytest.mark.parametrize("flags", [["--plus", "3"], ["--usd-only"]])
+def test_show_for_scripts_fails_closed_on_a_corrupt_ledger(tmp_path, capsys, flags):
+    path = tmp_path / "spend.json"
+    path.write_text("{ truncated", encoding="utf-8")
+    assert spend.main(["--ledger", str(path), "show", *flags]) != 0
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1"])
+def test_show_plus_refuses_a_non_finite_or_negative_amount(tmp_path, capsys, bad):
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.36",
+                       "--no-ticker"]) == 0
+    capsys.readouterr()
+    assert spend.main(["--ledger", str(path), "show", "--plus", bad]) != 0
+    assert capsys.readouterr().out == ""
+
+
+# ---- a tool that exits releases the ledger: `spend stop` right after it succeeds ---------------
+
+def test_release_tool_clears_this_tools_tag_so_stop_succeeds_at_once(tmp_path, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(spend.time, "time", clock)
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.36",
+                       "--no-ticker"]) == 0
+    tool = Ledger.load(path, clock=clock)
+    tool.tool = "run_moe"
+    tool.tick()
+    assert Ledger.load(path, clock=clock).active_tool()[0] == "run_moe"
+    assert tool.release_tool() is True
+    cur = Ledger.load(path, clock=clock).current
+    assert "tool" not in cur and "tool_seen" not in cur
+    assert cur["last_seen"] == clock.t                        # the box time is kept
+    assert spend.main(["--ledger", str(path), "stop"]) == 0   # no --force needed
+    assert Ledger.load(path, clock=clock).current["ended"]
+
+
+def test_release_tool_leaves_another_tools_tag_alone(tmp_path):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    Ledger.load(path, clock=clock).start_session(RATE)
+    ab = Ledger.load(path, clock=clock)
+    ab.tool = "ab_runs"
+    ab.tick()
+    moe = Ledger.load(path, clock=clock)
+    moe.tool = "run_moe"
+    assert moe.release_tool() is False                        # ab_runs is still running
+    assert Ledger.load(path, clock=clock).active_tool()[0] == "ab_runs"
+    idle = Ledger.load(path, clock=clock)                     # no tool name: never releases
+    assert idle.release_tool() is False
+    assert Ledger.load(path, clock=clock).active_tool()[0] == "ab_runs"
+
+
+def test_release_tool_on_a_missing_or_ended_ledger_is_a_no_op(tmp_path):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    led = Ledger.load(path, clock=clock)
+    led.tool = "run_moe"
+    assert led.release_tool() is False
+    assert not path.exists()                                  # nothing written
+    led.start_session(RATE)
+    led.tick()
+    led.end_session()
+    assert led.release_tool() is True                         # the tag goes; still ended
+    assert Ledger.load(path, clock=clock).current["ended"]

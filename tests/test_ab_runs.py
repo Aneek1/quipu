@@ -283,10 +283,13 @@ def test_each_attempt_passes_the_budget_left_as_the_trainers_backstop(tmp_path):
              seed_reruns=False, budget_usd=5.0, usd_per_hour=0.36)
     assert o.run() == 0
     assert len(seen) == 2
+    # Less the grace reserve, plus half of it back as slack: the orchestrator's
+    # deadline (spend + the grace reserve) always stops a trainer before its own
+    # backstop, and an orphan still has half the grace for its checkpoint.
     grace_usd = ab.STOP_GRACE_S / 3600 * 0.36
     for budget, rate, spent in seen:
         assert rate == 0.36
-        assert budget == pytest.approx(5.0 - spent - grace_usd, abs=1e-4)
+        assert budget == pytest.approx(5.0 - spent - 0.5 * grace_usd, abs=1e-4)
     assert seen[1][0] < seen[0][0]                     # the second run has less left
     # The orchestrator's own overrides stay refused from the command line.
     assert "train.budget_usd" in ab.RESERVED_OVERRIDES
@@ -306,6 +309,61 @@ def test_the_trainers_backstop_exit_is_stopped_budget(tmp_path, monkeypatch):
 def test_the_orchestrator_tags_its_ledger_ticks(tmp_path):
     o = orch(tmp_path, FakeRunner(FakeClock(), val_by_settings))
     assert o.ledger.tool == "ab_runs"
+
+
+@pytest.mark.parametrize("how", ["returns", "raises"])
+def test_spend_stop_succeeds_right_after_the_orchestrator_exits(
+        tmp_path, box_ledger, monkeypatch, how):
+    # run_until_stopped releases the orchestrator's tag on the way out (a finally),
+    # so `spend stop` right after it needs no --force, however it ended.
+    from quipu import spend
+
+    monkeypatch.setattr(spend, "remove_ticker", lambda ledger, system=None: [])
+    clock = FakeClock()
+    clock.t = 1_000_000.0
+
+    def outcome(spec):
+        if how == "raises":
+            raise RuntimeError("the orchestrator fell over")
+        return val_by_settings(spec)
+
+    o = orch(tmp_path, FakeRunner(clock, outcome), clock, skip_sweeps=True, pairs=("attnres",),
+             seed_reruns=False)
+    if how == "raises":
+        with pytest.raises(RuntimeError):
+            ab.run_until_stopped(o)
+    else:
+        assert ab.run_until_stopped(o) == 0
+    assert Ledger.load(box_ledger, clock=clock).active_tool() is None
+    assert spend.main(["--ledger", str(box_ledger), "stop"]) == 0
+    assert Ledger.load(box_ledger, clock=clock).current["ended"]
+
+
+def test_the_childs_output_reaches_its_log_file_line_by_line(tmp_path, monkeypatch):
+    # Each line is flushed to the run's log as it arrives (a SIGKILLed orchestrator
+    # loses none of it), and the trainer is told that file ($QUIPU_TRAIN_LOG) so an
+    # orphaned trainer can go on writing there.
+    env_out = tmp_path / "env.json"
+    behave = {"losses": [3.0] * 400, "sleep": 0.05, "marker": str(tmp_path / "marker"),
+              "env_out": str(env_out)}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave, grace_s=20, kill_wait_s=5,
+                                    poll_s=0.1)
+    o = orch(tmp_path, runner, arm_tokens=400 * 524_288)
+    spec = one_spec(o)
+    ctx = o.context_for(spec, None)
+
+    def budget_check():
+        text = ctx.log_path.read_text(encoding="utf-8") if ctx.log_path.exists() else ""
+        return "step 3/" in text
+
+    ctx = dataclasses.replace(ctx, budget_check=budget_check)
+    r = runner(spec, ctx)
+    assert r.status == "stopped_budget"                  # the line was on disk mid-run
+    steps = [ln for ln in ctx.log_path.read_text(encoding="utf-8").splitlines()
+             if ln.startswith("step ")]
+    assert len(steps) < 100                              # well before the 8 KB buffer
+    import os
+    assert json.loads(env_out.read_text())["QUIPU_TRAIN_LOG"] == os.path.abspath(ctx.log_path)
 
 
 # ---- decision rules ---------------------------------------------------------------------

@@ -15,13 +15,29 @@ from these; see run_main): 0 completed, 1 any other crash, 2 a usage/config erro
 3 the non-finite stop, 4 the spend backstop, 130 an interrupt. SIGTERM, SIGHUP
 (POSIX) and SIGBREAK (Windows) are handled like Ctrl+C: the interrupt checkpoint
 is written, then it exits 130. Only the first of these signals raises; repeats
-during the checkpoint are ignored.
+during the checkpoint are ignored. So is any signal once the trainer has begun a
+stop of its own (the budget backstop, an orphan stop): the module flag _stopping
+makes the handler ignore it (a stderr note), so the launcher's SIGINT arriving
+while the backstop's checkpoint is being written cannot cut that save short.
 
 Spend backstop (spec 6.4): with train.budget_usd > 0, the trainer stops cleanly
 (checkpoint, run log "stopped_budget", exit 4) before the first step at which its
 own wall time since start x train.usd_per_hour has reached budget_usd. The box
-tools pass the budget that remains when they launch it (less their reserve), so a
-trainer orphaned by a dead launcher still cannot overrun the box budget.
+tools pass the budget that remains when they launch it, less their reserve, plus
+half their stop grace as slack: a live launcher's guard always stops the trainer
+first; the backstop matters when the launcher is gone and the trainer does not
+notice (below).
+
+Orphan stop: the box tools read the trainer's stdout/stderr through a pipe. If the
+launcher dies (SIGKILL, OOM), the trainer's next output line fails with
+BrokenPipeError (EPIPE; EIO for a terminal that hung up). run_main wraps
+sys.stdout / sys.stderr so that such a failure, and only on those two streams, is
+an orphan stop: the rest of the output goes to $QUIPU_TRAIN_LOG (the attempt's log
+file, which the launchers set, appended to) or else os.devnull, and at the top of
+the next step the trainer takes the interrupt path: checkpoint, run log
+"interrupted", exit 130. Any other write error (a full disk behind a redirect, a
+broken pipe that is not stdout/stderr) is still a crash. Step lines come every
+PRINT_EVERY steps, so an orphan is noticed within about that many steps.
 
 Models and optimizers (quipu-moe, M6): the model comes from build_model (dense
 Quipu or QuipuMoE) and the optimizers from build_optimizers (one AdamW, or Muon +
@@ -59,9 +75,11 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
+import errno
 import importlib.util
 import json
 import math
+import os
 import re
 import shutil
 import signal
@@ -76,6 +94,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from quipu.childproc import TRAIN_LOG_ENV
 from quipu.config import Config, ModelConfig, TrainConfig, load_config, parse_overrides
 from quipu.eval import estimate_loss
 from quipu.fp8 import Fp8Unsupported, apply_precision
@@ -116,6 +135,21 @@ EXIT_INTERRUPTED = 130
 # The spend backstop's clock (tests swap it for a fake).
 _clock: Callable[[], float] = time.monotonic
 
+# The attempt's log file, set by the box tools: an orphaned trainer's output goes here.
+LOG_ENV = TRAIN_LOG_ENV
+# A write to stdout / stderr failing with one of these means its reader is gone
+# (a broken pipe; a hung-up terminal; Windows reports a closed pipe as EINVAL).
+_ORPHAN_ERRNOS = frozenset({errno.EPIPE, errno.EIO}
+                           | ({errno.EINVAL} if os.name == "nt" else set()))
+
+# Set once the trainer has begun a stop of its own (budget backstop, orphan stop):
+# the stop handler then ignores every signal, so none can cut that checkpoint short.
+_stopping = False
+# Why stdout / stderr went away (None while the launcher is reading them).
+_orphaned: str | None = None
+_guards: list["_OrphanGuard"] = []
+_orphan_sink: Any = None
+
 # SetThreadExecutionState flags (winbase.h).
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -132,6 +166,114 @@ class BudgetStop(Exception):
     train.usd_per_hour reached train.budget_usd. The interrupt checkpoint is written
     and the process exits 4, so a trainer whose launcher died cannot overrun the
     budget the launcher gave it."""
+
+
+class OrphanStop(KeyboardInterrupt):
+    """stdout / stderr went away (the launcher reading them died): the interrupt
+    path, so the checkpoint is written and the process exits 130."""
+
+
+def _is_orphan_error(exc: BaseException) -> bool:
+    return isinstance(exc, BrokenPipeError) or (
+        isinstance(exc, OSError) and exc.errno in _ORPHAN_ERRNOS)
+
+
+class _OrphanGuard:
+    """sys.stdout / sys.stderr while run_main runs: writes go through to the real
+    stream; a write or flush that fails because the reader is gone (EPIPE, EIO)
+    turns into an orphan (see _orphan) instead of an exception. Any other error is
+    raised as before."""
+
+    def __init__(self, stream: Any, name: str) -> None:
+        self._stream = stream
+        self._name = name
+
+    def write(self, s: str) -> int:
+        try:
+            return self._stream.write(s)
+        except OSError as exc:
+            if not _is_orphan_error(exc):
+                raise
+            _orphan(exc, self._name)
+            try:
+                return self._stream.write(s)      # to the log file (or devnull) now
+            except OSError:
+                return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except OSError as exc:
+            if not _is_orphan_error(exc):
+                raise
+            _orphan(exc, self._name)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _orphan(exc: BaseException, name: str) -> None:
+    """The launcher reading this trainer's output is gone: point stdout and stderr
+    (the Python streams and, where they are fds 1 / 2, the fds) at $QUIPU_TRAIN_LOG
+    (appended) or os.devnull, and flag it; the training loop then stops like an
+    interrupt at its next step."""
+    global _orphaned, _orphan_sink
+    if _orphaned is not None:
+        return
+    _orphaned = f"{name}: {exc}"
+    sink = None
+    path = os.environ.get(LOG_ENV)
+    if path:
+        try:
+            sink = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
+        except OSError:
+            sink = None
+    if sink is None:
+        sink = open(os.devnull, "w", encoding="utf-8")
+    _orphan_sink = sink
+    for guard in _guards:
+        old, guard._stream = guard._stream, sink
+        try:
+            fd = old.fileno()
+        except (AttributeError, OSError, ValueError):
+            continue
+        if fd in (1, 2):
+            try:
+                os.dup2(sink.fileno(), fd)     # C-level writes (torch warnings) too
+            except OSError:
+                pass
+    print(f"orphaned: writing {name} failed ({exc}): the launcher reading this "
+          "trainer's output is gone. Stopping like an interrupt at the next step "
+          f"(checkpoint, exit {EXIT_INTERRUPTED}); output continues "
+          + (f"in {path}" if path and sink.name == path else "nowhere (os.devnull)"),
+          file=sys.stderr, flush=True)
+
+
+def _guard_output() -> tuple[Any, Any]:
+    """Wrap sys.stdout / sys.stderr in _OrphanGuard; returns the originals."""
+    saved = (sys.stdout, sys.stderr)
+    _guards.clear()
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if stream is not None:
+            guard = _OrphanGuard(stream, name)
+            _guards.append(guard)
+            setattr(sys, name, guard)
+    return saved
+
+
+def _unguard_output(saved: tuple[Any, Any]) -> None:
+    global _orphaned, _orphan_sink, _stopping
+    sys.stdout, sys.stderr = saved
+    _guards.clear()
+    if _orphan_sink is not None:
+        try:
+            _orphan_sink.close()
+        except OSError:
+            pass
+    _orphan_sink = None
+    _orphaned = None
+    _stopping = False
 
 
 class UsageError(Exception):
@@ -765,12 +907,24 @@ class Trainer:
     def _check_budget(self) -> None:
         """The spend backstop: raise BudgetStop once this process's wall time x
         usd_per_hour reaches budget_usd (budget_usd 0 = no backstop)."""
+        global _stopping
         cfg = self.train_cfg
         if cfg.budget_usd > 0 and self.budget_spent_usd() >= cfg.budget_usd:
+            # From here on a signal (the launcher's SIGINT, say) must not interrupt
+            # the backstop's checkpoint: the handler ignores it.
+            _stopping = True
             raise BudgetStop(
                 f"budget backstop: {(_clock() - self.started_at) / 3600:.2f} h x "
                 f"${cfg.usd_per_hour:.2f}/h = ${self.budget_spent_usd():.2f} reached "
                 f"train.budget_usd ${cfg.budget_usd:.2f} at step {self.step}")
+
+    def _check_orphaned(self) -> None:
+        """The orphan stop: stdout / stderr went away (_orphan), so stop like an
+        interrupt (checkpoint, exit 130), with every later signal ignored."""
+        global _stopping
+        if _orphaned is not None:
+            _stopping = True
+            raise OrphanStop(f"orphaned at step {self.step} ({_orphaned})")
 
     def _run(self) -> None:
         cfg = self.train_cfg
@@ -784,6 +938,7 @@ class Trainer:
             if self.step > 0 and (self.step in milestones or self.step == cfg.steps):
                 self.save_milestone()      # no-op when the file exists
             while self.step < cfg.steps:
+                self._check_orphaned()
                 self._check_budget()
                 before = self.step
                 loss = self.train_step()
@@ -817,7 +972,10 @@ class Trainer:
                 self.save_checkpoint()
             self._safe_log(self.log.finish, "stopped_budget")
             raise
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
+            if isinstance(exc, OrphanStop):
+                print(f"{exc}: stopping like an interrupt (checkpoint, exit "
+                      f"{EXIT_INTERRUPTED})", file=sys.stderr, flush=True)
             self.save_checkpoint()
             self._safe_log(self.log.finish, "interrupted")
             raise
@@ -901,8 +1059,11 @@ def _install_stop_handlers() -> dict[int, Any]:
     with a note, so it cannot abort the save (a supervisor that wants the process
     gone kills it). SIGINT is taken over only from Python's default handler, which
     raises KeyboardInterrupt the same way, so Ctrl+C behaves as before on every
-    platform; an ignored or custom SIGINT handler is left alone. Returns the
-    previous handlers for run_main to restore. Main thread only (signal.signal)."""
+    platform; an ignored or custom SIGINT handler is left alone. Once the trainer
+    has begun a stop of its own (_stopping: the budget backstop or an orphan stop),
+    every signal is ignored with a note, so e.g. the launcher's SIGINT cannot abort
+    the backstop's checkpoint. Returns the previous handlers for run_main to
+    restore. Main thread only (signal.signal)."""
     if threading.current_thread() is not threading.main_thread():
         return {}
     signals = list(STOP_SIGNALS)
@@ -914,6 +1075,11 @@ def _install_stop_handlers() -> dict[int, Any]:
         nonlocal fired
         if fired:
             print(f"signal {signum} again; still saving the interrupt checkpoint",
+                  file=sys.stderr, flush=True)
+            return
+        if _stopping:
+            print(f"signal {signum} during the stop's checkpoint; ignored (the "
+                  "checkpoint is finished first, then the process exits)",
                   file=sys.stderr, flush=True)
             return
         fired = True
@@ -935,13 +1101,18 @@ def run_main(argv: list[str] | None = None) -> int:
     0 completed, 1 any other crash, 2 usage/config error, 3 non-finite stop,
     4 spend backstop (checkpointed), 130 interrupt (Ctrl+C, SIGINT, SIGTERM, SIGHUP
     or SIGBREAK: all checkpoint first). Codes 2, 3, 4 and 130 are not worth
-    retrying; 1 may be."""
+    retrying; 1 may be. stdout / stderr are guarded meanwhile: a write that finds
+    its reader gone is an orphan stop (checkpoint, 130), see the module docstring."""
+    global _stopping, _orphaned
+    _stopping, _orphaned = False, None
+    saved = _guard_output()
     previous = _install_stop_handlers()
     try:
         return _run_main(argv)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        _unguard_output(saved)
 
 
 def _run_main(argv: list[str] | None) -> int:

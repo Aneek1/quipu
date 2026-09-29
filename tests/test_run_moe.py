@@ -578,11 +578,33 @@ def test_every_trainer_gets_the_budget_left_at_its_launch_as_its_backstop(tmp_pa
     # The gate's trainer: at most 2 x the gate's cost (5 min = $0.30), so an orphaned
     # gate cannot train the whole configured run.
     assert gate["budget_usd"] == pytest.approx(rm.GATE_BACKSTOP_FACTOR * 0.30, abs=1e-4)
-    # Each long-run attempt: the budget left at its launch, less the reserve (a retry
-    # gets less: its trainer's clock starts again at zero).
+    # Each long-run attempt: the budget left at its launch, less the reserve, plus half
+    # the stop grace as slack, so a live launcher's guard always stops it first (a
+    # retry gets less: its trainer's clock starts again at zero).
+    slack = 0.5 * rm.STOP_GRACE_S / 3600 * RATE
     for call, spent in zip((first, retry), spent_at_launch[1:]):
-        assert call["budget_usd"] == pytest.approx(20.0 - spent - 1.0, abs=1e-3)
+        assert call["budget_usd"] == pytest.approx(20.0 - spent - 1.0 + slack, abs=1e-3)
     assert retry["budget_usd"] < first["budget_usd"]
+
+
+def test_the_backstop_slack_follows_the_childs_stop_grace(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+
+    ledger = Ledger.load(tmp_path / "spend.json", clock=clock)
+    spent_at_launch = []
+
+    def spy(cmd, log_path, should_stop):
+        spent_at_launch.append(ledger.spent_usd())
+        return trainer(cmd, log_path, should_stop)
+    spy.effective_grace_s = 900.0                      # 3 x a 300 s checkpoint save
+
+    launcher = make_launcher(tmp_path, clock, spy, budget=20.0, reserve=1.0, gate_minutes=5.0,
+                             go_after=1, ledger=ledger)
+    assert launcher.run() == 0
+    first = trainer.calls[1]
+    assert first["budget_usd"] == pytest.approx(
+        20.0 - spent_at_launch[1] - 1.0 + 0.5 * 900.0 / 3600 * RATE, abs=1e-3)
 
 
 def test_the_trainers_backstop_exit_is_a_budget_stop_and_not_retried(tmp_path):
@@ -647,6 +669,63 @@ def test_the_launcher_tags_its_ledger_ticks_so_spend_stop_refuses(tmp_path):
                          ledger=ledger).run() == 0
     assert ledger.tool == "run_moe"
     assert Ledger.load(tmp_path / "spend.json", clock=clock).active_tool()[0] == "run_moe"
+
+
+@pytest.mark.parametrize("how", ["returns", "raises"])
+def test_spend_stop_succeeds_right_after_the_launcher_exits(tmp_path, monkeypatch, how):
+    # run_until_stopped releases the launcher's tag on the way out (a finally), so
+    # `spend stop` right after it needs no --force, however the launcher ended.
+    from quipu import spend
+
+    monkeypatch.setattr(spend, "remove_ticker", lambda ledger, system=None: [])
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    ledger = Ledger.load(path, clock=clock)
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+    launcher = make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0,
+                             ledger=ledger)
+    if how == "raises":
+        def boom():
+            ledger.ensure_session(RATE)
+            ledger.tick()                                  # tagged: run_moe is running
+            raise RuntimeError("the launcher fell over")
+        launcher.run = boom
+        with pytest.raises(RuntimeError):
+            rm.run_until_stopped(launcher, ledger)
+    else:
+        assert rm.run_until_stopped(launcher, ledger) == 0
+    assert Ledger.load(path, clock=clock).active_tool() is None
+    assert spend.main(["--ledger", str(path), "stop"]) == 0
+    assert Ledger.load(path, clock=clock).current["ended"]
+
+
+# ---- the child's output: teed to the attempt's log, line by line ---------------------------
+
+TEE_CHILD = r'''
+import os, sys, time
+print("log is " + os.environ.get("QUIPU_TRAIN_LOG", "unset"), flush=True)
+time.sleep(20)
+'''
+
+
+def test_the_childs_output_reaches_its_log_file_line_by_line(tmp_path):
+    # The launcher flushes each line to the attempt's log (a SIGKILLed launcher loses
+    # none of it), and tells the trainer that file ($QUIPU_TRAIN_LOG) so an orphaned
+    # trainer can go on writing there.
+    script = tmp_path / "child.py"
+    script.write_text(TEE_CHILD, encoding="utf-8")
+    log = tmp_path / "logs" / "train_1.log"
+    seen = []
+
+    def should_stop(events):
+        text = log.read_text(encoding="utf-8") if log.exists() else ""
+        seen.append(text)
+        return "stop: the line is on disk" if "log is " in text else None
+
+    child = rm.SubprocessChild(poll_s=0.1, grace_s=10.0, kill_wait_s=5.0, echo=lambda s: None)
+    outcome = child([sys.executable, str(script)], log, should_stop)
+    assert outcome.stop_reason == "stop: the line is on disk"   # seen while it ran
+    assert f"log is {log}" in log.read_text(encoding="utf-8")
 
 
 # ---- the GO wait is bounded ----------------------------------------------------------------
