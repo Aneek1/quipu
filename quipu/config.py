@@ -91,6 +91,13 @@ class DataConfig:
     # (Hugging Face repo id), and the revision used; "" until a build pins it.
     lid_model: str = "AneekC/lid-specialists-9plus1"
     lid_revision: str = ""
+    # Data v2: the dataset commits the shard build reads (code_dataset, the English
+    # dataset above, FineWeb-2), full 40-hex shas. "" = whatever the Hub's main
+    # branch is at build time (the build prints a warning); the quipu-moe configs pin
+    # the commits the tokenizer and its gate were built from.
+    code_revision: str = ""
+    text_revision: str = ""
+    fineweb2_revision: str = ""
 
 
 ENGLISH_TEXT_KEY = "eng_Latn"
@@ -352,6 +359,8 @@ def _check_data_mix(data: DataConfig) -> None:
                          f"(the {data.dataset} share)")
     _check_str("lid_model", data.lid_model)
     _check_str("lid_revision", data.lid_revision, allow_empty=True)
+    for name in ("code_revision", "text_revision", "fineweb2_revision"):
+        _check_str(name, getattr(data, name), allow_empty=True)
 
 
 def _check_train_extras(train: TrainConfig) -> None:

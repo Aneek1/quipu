@@ -269,6 +269,7 @@ def test_quipu_114m_gets_the_dense_gpt2_adamw_defaults():
     assert d.tokenizer == "gpt2"
     assert d.code_language_weights == {} and d.text_language_weights == {}
     assert (d.lid_model, d.lid_revision) == ("AneekC/lid-specialists-9plus1", "")
+    assert (d.code_revision, d.text_revision, d.fineweb2_revision) == ("", "", "")
     assert (t.optimizer, t.muon_lr, t.muon_momentum, t.muon_ns_steps, t.muon_per_head,
             t.muon_weight_decay, t.compile, t.budget_usd, t.usd_per_hour) == (
         "adamw", 0.02, 0.95, 5, True, 0.01, False, 0.0, 0.0)
@@ -287,14 +288,17 @@ def test_quipu_moe_config_matches_the_spec():
         64, 4, 384, 1, 768)
     assert d.tokenizer == "artifacts/tokenizer/tokenizer.json"
     assert d.code_share == 0.6
-    assert d.code_language_weights["Python"] == 0.30
-    assert d.code_language_weights["JavaScript"] == 0.25
-    assert d.code_language_weights["TypeScript"] == 0.12
-    assert d.code_language_weights["HTML"] == 0.08 == d.html_cap
-    assert (d.code_language_weights["CSS"], d.code_language_weights["SQL"]) == (0.05, 0.05)
-    others = set(d.code_language_weights) - {"Python", "JavaScript", "TypeScript", "HTML",
-                                             "CSS", "SQL"}
-    assert sum(d.code_language_weights[k] for k in others) == pytest.approx(0.15)
+    # The owner's cut of 2026-09-29 (spec 5 and 11): fewer rare-language tokens, so
+    # fewer github-code-clean files to download.
+    assert d.code_language_weights == {
+        "Python": 0.325, "JavaScript": 0.272, "TypeScript": 0.12, "HTML": 0.08, "CSS": 0.05,
+        "SQL": 0.02, "PHP": 0.03, "Java": 0.03, "GO": 0.03, "Shell": 0.01,
+        "Dockerfile": 0.003, "C": 0.01, "C++": 0.01, "Rust": 0.01}
+    assert d.code_language_weights["HTML"] == d.html_cap
+    # The dataset revisions the tokenizer and its gate were built from.
+    assert (d.code_revision, d.text_revision, d.fineweb2_revision) == (
+        "c48d40f9e70f0196f8236901ee35807f7d6c44c0", "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+        "af9c13333eb981300149d5ca60a8e9d659b276b9")
     # Of all tokens: 60% code, 28% English, 12% over the nine FineWeb-2 subsets.
     text = d.text_language_weights
     assert set(text) == {"eng_Latn", "ind_Latn", "zsm_Latn", "cmn_Hani", "jpn_Jpan",
@@ -332,6 +336,20 @@ def test_quipu_moe_smoke_is_tiny_and_switches_every_new_path_on():
     assert (m.activation, m.attnres_blocks, t.optimizer) == ("situ_glu", 2, "muon")
     assert t.total_tokens == 2_000_000
     assert d.tokenizer != "gpt2"
+
+
+def test_moe_configs_share_the_code_weights_and_pinned_revisions():
+    full = load_config(MOE).data
+    for path in (MOE_AB, MOE_SMOKE):
+        d = load_config(path).data
+        assert d.code_language_weights == full.code_language_weights, path
+        assert (d.code_revision, d.text_revision, d.fineweb2_revision) == (
+            full.code_revision, full.text_revision, full.fineweb2_revision), path
+
+
+def test_dataset_revisions_must_be_strings():
+    with pytest.raises(ValueError, match="code_revision"):
+        _load_mix(code_revision=5)
 
 
 @pytest.mark.parametrize("path", [MOE, MOE_AB, MOE_SMOKE])
@@ -457,7 +475,7 @@ def test_other_sections_still_merge_key_by_key():
 @pytest.mark.parametrize(
     "mutate, match",
     [
-        (lambda w: w.update(Python=0.31), "sum to 1"),               # sums to 1.01
+        (lambda w: w.update(Python=0.335), "sum to 1"),              # sums to 1.01
         (lambda w: w.pop("Rust"), "sum to 1"),                       # sums to 0.99
         (lambda w: w.update(Python=0.0, JavaScript=0.55), "Python"),  # zero weight
         (lambda w: w.update(Python="0.3"), "Python"),
@@ -496,7 +514,7 @@ def test_weights_within_tolerance_of_one_are_accepted():
     w = _weights()
     w["Python"] += 5e-7
     cfg = _load_mix(code_language_weights=w)
-    assert cfg.data.code_language_weights["Python"] == pytest.approx(0.3 + 5e-7)
+    assert cfg.data.code_language_weights["Python"] == pytest.approx(0.325 + 5e-7)
 
 
 @pytest.mark.parametrize(
@@ -524,7 +542,7 @@ def test_weights_are_copied_not_shared_with_the_overrides():
     w = _weights()
     cfg = _load_mix(code_language_weights=w)
     w["Python"] = 0.9
-    assert cfg.data.code_language_weights["Python"] == 0.30
+    assert cfg.data.code_language_weights["Python"] == 0.325
 
 
 @pytest.mark.parametrize("overrides, match", [

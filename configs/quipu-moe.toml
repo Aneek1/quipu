@@ -52,25 +52,31 @@ code_heldout_first_file = 840
 code_files_total        = 880
 lid_model    = "AneekC/lid-specialists-9plus1"
 lid_revision = ""         # pinned by the shard build and recorded in its manifest
+code_revision     = "c48d40f9e70f0196f8236901ee35807f7d6c44c0"  # github-code-clean
+text_revision     = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"  # fineweb-edu
+fineweb2_revision = "af9c13333eb981300149d5ca60a8e9d659b276b9"  # fineweb-2
 
-# Share of code tokens, spec 5; the same table scripts/train_tokenizer.py sampled.
+# Share of code tokens, spec 5 as amended by the owner on 2026-09-29 (spec 11): SQL,
+# Shell and Dockerfile are rare in github-code-clean, and filling their old weights
+# (0.05 / 0.02 / 0.01) meant downloading far more files, so they were cut and the
+# difference given to Python and JavaScript. scripts/train_tokenizer.py keeps the
+# original table (0.30 / 0.25 / ... ; the tokenizer is already trained on it).
 # Keys are github-code-clean's language labels (note GO). The dataset has no JSX or
 # TSX label: its labels come from file extensions, so .jsx/.tsx files are counted
 # under whatever label the dataset gives them (JavaScript / TypeScript) and cannot
-# be weighted separately. "JavaScript/JSX ~25%" is therefore JavaScript = 0.25,
-# "TypeScript/TSX ~12%" is TypeScript = 0.12. "All others ~15%" is spread as below.
+# be weighted separately.
 [data.code_language_weights]
-Python     = 0.30
-JavaScript = 0.25
+Python     = 0.325
+JavaScript = 0.272
 TypeScript = 0.12
 HTML       = 0.08
 CSS        = 0.05
-SQL        = 0.05
+SQL        = 0.02
 PHP        = 0.03
 Java       = 0.03
 GO         = 0.03
-Shell      = 0.02
-Dockerfile = 0.01
+Shell      = 0.01
+Dockerfile = 0.003
 C          = 0.01
 "C++"      = 0.01
 Rust       = 0.01
