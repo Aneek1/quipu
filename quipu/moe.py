@@ -9,7 +9,8 @@ Pieces, smallest first:
 - ExpertBank: n experts stored as stacked weights ([n, d, h] gate/up, [n, h, d] down).
   Two dispatches over tokens already sorted by expert: "loop" runs each expert on its
   contiguous slice; "padded" pads every slice to a fixed capacity and runs all experts
-  in one batched matmul, dropping overflow.
+  in one batched matmul, dropping overflow. Padded drops are batch-dependent
+  (Switch-style capacity over the whole flattened batch): see MoELayer.
 - Router: fp32 softmax scores; Top-k chosen on score + bias, weights taken from the
   unbiased scores and renormalised over the chosen k.
 - QuantileBalancer: the auxiliary-loss-free bias b. It never receives gradients; it is
@@ -162,7 +163,13 @@ class ExpertBank(nn.Module):
         """All experts in one torch.bmm over [n, capacity, d]. Each expert keeps its
         first `capacity` rows (token order, as sorted); rows past that are dropped and
         get a zero output. No host sync: shapes depend only on n and capacity.
-        Returns (out, dropped) with dropped a 0-d tensor."""
+        Returns (out, dropped) with dropped a 0-d tensor.
+
+        Whether a row is dropped depends on every row sorted before it, i.e. on the
+        rest of the batch: later tokens and later batch rows drop more, and a token's
+        output can change when an EARLIER row of the batch changes. Within one
+        sequence an earlier position never depends on a later one. Use loop dispatch
+        for evaluation and generation."""
         n, N, d = self.n_experts, x_sorted.shape[0], x_sorted.shape[-1]
         dtype = _compute_dtype(x_sorted)
         gate, up, down = self._weights(dtype)
@@ -296,14 +303,17 @@ class MoELayer(nn.Module):
 
     forward(x) -> (y, MoEStats): y has x's shape (the autocast dtype under autocast,
     else x's dtype). The batch's router scores are kept so the trainer can call
-    update_balance() after its optimizer step."""
+    update_balance() after its optimizer step.
+
+    dispatch ("loop" | "padded") is a validated, mutable attribute: a model trained
+    with padded dispatch can be switched to loop for evaluation. Padded dispatch
+    drops overflow Switch-style, so its drops (and a token's output) depend on the
+    rest of the batch; loop dispatch drops nothing and is per-token."""
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         if cfg.kind != "moe":
             raise ValueError(f"MoELayer needs kind 'moe', got {cfg.kind!r}")
-        if cfg.moe_dispatch not in ("loop", "padded"):
-            raise ValueError(f"unknown moe_dispatch {cfg.moe_dispatch!r}")
         d = cfg.d_model
         self.n_experts = cfg.n_experts
         self.top_k = cfg.top_k
@@ -324,6 +334,16 @@ class MoELayer(nn.Module):
             nn.init.normal_(ffn.up.weight, mean=0.0, std=INIT_STD)
             nn.init.normal_(ffn.down.weight, mean=0.0, std=INIT_STD / (2 * cfg.n_layer) ** 0.5)
         self._last_scores: torch.Tensor | None = None
+
+    @property
+    def dispatch(self) -> str:
+        return self._dispatch
+
+    @dispatch.setter
+    def dispatch(self, mode: str) -> None:
+        if mode not in ("loop", "padded"):
+            raise ValueError(f"unknown moe_dispatch {mode!r}")
+        self._dispatch = mode
 
     def capacity(self, n_tokens: int) -> int:
         """Per-expert slots for the padded dispatch: ceil(factor * T * k / n)."""

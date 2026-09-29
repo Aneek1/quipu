@@ -40,6 +40,7 @@ class ModelConfig:
     situ_beta_gate: float = 4.0          # SiTU-GLU beta_1 (gate tanh bound)
     situ_beta_up: float = 25.0           # SiTU-GLU beta_2 (up tanh bound)
     attnres_blocks: int = 0              # Block Attention Residuals; 0 = plain residual
+    attnres_checkpoint: bool = True      # recompute the AttnRes depth mix in backward
     balance_update_rate: float = 0.3     # Quantile Balancing bias EMA rate
     # Routed-expert dispatch: "loop" runs each expert on its own contiguous slice;
     # "padded" pads every slice to capacity ceil(capacity_factor * T * top_k / n)
@@ -277,6 +278,7 @@ def _check_moe(model: ModelConfig) -> None:
     _check_positive("situ_beta_up", model.situ_beta_up)
     _check_fraction("balance_update_rate", model.balance_update_rate, allow_one=True)
     _check_choice("moe_dispatch", model.moe_dispatch, MOE_DISPATCHES)
+    _check_bool("attnres_checkpoint", model.attnres_checkpoint)
     _check_positive("capacity_factor", model.capacity_factor)
     if model.capacity_factor < 1:
         # Below 1 tokens are dropped even under perfect balance.

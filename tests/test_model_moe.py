@@ -4,7 +4,7 @@ import torch
 from quipu.config import ModelConfig, load_config
 from quipu.model import Quipu
 from quipu.model_factory import build_model
-from quipu.model_moe import MoEBlock, QuipuMoE
+from quipu.model_moe import QuipuMoE
 
 MOE_CONFIG = "configs/quipu-moe.toml"
 SMOKE_CONFIG = "configs/quipu-moe-smoke.toml"
@@ -40,7 +40,7 @@ def _analytic_counts(cfg: ModelConfig) -> tuple[int, int]:
     router = cfg.n_experts * d
     shared = cfg.shared_experts * 3 * d * cfg.shared_hidden
     expert = 3 * d * cfg.expert_hidden
-    attnres = (cfg.n_layer + 1) * d if cfg.attnres_blocks else 0
+    attnres = (2 * cfg.n_layer + 1) * d if cfg.attnres_blocks else 0   # a query per sub-layer + head
     embed = cfg.vocab_size * d
     common = embed + d + attnres + cfg.n_layer * (attn + norms + router + shared)
     total = common + cfg.n_layer * cfg.n_experts * expert
@@ -119,37 +119,55 @@ def test_attnres_blocks_zero_is_a_plain_pre_norm_residual():
     assert torch.equal(got, want)
 
 
-def test_zero_pseudo_queries_feed_each_layer_the_mean_of_its_block_sources(monkeypatch):
-    """At init every AttnRes weight is 1/m, so layer l's input must be the plain mean
-    of the Kimi source list: [b_0 (embedding), completed block sums, partial sum]."""
+def test_zero_pseudo_queries_feed_each_sub_layer_the_mean_of_its_block_sources(monkeypatch):
+    """At init every AttnRes weight is 1/m, so sub-layer i's input must be the plain
+    mean of the Kimi source list: [b_0 (embedding), completed block sums, partial
+    sum]. Sub-layers alternate attention (even i) and MoE (odd i); a block of
+    n_layer / attnres_blocks layers holds twice that many sub-layers."""
     torch.manual_seed(0)
     cfg = tiny(n_layer=6, attnres_blocks=3)
     model = QuipuMoE(cfg)
     inputs, outs = [], []
-    real_update = MoEBlock.update
+    real = QuipuMoE._sublayer
 
-    def recording(self, h, cos, sin):
-        f, s = real_update(self, h, cos, sin)
+    def recording(self, i, h, cos, sin):
+        f = real(self, i, h, cos, sin)
         inputs.append(h)
         outs.append(f)
-        return f, s
+        return f
 
-    monkeypatch.setattr(MoEBlock, "update", recording)
+    monkeypatch.setattr(QuipuMoE, "_sublayer", recording)
     idx = torch.randint(0, cfg.vocab_size, (2, 9))
     with torch.no_grad():
         logits = model(idx)
         emb = model.embed(idx)
-    lpb = cfg.n_layer // cfg.attnres_blocks
-    for l in range(cfg.n_layer):
-        n, i = divmod(l, lpb)
-        srcs = [emb] + [sum(outs[b * lpb:(b + 1) * lpb]) for b in range(n)]
-        if i:
-            srcs.append(sum(outs[n * lpb:l]))
-        torch.testing.assert_close(inputs[l], torch.stack(srcs).mean(0), atol=1e-6, rtol=0)
-    blocks = [emb] + [sum(outs[b * lpb:(b + 1) * lpb]) for b in range(cfg.attnres_blocks)]
+    n_steps = 2 * cfg.n_layer
+    assert len(inputs) == n_steps
+    spb = n_steps // cfg.attnres_blocks
+    for i in range(n_steps):
+        n, j = divmod(i, spb)
+        srcs = [emb] + [sum(outs[b * spb:(b + 1) * spb]) for b in range(n)]
+        if j:
+            srcs.append(sum(outs[n * spb:i]))
+        torch.testing.assert_close(inputs[i], torch.stack(srcs).mean(0), atol=1e-6, rtol=0)
+    blocks = [emb] + [sum(outs[b * spb:(b + 1) * spb]) for b in range(cfg.attnres_blocks)]
     with torch.no_grad():
         want = model.lm_head(model.norm(torch.stack(blocks).mean(0)))
     torch.testing.assert_close(logits, want, atol=1e-5, rtol=0)
+
+
+def test_attnres_has_one_pseudo_query_per_sub_layer_plus_the_head():
+    cfg = tiny(n_layer=4, attnres_blocks=2)
+    with torch.device("meta"):
+        model = QuipuMoE(cfg)
+    assert len(model.attnres.queries) == 2 * cfg.n_layer + 1
+    assert model.attnres.steps_per_block == 2 * cfg.n_layer // cfg.attnres_blocks
+
+
+def test_attnres_blocks_must_split_whole_layers():
+    # 2 * n_layer divides by 4 but n_layer (2) does not: a block would end mid-layer.
+    with pytest.raises(ValueError, match="attnres_blocks"):
+        QuipuMoE(tiny(n_layer=2, attnres_blocks=4))
 
 
 # ---- gradients, causality, precision --------------------------------------------
@@ -234,3 +252,191 @@ def test_build_model_on_a_moe_config_is_quipu_moe():
 def test_build_model_rejects_an_unknown_kind():
     with pytest.raises(ValueError):
         build_model(tiny(kind="sparse"))
+
+
+# ---- sub-layer granularity (I1) ---------------------------------------------------
+
+def _plain_residual_logits(model: QuipuMoE, idx: torch.Tensor) -> torch.Tensor:
+    """The plain pre-norm residual computation on model's own weights."""
+    x = model.embed(idx)
+    cos, sin = model.rope_cos, model.rope_sin
+    for b in model.blocks:
+        x = x + b.attn(b.norm1(x), cos, sin)
+        x = x + b.moe(b.norm2(x))[0]
+    return model.lm_head(model.norm(x))
+
+
+@pytest.mark.parametrize("n_layer, attnres_blocks", [(4, 2), (6, 3), (4, 4), (4, 1)])
+def test_zero_queries_make_attnres_the_plain_residual_model(n_layer, attnres_blocks):
+    """With zero pseudo-queries every step input is the mean of its sources, i.e. the
+    plain residual stream / m. Every sub-layer reads it through a scale-invariant
+    RMSNorm, so the model IS the plain residual model -- but only when attention and
+    MoE are separate AttnRes steps (a paired step would feed MoE norm(stream/m + a)).
+    norm_eps is made negligible: at init the embedding has RMS ~0.02, so stream/m has
+    a mean square near the default eps (1e-6) and eps alone would break the identity."""
+    torch.manual_seed(0)
+    cfg = tiny(n_layer=n_layer, attnres_blocks=attnres_blocks, norm_eps=1e-12)
+    model = QuipuMoE(cfg).eval()
+    idx = torch.randint(0, cfg.vocab_size, (2, 12))
+    with torch.no_grad():
+        got = model(idx)
+        want = _plain_residual_logits(model, idx)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=0)
+
+
+# ---- AttnRes memory (I2) ------------------------------------------------------------
+
+def _saved_bytes(model: QuipuMoE, idx: torch.Tensor) -> int:
+    """Bytes of the distinct non-parameter storages autograd saves for backward."""
+    params = {p.untyped_storage().data_ptr() for p in model.parameters()}
+    seen: dict[int, int] = {}
+
+    def pack(t):
+        s = t.untyped_storage()
+        if s.data_ptr() not in params:
+            seen[s.data_ptr()] = s.nbytes()
+        return t
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        loss = model(idx).float().pow(2).mean()
+    loss.backward()
+    return sum(seen.values())
+
+
+def test_attnres_adds_at_most_a_quarter_to_the_plain_models_saved_activations():
+    """Every layer its own block (the most sources: up to n_layer + 1 per mix), no
+    checkpoint. The mix may keep the sources themselves and per-position scalars,
+    never stacked or normalised copies of the sources. Measured (16 layers, d 32,
+    2 x 32 tokens): plain 4298 KiB; AttnRes 4722 KiB (x1.10); the stacking mix of
+    f8f3d3e saved 6822 KiB (x1.59)."""
+    ids = torch.randint(0, 64, (2, 32), generator=torch.Generator().manual_seed(0))
+    sizes = {}
+    for blocks in (0, 16):
+        torch.manual_seed(0)
+        model = QuipuMoE(tiny(n_layer=16, attnres_blocks=blocks,
+                              attnres_checkpoint=False)).train()
+        sizes[blocks] = _saved_bytes(model, ids)
+    assert sizes[16] <= 1.25 * sizes[0], sizes
+
+
+def test_attnres_checkpoint_gives_the_same_logits_and_gradients():
+    idx = torch.randint(0, 64, (2, 16), generator=torch.Generator().manual_seed(0))
+    runs = []
+    for ckpt in (False, True):
+        torch.manual_seed(0)
+        model = QuipuMoE(tiny(attnres_checkpoint=ckpt)).train()
+        _randomise_queries(model)
+        out = model(idx)
+        out.float().pow(2).mean().backward()
+        runs.append((out.detach(), {n: p.grad for n, p in model.named_parameters()}))
+    (o0, g0), (o1, g1) = runs
+    assert torch.equal(o0, o1)
+    for name, g in g0.items():
+        if g is None:
+            assert g1[name] is None or torch.count_nonzero(g1[name]) == 0, name
+        else:
+            torch.testing.assert_close(g1[name], g, atol=1e-6, rtol=1e-5, msg=name)
+
+
+# ---- padded dispatch is batch-dependent (I3) ------------------------------------------
+
+def _overflowing_padded_model() -> QuipuMoE:
+    torch.manual_seed(0)
+    cfg = tiny(moe_dispatch="padded", capacity_factor=1.0, attnres_blocks=0)
+    model = QuipuMoE(cfg).eval()
+    with torch.no_grad():
+        for b in model.blocks:
+            b.moe.balancer.bias.copy_(torch.tensor([5.0, 5.0] + [0.0] * (cfg.n_experts - 2)))
+    return model
+
+
+def test_padded_dispatch_keeps_earlier_positions_of_a_row_exactly_unchanged():
+    """Inside one row, overflow is decided in token order, so changing later tokens
+    never changes an earlier position -- even with every expert overflowing."""
+    model = _overflowing_padded_model()
+    ids = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        before = model(ids)
+        assert all(int(s.dropped) > 0 for s in model.last_stats)
+        ids2 = ids.clone()
+        ids2[0, 10:] = (ids2[0, 10:] + 1) % 64
+        after = model(ids2)
+    assert torch.equal(after[0, :10], before[0, :10])
+
+
+def test_padded_dispatch_drops_depend_on_the_rest_of_the_batch():
+    """Switch-style capacity: the same row gives different logits alone and after
+    another row (whose tokens fill the experts first). Use loop dispatch to evaluate."""
+    model = _overflowing_padded_model()
+    g = torch.Generator().manual_seed(0)
+    rows = torch.randint(0, 64, (2, 16), generator=g)
+    with torch.no_grad():
+        alone = model(rows[1:])
+        batched = model(rows)
+    assert not torch.allclose(alone[0], batched[1])
+    model.set_dispatch("loop")
+    with torch.no_grad():
+        alone = model(rows[1:])
+        batched = model(rows)
+    torch.testing.assert_close(batched[1], alone[0], atol=1e-5, rtol=0)
+
+
+def test_dispatch_can_be_switched_at_runtime():
+    model = _overflowing_padded_model()
+    ids = torch.randint(0, 64, (2, 16), generator=torch.Generator().manual_seed(1))
+    torch.manual_seed(0)
+    loop_model = QuipuMoE(tiny(attnres_blocks=0)).eval()
+    loop_model.load_state_dict(model.state_dict())
+    model.set_dispatch("loop")
+    assert all(b.moe.dispatch == "loop" for b in model.blocks)
+    with torch.no_grad():
+        assert torch.equal(model(ids), loop_model(ids))
+        assert all(int(s.dropped) == 0 for s in model.last_stats)
+    model.blocks[0].moe.dispatch = "padded"
+    assert model.blocks[0].moe.dispatch == "padded"
+    with pytest.raises(ValueError):
+        model.set_dispatch("scatter")
+    with pytest.raises(ValueError):
+        model.blocks[0].moe.dispatch = "scatter"
+
+
+# ---- stats survive recompute (M3) --------------------------------------------------
+
+@pytest.mark.parametrize("attnres_blocks", [0, 2])
+def test_last_stats_has_one_entry_per_layer_after_repeated_forwards(attnres_blocks):
+    torch.manual_seed(0)
+    cfg = tiny(attnres_blocks=attnres_blocks)
+    model = QuipuMoE(cfg)
+    idx = torch.randint(0, cfg.vocab_size, (2, 8))
+    for _ in range(2):
+        model(idx)
+        assert len(model.last_stats) == cfg.n_layer
+        assert all(s is not None for s in model.last_stats)
+
+
+def test_recomputing_a_sub_layer_overwrites_its_stats_instead_of_appending(monkeypatch):
+    """A trainer that checkpoints sub-layers re-runs them in backward; the stats list
+    must stay one entry per layer."""
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(0)
+    cfg = tiny()
+    model = QuipuMoE(cfg).train()
+    real = QuipuMoE._sublayer
+    monkeypatch.setattr(QuipuMoE, "_sublayer", lambda self, i, h, cos, sin: checkpoint(
+        real, self, i, h, cos, sin, use_reentrant=False))
+    model(torch.randint(0, cfg.vocab_size, (2, 8))).float().pow(2).mean().backward()
+    assert len(model.last_stats) == cfg.n_layer
+
+
+# ---- optimizer grouping helper -------------------------------------------------------
+
+def test_no_decay_param_names_are_the_norms_and_pseudo_queries():
+    cfg = tiny(n_layer=4, attnres_blocks=2)
+    with torch.device("meta"):
+        model = QuipuMoE(cfg)
+    names = model.no_decay_param_names()
+    params = dict(model.named_parameters())
+    assert all(params[n].ndim == 1 for n in names)
+    assert {n for n, p in params.items() if p.ndim == 1} == set(names)
+    assert sum(n.startswith("attnres.queries.") for n in names) == 2 * cfg.n_layer + 1
+    assert "norm.weight" in names and "blocks.0.norm1.weight" in names
+    assert not any("experts" in n or "embed" in n for n in names)

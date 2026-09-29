@@ -37,6 +37,7 @@ activation     = "swiglu"   # arm 3: "situ_glu"
 situ_beta_gate = 4.0
 situ_beta_up   = 25.0
 attnres_blocks = 0          # arm 2: 4 (four blocks of two layers)
+attnres_checkpoint = true   # recompute the depth mix in backward (AttnRes only)
 balance_update_rate = 0.3
 
 [data]

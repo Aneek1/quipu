@@ -265,6 +265,7 @@ def test_quipu_114m_gets_the_dense_gpt2_adamw_defaults():
     assert (m.activation, m.situ_beta_gate, m.situ_beta_up, m.balance_update_rate) == (
         "swiglu", 4.0, 25.0, 0.3)
     assert (m.moe_dispatch, m.capacity_factor) == ("loop", 1.5)
+    assert m.attnres_checkpoint is True
     assert d.tokenizer == "gpt2"
     assert d.code_language_weights == {} and d.text_language_weights == {}
     assert (d.lid_model, d.lid_revision) == ("AneekC/lid-specialists-9plus1", "")
@@ -351,6 +352,8 @@ def test_moe_configs_have_weights_summing_to_one(path):
         ({"shared_experts": 1, "shared_hidden": 0}, "shared_hidden"),
         ({"shared_experts": 0, "shared_hidden": 128}, "shared_experts"),
         ({"attnres_blocks": 3}, "attnres_blocks"),
+        ({"attnres_checkpoint": 1}, "attnres_checkpoint"),
+        ({"attnres_checkpoint": "yes"}, "attnres_checkpoint"),
         ({"top_k": 2.0}, "top_k"),
         ({"situ_beta_gate": 0.0}, "situ_beta_gate"),
         ({"situ_beta_up": -1.0}, "situ_beta_up"),
