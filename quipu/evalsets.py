@@ -15,6 +15,14 @@ Batches: split_batches() reads the first tokens of a split into rows of `context
 tokens and a short split is evaluated once rather than repeated. The per-language
 validation splits can be short (allow_short in the builder).
 
+Bits per byte over these batches (quipu.eval.nll_tokens_bytes): summed next-token
+loss in bits / the UTF-8 bytes of the target tokens (tokenizer.token_byte_lengths).
+The splits keep their <|endoftext|> document separators, and a separator is a target
+like any other token: its loss is counted but it is 0 bytes of text. So bpb here is
+slightly higher (more pessimistic) than a separator-free definition would give, by a
+share that depends on the split's document length; compare numbers only across models
+evaluated on the same splits.
+
 Checkpoints: a milestone is a bare bf16 state_dict; a full checkpoint is
 {"model": fp32 state_dict, "optimizers": ..., ...}. load_model() takes either, builds
 the configured model (quipu.model_factory) and loads strictly, so a mismatch fails

@@ -66,6 +66,7 @@ def test_main_writes_a_table_with_one_row_per_expert_and_a_heatmap(tmp_path, mon
     rows = [l for l in english.splitlines() if l.startswith("| ") and l[2].isdigit()]
     assert len(rows) == cfg.model.n_experts
     assert "| expert | L0 | L1 |" in english
+    assert "Python vs JavaScript" in md and "zero assignments" in md
     data = json.loads((out / "usage.json").read_text(encoding="utf-8"))
     for u in data["splits"].values():
         assert all(abs(sum(row) - 1.0) < 1e-9 for row in u["frequency"])

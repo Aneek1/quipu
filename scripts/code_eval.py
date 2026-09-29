@@ -3,21 +3,33 @@ generated Python, run on the laptop (no paid time).
 
     python -m uv run python scripts/code_eval.py --config results/moe/run_config.toml \
         [--checkpoint latest|PATH] [--chat] [--samples 20] [--limit N] \
-        [--benchmarks humaneval,mbpp] [--model-name quipu-moe-1B-A149M] [--out results/code_eval]
+        [--benchmarks humaneval,mbpp] [--model-name NAME] [--out results/code_eval]
+
+--model-name defaults to the release name the config's model gets
+(quipu.model_card.release_name, e.g. quipu-moe-1B-A149M, plus -chat), which is the
+file name the model card looks for.
 
 Benchmarks, at the commits pinned in the config (data.humaneval_revision /
-data.mbpp_revision, the same ones the shard builder decontaminated against):
+data.mbpp_revision, the same ones the shard builder decontaminated against; main()
+refuses to run when the shard manifest's decontamination.benchmarks names another
+commit):
 - HumanEval: openai/openai_humaneval, test split, 164 problems (MIT);
 - MBPP: google-research-datasets/mbpp, "sanitized" config, test split, 257 problems
   (CC-BY-4.0).
 
-Prompts:
-- base (default): plain completion. HumanEval: the problem's prompt (signature +
-  docstring), the model writes the body. MBPP: the task text and its first test in a
-  docstring (the usual MBPP completion prompt), the model writes the function.
-  Generation stops at a stop sequence (STOP_HUMANEVAL / STOP_MBPP): the next
-  top-level def/class/if __name__/print(/comment. MBPP keeps a second def (helper
-  functions are common there) and stops at a following assert or docstring instead.
+Prompts (also written, with the exact stop lists, into every report and the card):
+- base (default): plain completion, zero-shot.
+  HumanEval: the problem's prompt (signature + docstring) with trailing whitespace
+  removed, prompt.rstrip() (the BigCode harness convention). The byte-level
+  pre-tokeniser merges a newline with the next line's indentation into one token, so
+  a prompt ending in a newline ends on a token that the solution never contains (every one
+  of the 164 prompts broke this way with the real tokenizer); the model writes the
+  newline and indentation itself. The program is the stripped prompt + completion.
+  MBPP: the task text and its first test in a docstring, the model writes the
+  function (BigCode style); the prompt ends on the closing docstring quotes and a
+  newline, followed by "def", which tokenises as a prefix, so it is not stripped.
+  Generation stops at the earliest stop sequence (STOP_HUMANEVAL / STOP_MBPP, listed
+  exactly in the reports). MBPP keeps a second def (helper functions are common there).
 - chat (--chat, a chat fine-tune): the spec 13 template <|user|>...<|end|><|assistant|>,
   generation stops at <|end|>; the code is the reply's first ```python block (or the
   whole reply). A reply that defines the HumanEval entry point replaces the prompt's
@@ -25,16 +37,22 @@ Prompts:
 
 Decoding: greedy (temperature 0) gives pass@1; --samples n (default 20) samples at
 temperature 0.8, top-p 0.95 give pass@1 and pass@10 by the unbiased estimator of
-Chen et al. 2021 (pass_at_k). --samples 0 runs greedy only. Every MoE forward uses
-loop dispatch; each problem's samples are one batch with a seeded generator.
+Chen et al. 2021 (pass_at_k); both k from the same T=0.8 samples (published models
+often use T=0.2 for pass@1, so the reports label every row's setting). --samples 0
+runs greedy only. Every MoE forward uses loop dispatch; each problem's samples are one
+batch with a seeded generator.
 
-Execution: each candidate program is written to its own temporary directory and run
-by a fresh `python -I` subprocess with a timeout (10 s; the process tree is killed on
-timeout) and no network, best effort: proxy variables point at an unreachable
-address, and a prelude replaces socket.socket / create_connection / getaddrinfo with
-functions that raise. On POSIX, resource limits (address space 4 GB, CPU time, file
-size 16 MB, no core dumps) apply too. This is NOT a security sandbox: run it only on
-a machine where running untrusted model output is acceptable.
+Execution, best effort and NOT a security boundary: each candidate program is written
+to its own temporary directory and run by a fresh `python -I` subprocess with a
+timeout (10 s; the process tree is killed on timeout). A prelude (GUARD_PRELUDE, after
+human-eval's reliability_guard) runs first: it disables deleting / renaming files,
+os.system / fork / kill, subprocess.Popen, shutil.rmtree / move and builtins
+exit / quit; refuses opening a file for writing outside the temporary directory;
+replaces socket.socket with a subclass whose connect / connect_ex / sendto raise
+(so ssl, asyncio and urllib still import) and blocks getaddrinfo / create_connection;
+and on Linux / POSIX sets resource limits (address space 4 GB, CPU time, file size
+16 MB, no core dumps). Proxy variables point at an unreachable address. Run it only
+on a machine where running untrusted model output is acceptable.
 
 Writes results/code_eval/<model-name>.json (per problem: greedy status and
 completion, samples passed) and <model-name>.md (the table, with published numbers of
@@ -83,13 +101,104 @@ TOP_P = 0.95
 MAX_NEW_TOKENS = 384
 SEED = 1234
 UNREACHABLE_PROXY = "http://127.0.0.1:9"
-NO_NETWORK_PRELUDE = (
-    "import socket as _qs\n"
-    "def _qs_blocked(*a, **k):\n"
-    "    raise OSError('network disabled by code_eval')\n"
-    "_qs.socket = _qs_blocked\n_qs.create_connection = _qs_blocked\n"
-    "_qs.getaddrinfo = _qs_blocked\ndel _qs\n"
-)
+SANDBOX_NOTE = ("best effort, not a security boundary: run it only where executing "
+                "untrusted model output is acceptable")
+# Runs before every candidate (human-eval's reliability_guard, plus a write guard and a
+# socket that cannot connect). Everything lives inside one function that deletes itself,
+# so the candidate's namespace is untouched. Limits are set here, not in preexec_fn
+# (which is not safe with threads, and the harness runs candidates from a pool).
+GUARD_PRELUDE = r'''
+def _quipu_guard(timeout):
+    import builtins, io, os, shutil, socket, subprocess, sys
+    if os.name == "posix":
+        try:
+            import resource
+            gb = 1 << 30
+            for res, val in ((resource.RLIMIT_AS, 4 * gb), (resource.RLIMIT_DATA, 4 * gb),
+                             (resource.RLIMIT_FSIZE, 16 << 20), (resource.RLIMIT_CORE, 0),
+                             (resource.RLIMIT_CPU, timeout)):
+                try:
+                    resource.setrlimit(res, (val, val))
+                except (ValueError, OSError):
+                    pass
+        except ImportError:
+            pass
+    try:
+        import faulthandler
+        faulthandler.disable()
+    except Exception:
+        pass
+
+    def blocked(name):
+        def refuse(*a, **k):
+            raise PermissionError(f"{name} is disabled by code_eval")
+        return refuse
+
+    root = os.path.realpath(os.getcwd())
+
+    def inside(path):
+        try:
+            p = os.path.realpath(os.fspath(path))
+        except TypeError:        # a file descriptor: already open, allowed
+            return True
+        return p == root or p.startswith(root + os.sep)
+
+    real_open, real_os_open = io.open, os.open
+    writing = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def guarded_open(file, mode="r", *a, **k):
+        if any(c in mode for c in "wax+") and not inside(file):
+            raise PermissionError(f"code_eval: writing outside the temp dir: {file!r}")
+        return real_open(file, mode, *a, **k)
+
+    def guarded_os_open(path, flags, *a, **k):
+        if flags & writing and not inside(path):
+            raise PermissionError(f"code_eval: writing outside the temp dir: {path!r}")
+        return real_os_open(path, flags, *a, **k)
+
+    builtins.open = io.open = guarded_open
+    os.open = guarded_os_open
+    for name in ("kill", "killpg", "system", "putenv", "remove", "removedirs", "rmdir",
+                 "fchdir", "setuid", "fork", "forkpty", "rename", "renames", "truncate",
+                 "replace", "unlink", "fchmod", "fchown", "chmod", "chown", "chroot",
+                 "lchflags", "lchmod", "lchown", "link", "symlink", "startfile",
+                 "execv", "execve", "execl", "execle", "execlp", "execvp", "execvpe",
+                 "spawnl", "spawnle", "spawnv", "spawnve", "popen", "posix_spawn",
+                 "posix_spawnp"):
+        if hasattr(os, name):
+            setattr(os, name, blocked("os." + name))
+    for name in ("rmtree", "move", "chown"):     # copies go through the guarded open
+        setattr(shutil, name, blocked("shutil." + name))
+    class NoPopen(subprocess.Popen):     # a class: asyncio subclasses it at import
+        def __init__(self, *a, **k):
+            raise PermissionError("subprocess.Popen is disabled by code_eval")
+
+        def __del__(self):
+            pass
+
+    subprocess.Popen = NoPopen
+    builtins.exit = builtins.quit = None
+
+    def no_network(*a, **k):
+        raise OSError("network disabled by code_eval")
+
+    class NoNetSocket(socket.socket):
+        connect = connect_ex = sendto = no_network
+
+    socket.socket = NoNetSocket
+    socket.create_connection = socket.getaddrinfo = no_network
+    for name in ("ipdb", "joblib", "psutil", "tkinter"):
+        sys.modules[name] = None
+
+
+_quipu_guard(%d)
+del _quipu_guard
+'''
+
+
+def guard_prelude(timeout: float) -> str:
+    """GUARD_PRELUDE with the CPU-time limit for this timeout."""
+    return GUARD_PRELUDE % (int(math.ceil(timeout)) + 1)
 
 # Published numbers of reference models (cited, not re-run) live in quipu.model_card,
 # shared with the model card.
@@ -102,7 +211,7 @@ PUBLISHED = model_card.PUBLISHED
 class Task:
     benchmark: str
     task_id: str
-    prompt: str            # the base (completion) prompt
+    prompt: str            # the base (completion) prompt; HumanEval's is rstrip()ped
     instruction: str       # the chat user turn
     test: str              # appended after the candidate code
     entry_point: str | None
@@ -116,7 +225,9 @@ def humaneval_tasks(rows: Sequence[dict]) -> list[Task]:
         instruction = ("Complete the following Python function. Reply with the whole "
                        "function in a ```python code block.\n\n```python\n"
                        + r["prompt"] + "```")
-        out.append(Task(HUMANEVAL, r["task_id"], r["prompt"], instruction,
+        # rstrip: the prompt must end where a token boundary of prompt + solution is
+        # (see the module docstring); the model generates the newline + indentation.
+        out.append(Task(HUMANEVAL, r["task_id"], r["prompt"].rstrip(), instruction,
                         r["test"] + f"\n\ncheck({r['entry_point']})\n", r["entry_point"],
                         STOP_HUMANEVAL))
     return out
@@ -178,20 +289,81 @@ def extract_code(reply: str) -> str:
 
 
 def build_program(task: Task, completion: str, chat: bool) -> str:
-    """The program that passes iff the candidate is correct (exit status 0)."""
+    """The program that passes iff the candidate is correct (exit status 0).
+    Base HumanEval: the stripped prompt + the completion verbatim, so the completion
+    must start with the newline and indentation the model generated (as it does when
+    the model continues the docstring's closing line)."""
     if not chat:
         return task.prompt + completion + "\n\n" + task.test
     code = extract_code(completion)
     if task.benchmark == HUMANEVAL:
         if re.search(rf"^\s*def\s+{re.escape(task.entry_point)}\s*\(", code, re.M):
-            return task.prompt + "    pass\n\n" + code + "\n\n" + task.test
-        return task.prompt + code + "\n\n" + task.test
+            return task.prompt + "\n    pass\n\n" + code + "\n\n" + task.test
+        return task.prompt + "\n" + code + "\n\n" + task.test
     return task.setup + code + "\n\n" + task.test
 
 
 def render_chat(user: str) -> str:
     """Spec 13's chat format for one user turn, ready for the assistant's reply."""
     return f"<|user|>{user}<|end|><|assistant|>"
+
+
+def protocol(chat: bool, samples: int, *, temperature: float = TEMPERATURE,
+             top_p: float = TOP_P, max_new_tokens: int = MAX_NEW_TOKENS,
+             timeout: float = TIMEOUT_S) -> dict[str, Any]:
+    """How the numbers were produced, exactly; saved with the results and rendered into
+    the report and the model card (quipu.model_card.protocol_md)."""
+    if chat:
+        prompts = {
+            HUMANEVAL: "chat template <|user|>...<|end|><|assistant|>; the user turn asks "
+                       "to complete the function and shows the published prompt in a "
+                       "```python fence; the reply's first code block (or the whole reply) "
+                       "is the code",
+            MBPP: "chat template; the user turn is the task text, 'Your code should pass "
+                  "this test:' and the first assert; the reply's first code block is the code",
+        }
+        stops: dict[str, list[str]] = {HUMANEVAL: [], MBPP: []}
+        stop_tokens = ["<|end|>", "<|endoftext|>"]
+    else:
+        prompts = {
+            HUMANEVAL: "zero-shot completion of prompt.rstrip() (the published signature + "
+                       "docstring, trailing whitespace removed, BigCode harness convention); "
+                       "the program is that prompt + the completion + the tests",
+            MBPP: "zero-shot completion of '\"\"\"\\n{task text}\\n{first assert}\\n\"\"\"\\n' "
+                  "(the task text and the first assert in a docstring, BigCode style); the "
+                  "program is the completion + the test imports and all asserts",
+        }
+        stops = {HUMANEVAL: list(STOP_HUMANEVAL), MBPP: list(STOP_MBPP)}
+        stop_tokens = ["<|endoftext|>"]
+    return {
+        "mode": "chat" if chat else "base", "prompts": prompts, "stop_sequences": stops,
+        "stop_tokens": stop_tokens, "max_new_tokens": max_new_tokens,
+        "greedy": "temperature 0 (argmax), one completion per problem -> greedy pass@1",
+        "samples": samples, "temperature": temperature if samples else None,
+        "top_p": top_p if samples else None,
+        "estimator": "unbiased pass@k (Chen et al. 2021), pass@1 and pass@10 from the "
+                     "same samples",
+        "timeout_s": timeout,
+        "sandbox": "subprocess `python -I` in a temporary directory with a reliability "
+                   "guard (no deleting / renaming files, no writing outside the temp dir, "
+                   "no subprocesses, sockets cannot connect, resource limits on POSIX); "
+                   + SANDBOX_NOTE,
+    }
+
+
+def check_revisions(revisions: dict[str, str], manifest: str | Path | None) -> None:
+    """Raise if the shard manifest decontaminated against other benchmark commits than
+    the ones evaluated here (manifest.decontamination.benchmarks[b].revision). No
+    manifest, or one without decontamination info, is nothing to check."""
+    problems = model_card.revision_mismatches(revisions, manifest)
+    if problems:
+        raise ValueError("benchmark revision differs from the shard manifest's "
+                         "decontamination: " + "; ".join(problems))
+
+
+def default_model_name(cfg, chat: bool) -> str:
+    """The release name of the configured model (+ -chat): what the model card reads."""
+    return model_card.release_name(*model_card.count_params(cfg.model)) + ("-chat" if chat else "")
 
 
 # ---- pass@k ------------------------------------------------------------------------------
@@ -224,20 +396,6 @@ def _sandbox_env(tmp: str) -> dict[str, str]:
     return env
 
 
-def _posix_limits(timeout: float) -> Callable[[], None]:
-    def apply() -> None:
-        import resource
-        gb = 1 << 30
-        for res, val in ((resource.RLIMIT_AS, 4 * gb), (resource.RLIMIT_FSIZE, 16 << 20),
-                         (resource.RLIMIT_CORE, 0),
-                         (resource.RLIMIT_CPU, int(math.ceil(timeout)) + 1)):
-            try:
-                resource.setrlimit(res, (val, val))
-            except (ValueError, OSError):
-                pass
-    return apply
-
-
 def _kill_tree(proc: subprocess.Popen) -> None:
     """Kill the candidate and anything it started (its own process group / tree)."""
     try:
@@ -259,13 +417,12 @@ def run_program(program: str, timeout: float = TIMEOUT_S) -> tuple[str, str]:
     """("passed" | "failed" | "timeout", the tail of stderr). Runs in a fresh temp dir."""
     with tempfile.TemporaryDirectory(prefix="quipu_code_eval_") as tmp:
         path = Path(tmp) / "candidate.py"
-        path.write_text(NO_NETWORK_PRELUDE + program, encoding="utf-8")
+        path.write_text(guard_prelude(timeout) + program, encoding="utf-8")
         kw: dict[str, Any] = {}
         if os.name == "nt":
             kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kw["start_new_session"] = True
-            kw["preexec_fn"] = _posix_limits(timeout)
         proc = subprocess.Popen([sys.executable, "-I", "-B", str(path)], cwd=tmp,
                                 env=_sandbox_env(tmp), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kw)
@@ -382,16 +539,17 @@ def evaluate(model, tok, tasks: Sequence[Task], *, chat: bool = False, samples: 
                 done = sum(p["greedy"] == "passed" for p in per)
                 log(f"  {i + 1}/{len(tasks)} problems, greedy {done} passed "
                     f"({time.perf_counter() - t0:.0f} s)")
-    return {"per_problem": per, **summarise(per, samples)}
+    return {"per_problem": per, **summarise(per, samples, temperature)}
 
 
-def summarise(per: Sequence[dict], samples: int) -> dict[str, Any]:
+def summarise(per: Sequence[dict], samples: int, temperature: float = TEMPERATURE,
+              top_p: float = TOP_P) -> dict[str, Any]:
     n_prob = len(per)
     out: dict[str, Any] = {
         "problems": n_prob,
         "greedy_pass@1": 100.0 * sum(p["greedy"] == "passed" for p in per) / max(n_prob, 1),
-        "samples": samples, "temperature": TEMPERATURE if samples else None,
-        "top_p": TOP_P if samples else None,
+        "samples": samples, "temperature": temperature if samples else None,
+        "top_p": top_p if samples else None,
     }
     for k in (1, 10):
         if samples >= k and n_prob:
@@ -410,7 +568,7 @@ def _pct(v: float | None) -> str:
 def results_table(ours: Sequence[dict[str, Any]]) -> str:
     """Markdown table: our models (measured here) then PUBLISHED (cited, not re-run).
     `ours` items: {"model", "params", "results": {benchmark: summary}}."""
-    return model_card.code_results_table(list(ours), TEMPERATURE, TOP_P)
+    return model_card.code_results_table(list(ours))
 
 
 def report_md(name: str, payload: dict[str, Any]) -> str:
@@ -421,9 +579,10 @@ def report_md(name: str, payload: dict[str, Any]) -> str:
         lines.append(f"- {b}: {info['dataset']} `{info['file']}` at {info['revision'][:12]} "
                      f"({info['license']}), {info['evaluated']} of {info['problems']} problems.")
     lines += ["", results_table([{"model": name, "params": payload.get("params", "-"),
-                                  "results": payload["results"]}]), "",
-              f"Candidates ran in subprocesses with a {TIMEOUT_S:g} s timeout, network "
-              "disabled best effort. pass@k by the unbiased estimator (Chen et al. 2021)."]
+                                  "results": payload["results"],
+                                  "chat": payload["chat"]}]), ""]
+    if payload.get("protocol"):
+        lines += ["## Protocol", "", model_card.protocol_md(payload["protocol"]), ""]
     if any(info["evaluated"] < info["problems"] for info in payload["benchmarks"].values()):
         lines += ["", "**Partial run (--limit): not comparable with the full-benchmark numbers.**"]
     return "\n".join(lines) + "\n"
@@ -442,7 +601,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=None, help="first N problems per benchmark")
     ap.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--model-name", default=None)
+    ap.add_argument("--model-name", default=None,
+                    help="default: the release name, e.g. quipu-moe-1B-A149M(-chat)")
+    ap.add_argument("--manifest", default=None,
+                    help="shard manifest to cross-check the benchmark revisions against "
+                         "(default: <shard_dir>/manifest.json, skipped when absent)")
     ap.add_argument("--out", default="results/code_eval")
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     args = ap.parse_args(argv)
@@ -452,6 +615,8 @@ def main(argv: list[str] | None = None) -> int:
     from quipu.tokenizer import make_tokenizer
 
     cfg = load_config(args.config)
+    revisions = {HUMANEVAL: cfg.data.humaneval_revision, MBPP: cfg.data.mbpp_revision}
+    check_revisions(revisions, args.manifest or Path(cfg.data.shard_dir) / "manifest.json")
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() and torch.cuda.device_count() else "cpu"
@@ -462,10 +627,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.chat and not hasattr(tok, "encode_with_special"):
         print("error: --chat needs the BPE tokenizer with chat tokens", file=sys.stderr)
         return 2
-    name = args.model_name or (cfg.name + ("-chat" if args.chat else ""))
-    revisions = {HUMANEVAL: cfg.data.humaneval_revision, MBPP: cfg.data.mbpp_revision}
+    name = args.model_name or default_model_name(cfg, args.chat)
     payload: dict[str, Any] = {"model": name, "checkpoint": str(path), "chat": args.chat,
-                               "benchmarks": {}, "results": {}}
+                               "benchmarks": {}, "results": {},
+                               "protocol": protocol(args.chat, args.samples,
+                                                    max_new_tokens=args.max_new_tokens)}
     for b in [x.strip() for x in args.benchmarks.split(",") if x.strip()]:
         if b not in FILES:
             print(f"error: unknown benchmark {b!r}", file=sys.stderr)
@@ -478,8 +644,8 @@ def main(argv: list[str] | None = None) -> int:
                        max_new_tokens=args.max_new_tokens, workers=args.workers)
         payload["benchmarks"][b] = {**info, "evaluated": len(tasks)}
         payload["results"][b] = res
-        print(f"{b}: greedy pass@1 {res['greedy_pass@1']:.1f}; pass@10 "
-              f"{_pct(res['pass@10'])}", flush=True)
+        print(f"{b}: greedy pass@1 {res['greedy_pass@1']:.1f}; sampled pass@1 "
+              f"{_pct(res['pass@1'])}, pass@10 {_pct(res['pass@10'])}", flush=True)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     write_text_atomic(out / f"{name}.json", json.dumps(payload, indent=1, ensure_ascii=False))

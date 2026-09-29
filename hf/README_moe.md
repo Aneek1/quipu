@@ -22,7 +22,7 @@ datasets:
 - HuggingFaceFW/fineweb-edu
 - HuggingFaceFW/fineweb-2
 - codeparrot/github-code-clean
----
+{{datasets_yaml}}---
 
 # {{model_name}}
 
@@ -120,18 +120,17 @@ runs the experts one after another without a KV cache: correct, not fast.
 
 - Small: {{active_params}} parameters are active per token. It states false things
   with confidence; do not use its output as information.
-- Ten languages share about 12% of the training text; English and code dominate.
-  Expect clearly weaker output in the other nine, especially Tamil and romanised
-  Hindi / Urdu, and some mixing of languages.
-- Code is syntax-shaped far more often than it is correct (see HumanEval / MBPP above).
+{{mix_limitation}}
+{{code_limitation}}
+{{experts_limitation}}
 - Trained on web text and public code, which carry their biases; no safety tuning.
-- The chat model (if this is it) was fine-tuned briefly: it follows short, simple
-  instructions and degrades over long conversations.
+{{chat_limitation}}
 
 ## Credits and licence
 
 Weights and code: Apache-2.0. Language identification of the training text used
 [{{lid_model}}](https://huggingface.co/{{lid_model}}) (MIT). Training data: FineWeb-Edu
 and FineWeb-2 (ODC-By 1.0, © Hugging Face) and the permissively licensed subset of
-codeparrot/github-code-clean (files keep their licences). HumanEval (MIT) and MBPP
-(CC-BY-4.0) were used for evaluation only and removed from the training data.
+codeparrot/github-code-clean (files keep their licences).{{sft_credits}} HumanEval
+(MIT) and MBPP (CC-BY-4.0) were used for evaluation only and filtered (substring /
+13-gram matching) from the training data.

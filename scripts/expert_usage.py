@@ -10,8 +10,13 @@ loop dispatch (nothing dropped, nothing batch-dependent) and every routed assign
 is counted from the layers' MoEStats. frequency = assignments to the expert / (tokens
 x top_k), so each layer's row sums to 1 and the balanced target is 1 / n_experts.
 
-Flags, per split and layer (the same bounds as the trainer's health alert): an expert
-is "dead" below 10% of the target and "overloaded" above 300% of it.
+Flags, per split and layer (the trainer's health-alert bounds, quipu.train
+MOE_HEALTH_LOW / MOE_HEALTH_HIGH, imported): an expert is "dead" below 10% of the
+target and "overloaded" above 300% of it, over the evaluated tokens. "Dead" means
+something else in the training log: there it counts experts with ZERO assignments in
+a logging interval, and the trainer's health alert needs a load outside the bounds
+for MOE_HEALTH_WINDOW consecutive steps. So an expert can be "dead" here (rarely
+chosen on held-out text) without ever being dead or alerted in training.
 
 Writes (atomically) to --out:
     usage.json   counts, frequencies and flags per split
@@ -21,9 +26,11 @@ Writes (atomically) to --out:
                  target): blue under-used, grey on target, red over-used (clipped at
                  1/4x and 4x)
 
-code_val mixes programming languages (the shards carry no per-document label), so
-code is one split here; the Python vs JavaScript split of spec 7 needs labelled
-code validation shards, which the shard builder does not write.
+Limitation: code_val mixes programming languages (the shards carry no per-document
+label), so code is one split here; the Python vs JavaScript / JSX split of spec 7
+needs labelled code validation shards, which the shard builder does not write. The
+model card states this (quipu.model_card.EXPERTS_LIMITATION), and summary.md says it
+too.
 """
 from __future__ import annotations
 
@@ -44,8 +51,11 @@ from quipu.config import Config, load_config  # noqa: E402
 from quipu.eval import loop_dispatch  # noqa: E402
 from quipu.fsio import write_text_atomic  # noqa: E402
 
-DEAD_BELOW = 0.10       # x target
-OVERLOADED_ABOVE = 3.0  # x target
+# The trainer's health-alert bounds, imported so the two never drift apart.
+from quipu.train import MOE_HEALTH_HIGH, MOE_HEALTH_LOW  # noqa: E402
+
+DEAD_BELOW = MOE_HEALTH_LOW          # x target (0.1)
+OVERLOADED_ABOVE = MOE_HEALTH_HIGH   # x target (3.0)
 CLIP = 2.0              # heatmap: log2 ratio clipped to [-2, 2] (1/4x .. 4x)
 
 # Diverging pair (dataviz reference palette): blue <-> red, neutral grey midpoint.
@@ -112,7 +122,12 @@ def summary_md(usage: dict[str, dict], cfg: Config, checkpoint: str) -> str:
         f"Checkpoint `{checkpoint}`; {m.n_layer} layers x {m.n_experts} routed experts, "
         f"top-{m.top_k}. Share of each layer's routed assignments (loop dispatch); the "
         f"balanced target is {100 / m.n_experts:.2f}% per expert. Dead: < "
-        f"{DEAD_BELOW:.0%} of target; overloaded: > {OVERLOADED_ABOVE:.0%} of target.",
+        f"{DEAD_BELOW:.0%} of target; overloaded: > {OVERLOADED_ABOVE:.0%} of target "
+        "(the trainer's health-alert bounds; the training log's \"dead\" is stricter: zero "
+        "assignments in an interval).", "",
+        "Not measured: expert use by programming language (Python vs JavaScript / JSX). "
+        "The code validation shards carry no per-document language label, so code is one "
+        "split.",
         "", "## Flags", "",
         "| split | tokens | dead | overloaded |", "|---|---:|---|---|",
     ]
