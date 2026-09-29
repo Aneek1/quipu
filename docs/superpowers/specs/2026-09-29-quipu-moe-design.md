@@ -176,3 +176,15 @@ The owner chose to try FP8 training. It is an option decided by measurement, not
 - **A/B pair 4 (§6.1):** bf16 vs FP8 on the scale-down, same seed and tokens. **Kept if** FP8's tokens/s is ≥ 1.2× bf16 **and** its final validation loss is within the seed noise of bf16 (and no extra loss spikes). Otherwise the full run stays bf16. Cost of the pair plus its seed re-run: about 45 minutes of box time (~$0.40), paid from the A/B allowance.
 - **If kept:** the throughput gain buys more tokens inside the same $20 cap; the full run's token target is recomputed from the measured tokens/s by the launcher (M9), never assumed.
 - **Not in scope:** int4/FP4 training. int4 is for inference only: M10 adds a weight-only int4 export with its measured quality loss (bits per byte per language and the stepbuild score vs bf16).
+
+## 13. Amendment — chat fine-tune (2026-09-29)
+
+The owner wants to chat with the model, so a short supervised fine-tune (SFT) follows pretraining, in the same box session (no second setup).
+
+- **Release names:** base `AneekC/quipu-moe-1B-A149M`; chat `AneekC/quipu-moe-1B-A149M-chat`. The cards state total and active parameters and never call either "a 1B model" without "A149M".
+- **Format:** the tokenizer's chat tokens: `<|system|>…<|end|><|user|>…<|end|><|assistant|>…<|end|>`, one conversation per sequence (packed with `<|endoftext|>` separators, attention not crossing conversations is not required at this size). Loss only on assistant tokens, including their `<|end|>`.
+- **Data (human-written, permissive, no outputs of models whose terms forbid training on them):** Aya dataset (CohereForAI/aya_dataset, Apache-2.0), filtered to the ten languages of spec §11 plus a small share of others if short; OpenAssistant oasst2 (Apache-2.0), top-ranked reply paths, conversations in our languages; stepbuild train split (FILE-block replies). Exact dataset revisions, licences and per-source counts go in the card. The stepbuild test split and benchmark apps stay out (LeakageGuard).
+- **Size and cost:** everything the sources hold after filtering, up to ~100M tokens including repeats (at most 3 epochs); about 15–30 minutes on the 5090, ~$0.25, inside the $20 cap's reserve. The spend guard covers it.
+- **Settings:** start from the final pretraining checkpoint; the optimizer that won A/B pair 1 at 0.1× the pretraining peak LR, short warm-up, cosine to 0; same precision as pretraining.
+- **Evaluation:** held-out chat loss per source; two fixed prompts per language answered at temperature 0 and shown verbatim in the card (good and bad); the stepbuild benchmark for base (few-shot) and chat, side by side with the reference models.
+- **Honest framing:** a small chat model — answers simple questions, follows short instructions, writes small code, switches languages; often wrong, weak over long conversations.
