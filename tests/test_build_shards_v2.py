@@ -1510,7 +1510,9 @@ SHORT_MBPP = "def add_two(a, b):\n    return a + b"
 
 
 def planted_problems():
-    return [dc.Problem(dc.HUMANEVAL, "HumanEval/900", (HE_PROMPT, HE_SOLUTION), HE_SOLUTION),
+    he = dc.humaneval_problems([{"task_id": "HumanEval/900", "prompt": HE_PROMPT,
+                                 "canonical_solution": HE_SOLUTION}])
+    return he + [
             dc.Problem(dc.MBPP, "901", (MBPP_CODE, MBPP_TEXT), MBPP_CODE),
             dc.Problem(dc.MBPP, "902", (SHORT_MBPP, "Write a function to add two numbers."),
                        SHORT_MBPP)]
@@ -1639,6 +1641,13 @@ def _planted_world(extra_val=()):
     val = list(src.text_val["eng_Latn"]())
     val.insert(3, {"text": "@eng_Latn:0.95 A copied answer: " + HE_SOLUTION})
     src.text_val["eng_Latn"] = lambda: iter(val)
+    # Train text (FineWeb-Edu, FineWeb-2) is decontaminated too.
+    eng = list(src.text_train["eng_Latn"]())
+    eng.insert(3, {"text": "@eng_Latn:0.95 A blog post with the answer:\n" + HE_SOLUTION})
+    src.text_train["eng_Latn"] = text_source(eng)
+    ind = list(src.text_train["ind_Latn"]())
+    ind.insert(2, {"text": f"@ind_Latn:0.95 Soal latihan: {MBPP_TEXT}"})
+    src.text_train["ind_Latn"] = text_source(ind)
     return src
 
 
@@ -1650,6 +1659,9 @@ def test_the_build_drops_planted_benchmark_problems_and_counts_them(tmp_path):
     assert dropped["train_code"] == {dc.HUMANEVAL: 1, dc.MBPP: 2}
     assert dropped["code_val"] == {dc.HUMANEVAL: 1, dc.MBPP: 0}
     assert dropped["val"] == {dc.HUMANEVAL: 1, dc.MBPP: 0}
+    assert dropped["train_text"] == {dc.HUMANEVAL: 1, dc.MBPP: 1}
+    assert "train text" in m["decontamination"]["applied_to"]
+    assert m["text"]["by_language"]["eng_Latn"]["dropped_contamination"] == 1
     assert m["decontamination"]["index"]["revisions"] == {dc.HUMANEVAL: "a" * 40,
                                                           dc.MBPP: "b" * 40}
     assert m["code"]["stats"]["dropped_contamination"] == 3
@@ -1707,3 +1719,138 @@ def test_a_changed_decontamination_index_cannot_be_resumed(tmp_path):
     with pytest.raises(sm.ResumeError, match="decontamination"):
         bs.build_mix(tmp_path, spec(**RESUME_SPEC), src,
                      sm.DocSetup(tokenizer=CharTok, max_doc_tokens=2_000, decontam=other))
+
+
+# HumanEval/13 as the benchmark has it: its solution has only two 13-grams.
+GCD_PROMPT = ('\n\ndef greatest_common_divisor(a: int, b: int) -> int:\n'
+              '    """ Return a greatest common divisor of two integers a and b\n'
+              '    >>> greatest_common_divisor(3, 5)\n    1\n'
+              '    >>> greatest_common_divisor(25, 15)\n    5\n    """\n')
+GCD_SOLUTION = '    while b:\n        a, b = b, a % b\n    return a\n'
+
+
+def test_decontam_needs_two_13_grams_so_an_ordinary_gcd_is_kept():
+    d = dc.Decontaminator(dc.humaneval_problems([{"task_id": "HumanEval/13",
+                                                  "prompt": GCD_PROMPT,
+                                                  "canonical_solution": GCD_SOLUTION}]))
+    grams = dc.ngrams(dc.tokens(GCD_SOLUTION))
+    assert len(grams) == 2
+    ordinary = ("def gcd(a, b):\n    \"\"\"Euclid.\"\"\"\n    while b:\n"
+                "        a, b = b, a % b\n    return abs(a)\n")
+    assert len(grams & dc.ngrams(dc.tokens(ordinary))) == 1
+    assert d.find(ordinary) is None and d.find(ordinary, prefilter=False) is None
+    # Under the old rule (one n-gram was enough for a 2-gram solution) it was dropped.
+    old = dc.Decontaminator(d.problems, min_grams=1)
+    assert old.find(ordinary) == ("humaneval", "HumanEval/13", "ngrams")
+    # The benchmark's own text is still caught.
+    assert d.find(GCD_PROMPT + GCD_SOLUTION)[:2] == (dc.HUMANEVAL, "HumanEval/13")
+
+
+def test_decontam_catches_the_prompt_docstring_under_a_new_signature():
+    d = planted_decontam()
+    sig = "def rolling_window_peaks(readings: List[float], width: int) -> List[float]:\n"
+    docstring = HE_PROMPT.split(sig)[1]
+    doc = ("import math\n\n\ndef peaks(xs, w):\n" + docstring
+           + "    return [max(xs[i:i + w]) for i in range(len(xs) - w + 1)]\n")
+    assert dc.collapse(HE_PROMPT) not in dc.collapse(doc)
+    assert d.find(doc) == (dc.HUMANEVAL, "HumanEval/900", "ngrams")
+    assert d.find(doc, prefilter=False) == d.find(doc)
+    # The solution's n-grams alone would not have seen it.
+    bare = dc.Decontaminator([p._replace(gram_texts=()) for p in d.problems])
+    assert bare.find(doc) is None
+
+
+def test_decontam_fingerprint_carries_the_rule_version(monkeypatch):
+    d = planted_decontam()
+    assert dc.DECONTAM_VERSION == 2
+    assert d.summary()["version"] == dc.DECONTAM_VERSION
+    before = d.fingerprint()
+    monkeypatch.setattr(dc, "DECONTAM_VERSION", dc.DECONTAM_VERSION + 1)
+    assert d.fingerprint() != before
+
+
+def test_humaneval_docstrings_are_n_gram_texts():
+    (p,) = dc.humaneval_problems([{"task_id": "HumanEval/13", "prompt": GCD_PROMPT,
+                                   "canonical_solution": GCD_SOLUTION}])
+    assert p.gram_texts[0] == GCD_PROMPT
+    assert p.gram_texts[1].strip().startswith("Return a greatest common divisor")
+
+
+# ------------------------------------------------------------------ garbled remote reads
+
+def test_a_garbled_remote_text_read_is_retried_then_succeeds(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    good = tmp_path / "good.parquet"
+    pq.write_table(pa.Table.from_pylist([{"text": "a"}, {"text": "b"}]), good)
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"half a parquet file, cut off by the network " * 20)
+    with pytest.raises(pa.lib.ArrowInvalid):
+        pq.ParquetFile(bad)
+
+    class GarbledTwice:
+        opens = 0
+
+        def open(self, path, mode="rb", **kw):
+            self.opens += 1
+            return open(bad if self.opens <= 2 else good, mode)
+    fs, slept = GarbledTwice(), []
+    rows = list(bs.iter_text_files(fs, ["x.parquet"], sleep=slept.append))
+    assert [r["text"] for r in rows] == ["a", "b"]
+    assert fs.opens == 3 and len(slept) == 2
+    # Garbled on every attempt: the normal bounded retries, then it gives up.
+    slept = []
+
+    class AlwaysGarbled:
+        opens = 0
+
+        def open(self, path, mode="rb", **kw):
+            self.opens += 1
+            return open(bad, mode)
+    fs = AlwaysGarbled()
+    with pytest.raises(bs.TransientError):
+        list(bs.iter_text_files(fs, ["x.parquet"], sleep=slept.append))
+    assert fs.opens == bs.DOWNLOAD_ATTEMPTS and len(slept) == bs.DOWNLOAD_ATTEMPTS - 1
+    # A local corrupt file is still permanent by the classifier.
+    assert bs.is_permanent(pa.lib.ArrowInvalid("bad"))
+
+
+# ------------------------------------------------------------------ stale finished builds
+
+def test_a_finished_build_with_other_settings_is_refused_with_exit_4(tmp_path, monkeypatch,
+                                                                     reference_build, capsys):
+    import shutil
+
+    ref_root, ref = reference_build
+    assert set(ref["fingerprint"]) == {"sources", "mix"}
+    root = tmp_path / "done"
+    shutil.copytree(ref_root, root)
+    before = (root / "manifest.json").read_bytes()
+    changed = spec(**{**RESUME_SPEC, "train_tokens": 250_000})
+    with pytest.raises(sm.ResumeError) as exc:
+        bs.build_mix(root, changed, _no_sources(world(lid=True)), setup(lid=True))
+    msg = str(exc.value)
+    assert "train_tokens: 300000 -> 250000" in msg and "--fresh" in msg
+    assert (root / "manifest.json").read_bytes() == before
+
+    def run(cfg, args, s=changed):
+        bs.build_mix(root, s, _no_sources(world(lid=True)), setup(lid=True))
+    monkeypatch.setattr(bs, "run_mix", run)
+    argv = ["--config", str(ROOT / "configs" / "quipu-moe-smoke.toml"), "--no-low-priority"]
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exit_:
+        bs.main(argv)
+    assert exit_.value.code == 4
+    assert "train_tokens" in capsys.readouterr().err
+    # Unchanged settings: "already built", exit 0.
+    monkeypatch.setattr(bs, "run_mix", lambda cfg, args: run(cfg, args, spec(**RESUME_SPEC)))
+    bs.main(argv)
+    assert "already built" in capsys.readouterr().out
+    # A manifest from before fingerprints were recorded counts as different.
+    m = json.loads(before)
+    m.pop("fingerprint")
+    (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    with pytest.raises(sm.ResumeError, match="--fresh"):
+        bs.build_mix(root, spec(**RESUME_SPEC), _no_sources(world(lid=True)), setup(lid=True))
+    same_output(ref_root, root)

@@ -9,13 +9,23 @@ A document is contaminated by a problem when either rule holds:
   of whitespace collapsed to one space, and the text is at least MIN_NEEDLE_CHARS
   characters long after collapsing (shorter ones, such as `return a + b`, would
   match ordinary code);
-- ngrams: at least MIN_GRAM_FRACTION of the distinct NGRAM-grams of the problem's
-  solution (HumanEval: canonical_solution; MBPP: code) occur in the document. Tokens
-  are \\w+ runs and single punctuation characters (tokens(), not the BPE), so the
-  rule ignores whitespace and formatting too.
+- ngrams: for one of the problem's n-gram texts (its solution, HumanEval: the
+  canonical_solution, MBPP: the code; and HumanEval's prompt and each docstring in
+  it, so a copied docstring under a changed signature is caught), at least
+  MIN_GRAM_FRACTION of that text's distinct NGRAM-grams, and at least MIN_GRAMS of
+  them, occur in the document. A text with fewer than MIN_GRAMS n-grams takes no part
+  in this rule (a solution of one 13-gram, such as HumanEval/13's gcd, would drop
+  ordinary files on that one n-gram; its substring rule still holds). Tokens are \\w+
+  runs and single punctuation characters (tokens(), not the BPE), so the rule
+  ignores whitespace and formatting too.
 
 find() reports the FIRST problem (in index order: HumanEval, then MBPP, each in file
 order) that matches, so the answer never depends on how the check was sped up.
+Internally each problem is one or more index entries (its needles with its solution's
+n-grams, then one entry per further n-gram text), in problem order.
+
+DECONTAM_VERSION is part of the fingerprint: bump it whenever a rule changes what is
+dropped, so a build saved under the old rules is not resumed under the new.
 
 Speed (the check runs on every code document, next to the BPE tokenizer): both rules
 imply that certain strings occur in the document with all whitespace removed (its
@@ -48,9 +58,12 @@ from typing import Any, Callable, Iterable, NamedTuple
 
 import numpy as np
 
+# 2: at least MIN_GRAMS n-grams; HumanEval prompt and docstring n-grams; train text.
+DECONTAM_VERSION = 2
 NGRAM = 13
 MIN_NEEDLE_CHARS = 60
 MIN_GRAM_FRACTION = 0.5
+MIN_GRAMS = 2
 BLOCK = 8  # bytes; one uint64
 
 HUMANEVAL = "humaneval"
@@ -149,6 +162,7 @@ class Problem(NamedTuple):
     task_id: str
     needles: tuple[str, ...]  # texts matched as whitespace-collapsed substrings
     solution: str             # the text whose n-grams are counted
+    gram_texts: tuple[str, ...] = ()  # further texts whose n-grams are counted, each alone
 
 
 class Decontaminator:
@@ -156,40 +170,51 @@ class Decontaminator:
 
     def __init__(self, problems: Iterable[Problem], *, revisions: dict[str, str] | None = None,
                  ngram: int = NGRAM, min_chars: int = MIN_NEEDLE_CHARS,
-                 fraction: float = MIN_GRAM_FRACTION) -> None:
-        self.problems = [Problem(p.benchmark, str(p.task_id), tuple(p.needles), p.solution)
-                         for p in problems]
+                 fraction: float = MIN_GRAM_FRACTION, min_grams: int = MIN_GRAMS) -> None:
+        self.problems = [Problem(p.benchmark, str(p.task_id), tuple(p.needles), p.solution,
+                                 tuple(p.gram_texts)) for p in problems]
         self.revisions = dict(revisions or {})
         self.ngram, self.min_chars, self.fraction = ngram, min_chars, fraction
+        self.min_grams = min_grams
         named = {p.benchmark for p in self.problems}
         self.benchmarks = ([b for b in BENCHMARKS if b in named]
                            + sorted(named - set(BENCHMARKS)))
-        # Per problem: collapsed needles and their spaceless forms; the distinct
-        # n-grams (sorted, for a stable index) and their spaceless forms; the count
-        # the n-gram rule needs.
+        # Per entry (a problem's needles and solution, then each further n-gram text):
+        # its problem; collapsed needles and their spaceless forms; the distinct
+        # n-grams (sorted, for a stable index; none when fewer than min_grams) and
+        # their spaceless forms; the count the n-gram rule needs.
+        self._owner: list[int] = []
         self._needles: list[tuple[str, ...]] = []
         self._needles_sl: list[tuple[str, ...]] = []
         self._grams: list[frozenset] = []
         self._grams_sl: list[tuple[str, ...]] = []
         self._need: list[int] = []
-        for p in self.problems:
+        for pi, p in enumerate(self.problems):
             needles = tuple(dict.fromkeys(c for c in (collapse(t) for t in p.needles)
                                           if len(c) >= min_chars))
-            grams = sorted(ngrams(tokens(p.solution), ngram))
-            self._needles.append(needles)
-            self._needles_sl.append(tuple(spaceless(c) for c in needles))
-            self._grams.append(frozenset(grams))
-            self._grams_sl.append(tuple("".join(g) for g in grams))
-            self._need.append(max(1, math.ceil(fraction * len(grams))) if grams else 0)
+            for needed, text in [(needles, p.solution)] + [((), t) for t in p.gram_texts]:
+                grams = sorted(ngrams(tokens(text), ngram))
+                if len(grams) < min_grams:
+                    grams = []
+                if not needed and not grams:
+                    continue
+                self._owner.append(pi)
+                self._needles.append(needed)
+                self._needles_sl.append(tuple(spaceless(c) for c in needed))
+                self._grams.append(frozenset(grams))
+                self._grams_sl.append(tuple("".join(g) for g in grams))
+                self._need.append(max(min_grams, 1, math.ceil(fraction * len(grams)))
+                                  if grams else 0)
         self._build_index()
 
     def _build_index(self) -> None:
         """Two block indexes (BLOCK bytes, and SHORT_BLOCK bytes for the patterns too
         short for BLOCK), each block key -> ((kind, problem, pattern), ...), kind 0
         needle, 1 n-gram: one block per pattern and residue, preferring blocks free
-        of COMMON_CODE and shared by the fewest problems."""
+        of COMMON_CODE and shared by the fewest entries. (Here i is an entry.)"""
+        entries = range(len(self._owner))
         df: dict[bytes, int] = {}
-        for i in range(len(self.problems)):
+        for i in entries:
             seen: set[bytes] = set()
             for sl in self._needles_sl[i] + self._grams_sl[i]:
                 b = sl.encode("utf-8")
@@ -204,10 +229,10 @@ class Decontaminator:
 
         # size -> key -> problem -> ("needle" seen, n-gram ids)
         postings: dict[int, dict[int, dict[int, list]]] = {BLOCK: {}, SHORT_BLOCK: {}}
-        self._always_needles: list[int] = []   # problems with an unindexable needle
-        self._free_grams = [0] * len(self.problems)  # n-grams too short to index
-        free_sl: list[list[str]] = [[] for _ in self.problems]
-        for i in range(len(self.problems)):
+        self._always_needles: list[int] = []   # entries with an unindexable needle
+        self._free_grams = [0] * len(entries)  # n-grams too short to index
+        free_sl: list[list[str]] = [[] for _ in entries]
+        for i in entries:
             patterns = [(0, j, sl) for j, sl in enumerate(self._needles_sl[i])] + \
                        [(1, j, sl) for j, sl in enumerate(self._grams_sl[i])]
             for kind, j, sl in patterns:
@@ -228,14 +253,14 @@ class Decontaminator:
                         entry[0] = True
                     else:
                         entry[1].add(j)
-        # Each posting: ((problem, has a needle, n-gram ids), ...) in problem order.
+        # Each posting: ((entry, has a needle, n-gram ids), ...) in entry order.
         self._index = [_BlockIndex(size, {k: [(i, e[0], tuple(sorted(e[1])))
                                               for i, e in sorted(v.items())]
                                           for k, v in postings[size].items()})
                        for size in (BLOCK, SHORT_BLOCK) if postings[size]]
         self._free_sl = [tuple(x) for x in free_sl]
         self._always_needles = sorted(set(self._always_needles))
-        # Problems the n-gram rule may hold for whatever the blocks show.
+        # Entries the n-gram rule may hold for whatever the blocks show.
         self._always_grams = [i for i, n in enumerate(self._free_grams)
                               if self._grams[i] and n >= self._need[i]]
 
@@ -269,7 +294,7 @@ class Decontaminator:
             if not order:
                 return None
         else:
-            order = range(len(self.problems))
+            order = range(len(self._owner))
             needle_c = gram_c = None
         flat: str | None = None
         doc_grams: set | None = None
@@ -280,7 +305,7 @@ class Decontaminator:
                         if flat is None:
                             flat = collapse(text)
                         if c in flat:
-                            p = self.problems[i]
+                            p = self.problems[self._owner[i]]
                             return p.benchmark, p.task_id, "substring"
             if self._grams[i] and (gram_c is None or i in gram_c):
                 need = self._need[i]
@@ -295,16 +320,18 @@ class Decontaminator:
                 if doc_grams is None:
                     doc_grams = ngrams(tokens(text), self.ngram)
                 if len(self._grams[i] & doc_grams) >= need:
-                    p = self.problems[i]
+                    p = self.problems[self._owner[i]]
                     return p.benchmark, p.task_id, "ngrams"
         return None
 
     # -------------------------------------------------------------- provenance
 
     def fingerprint(self) -> str:
-        """sha256 of the problems, the benchmark revisions and the rules."""
-        blob = json.dumps({"rules": {"ngram": self.ngram, "min_chars": self.min_chars,
-                                     "fraction": self.fraction},
+        """sha256 of the rule version, the problems, the benchmark revisions and the
+        rules."""
+        blob = json.dumps({"version": DECONTAM_VERSION,
+                           "rules": {"ngram": self.ngram, "min_chars": self.min_chars,
+                                     "fraction": self.fraction, "min_grams": self.min_grams},
                            "revisions": self.revisions,
                            "problems": [list(p) for p in self.problems]},
                           sort_keys=True, ensure_ascii=False)
@@ -312,30 +339,49 @@ class Decontaminator:
 
     def summary(self) -> dict[str, Any]:
         counts = {b: sum(p.benchmark == b for p in self.problems) for b in self.benchmarks}
-        uncheckable = [p.task_id for i, p in enumerate(self.problems)
-                       if not self._needles[i] and not self._grams[i]]
+        checkable = set(self._owner)  # an entry exists only with a needle or n-grams
+        uncheckable = [p.task_id for i, p in enumerate(self.problems) if i not in checkable]
         return {
+            "version": DECONTAM_VERSION,
             "problems": counts,
             "revisions": dict(self.revisions),
             "index_sha256": self.fingerprint(),
             "rule": (f"a document is dropped when it contains a problem's text (HumanEval: "
                      f"prompt, canonical_solution; MBPP: code, task text) as a "
                      f"whitespace-collapsed substring of at least {self.min_chars} "
-                     f"characters, or at least {self.fraction:.0%} of the distinct "
-                     f"{self.ngram}-grams of its solution (tokens: \\w+ runs and single "
-                     "punctuation characters)"),
+                     f"characters, or, for one of the problem's n-gram texts (its solution; "
+                     f"HumanEval also its prompt and each docstring in it), at least "
+                     f"{self.fraction:.0%} and at least {self.min_grams} of that text's "
+                     f"distinct {self.ngram}-grams (tokens: \\w+ runs and single "
+                     "punctuation characters; a text with fewer than "
+                     f"{self.min_grams} {self.ngram}-grams takes no part)"),
             "ngram": self.ngram, "min_chars": self.min_chars, "fraction": self.fraction,
-            # Every text of these is under min_chars and its solution under ngram
-            # tokens: neither rule can see them (too short to be told from ordinary code).
+            "min_grams": self.min_grams,
+            # Every text of these is under min_chars and every n-gram text under
+            # min_grams n-grams: neither rule can see them (too short to be told from
+            # ordinary code).
             "too_short_to_check": uncheckable,
         }
 
 
 # ------------------------------------------------------------------ loading
 
+DOCSTRING_RE = re.compile(r'"""(.*?)"""|\'\'\'(.*?)\'\'\'', re.DOTALL)
+
+
+def docstrings(source: str) -> list[str]:
+    """The triple-quoted strings in `source`, in order (their contents)."""
+    return [a or b for a, b in DOCSTRING_RE.findall(source) if (a or b).strip()]
+
+
 def humaneval_problems(rows: Iterable[dict]) -> list[Problem]:
+    """Needles: prompt and canonical_solution. N-gram texts: the solution, the prompt
+    and each docstring in the prompt (a repo that copies the docstring under its own
+    signature is caught by the docstring's n-grams)."""
     return [Problem(HUMANEVAL, r["task_id"], (r["prompt"], r["canonical_solution"]),
-                    r["canonical_solution"]) for r in rows]
+                    r["canonical_solution"],
+                    tuple(dict.fromkeys([r["prompt"], *docstrings(r["prompt"])])))
+            for r in rows]
 
 
 def mbpp_problems(rows: Iterable[dict]) -> list[Problem]:

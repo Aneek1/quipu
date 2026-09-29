@@ -696,16 +696,19 @@ def build_all(root: Path, stream: Iterable[dict], *, val_tokens: int, train_toke
 # accepts changed weights / token target and re-allocates from what was collected.
 # The old manifest.json is deleted only once the saved build has been accepted. A
 # finished build (manifest.json and no state.json; the cleanup deletes state.json
-# before the rest of _work) is left alone: rerunning it prints "already built".
+# before the rest of _work) is left alone: its manifest records the fingerprint, and
+# a rerun with the same sources and mix prints "already built"; any difference (or a
+# manifest without a fingerprint) is a ResumeError (exit 4) naming what differs.
 #
 # Held out, as for the tokenizer and its gate: val = the last sample-10BT file
 # (English, the trainer's loss); val_lang/<bucket> = FineWeb-2's test split; code_val
 # = github-code-clean files code_heldout_first_file.. (exact-dedup against train code).
 #
 # Decontamination (quipu/decontam.py): every code document (train and code_val) and
-# every validation text document (val, val_lang) that contains a HumanEval or MBPP
-# problem (whitespace-collapsed substring of >= 60 chars, or >= 50% of a solution's
-# 13-grams) is dropped, in the workers, before tokenisation. The benchmarks are read
+# every text document (train, val, val_lang) that contains a HumanEval or MBPP
+# problem (whitespace-collapsed substring of >= 60 chars, or >= 50% and >= 2 of the
+# 13-grams of its solution, HumanEval prompt or a docstring in that prompt) is
+# dropped, in the workers, before tokenisation. The benchmarks are read
 # at the config's pinned commits; the index's fingerprint is part of the resume
 # fingerprint, and the manifest's "decontamination" counts the drops per benchmark.
 
@@ -1117,6 +1120,16 @@ def _diff(old: dict, new: dict) -> list[str]:
             for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
 
 
+def _finished_diff(old: dict | None, new: dict[str, Any]) -> list[str]:
+    """How a finished build's manifest fingerprint (sources + mix) differs from the
+    current one; a manifest without one (older builder) always differs."""
+    if not isinstance(old, dict):
+        return ["fingerprint: the manifest records none (built by an older builder), so "
+                "its settings cannot be checked"]
+    return [f"{part}.{d}" for part in ("sources", "mix")
+            for d in _diff(old.get(part) or {}, new[part])]
+
+
 class BuildState:
     """<shard_dir>/_work/state.json: the fingerprint and each phase's checkpoint."""
 
@@ -1406,8 +1419,10 @@ def _text_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Pat
             ph["store"] = store.snapshot()
             state.set_phase("text", ph)
 
+        # Train text is decontaminated too (check_text): web pages quote benchmark
+        # problems and their answers.
         runner.collect(text_offers(sources.text_train[lang](files), lang), col, stats,
-                       on_mark=on_mark)
+                       on_mark=on_mark, check_text=True)
         warning = watch.finish() if watch else None
         if warning:
             warnings[lang] = warning
@@ -1441,16 +1456,26 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
     started, t0 = _now(), time.monotonic()
     work = root / MIX_WORK
     manifest_path = root / MANIFEST
+    fingerprint = mix_fingerprint(spec, setup, provenance)
     if manifest_path.exists() and not fresh and not (work / STATE).exists():
         # A finished build (its cleanup deletes state.json before anything else, so a
-        # crash part way through it lands here too). Never rebuild it by accident.
+        # crash part way through it lands here too). Never rebuild it by accident, and
+        # never call it "already built" for settings it was not built with.
         if from_work:
             raise sm.ResumeError(f"{root} is a finished build and its _work is gone, so "
                                  "--from-work has nothing to re-allocate from; rerun with "
                                  "--fresh to build it again (everything is read again)")
+        done = json.loads(manifest_path.read_text(encoding="utf-8"))
+        diff = _finished_diff(done.get("fingerprint"), fingerprint)
+        if diff:
+            raise sm.ResumeError(
+                f"{root} holds a finished build made with other settings:\n  "
+                + "\n  ".join(diff)
+                + "\nrerun with --fresh to rebuild it with these settings (everything is "
+                  "read again), or restore the settings it was built with")
         shutil.rmtree(work, ignore_errors=True)  # what a crashed cleanup left
         print(f"{root} is already built (use --fresh to rebuild)", flush=True)
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
+        return done
     lid = setup.lid is not None
     cw = dict(spec.code_weights)
     tw = dict(spec.text_weights) or {sm.ENGLISH: 1.0}
@@ -1468,8 +1493,7 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
     E = text_total * tw[sm.ENGLISH]
     G = text_total - E
     caps = {"HTML": spec.html_cap}
-    state = BuildState(work, mix_fingerprint(spec, setup, provenance), fresh=fresh,
-                       from_work=from_work)
+    state = BuildState(work, fingerprint, fresh=fresh, from_work=from_work)
     if (state.data.get("finished") and not state.mix_changed and not from_work
             and manifest_path.exists()):
         print(f"{root} is already built (its _work was kept; use --fresh to rebuild)",
@@ -1714,12 +1738,16 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
         lv_stats: Counter = Counter()
         for _, s in lv_cols.values():
             lv_stats.update(s)
+        tt_stats: Counter = Counter()
+        for _, s in text_cols.values():
+            tt_stats.update(s)
         decontam_info = {
             "index": setup.decontam.summary(),
             "benchmarks": provenance.get("decontamination"),
-            "applied_to": "every code document (train and code_val) and the validation "
-                          "text (val, val_lang); not the train text",
+            "applied_to": "every code document (train and code_val), the train text "
+                          "(FineWeb-Edu, FineWeb-2) and the validation text (val, val_lang)",
             "dropped": {"train_code": _dropped_by_benchmark(code_stats, benches),
+                        "train_text": _dropped_by_benchmark(tt_stats, benches),
                         "code_val": _dropped_by_benchmark(cv_docs.stats, benches),
                         "val": _dropped_by_benchmark(val_stats, benches),
                         "val_lang": _dropped_by_benchmark(lv_stats, benches)},
@@ -1755,6 +1783,8 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
                          "from_file": spec.projection_min_files}},
         "workers": spec.workers,
         "resume": resume,
+        # What a rerun is compared with before it may say "already built".
+        "fingerprint": fingerprint,
         "build_started": started,
         "build_finished": _now(),
         "build_seconds": round(time.monotonic() - t0, 1),
@@ -1839,18 +1869,33 @@ def iter_text_files(fs: Any, paths: Iterable[str], attempts: int = DOWNLOAD_ATTE
                     sleep: Callable[[float], None] = time.sleep) -> Iterator[dict]:
     """{"text", "file"} rows of each parquet file's "text" column, one row group at a
     time; a failed read is retried from the same (file, row group) with capped
-    backoff, `attempts` in all, unless the error is permanent (is_permanent)."""
+    backoff, `attempts` in all, unless the error is permanent (is_permanent).
+
+    These files are remote: bytes garbled or cut short in transit surface as a
+    pyarrow.ArrowInvalid or another ValueError (UnicodeDecodeError, ...), which
+    is_permanent would call permanent (right for a local file). Here they are raised
+    as TransientError, so they get the normal bounded retries."""
     import pyarrow.parquet as pq
+
+    def garbled(what: str, exc: BaseException) -> TransientError:
+        return TransientError(f"{path} ({what}) read garbled: {exc!r}")
 
     for path in paths:
         rg, n_groups, attempt = 0, None, 0
         while n_groups is None or rg < n_groups:
             try:
                 with fs.open(path, "rb", block_size=8 * 1024 * 1024) as f:
-                    pf = pq.ParquetFile(f)
-                    n_groups = pf.metadata.num_row_groups
+                    try:  # pyarrow.ArrowInvalid is a ValueError
+                        pf = pq.ParquetFile(f)
+                        n_groups = pf.metadata.num_row_groups
+                    except ValueError as exc:
+                        raise garbled("footer", exc) from exc
                     while rg < n_groups:
-                        texts = pf.read_row_group(rg, columns=["text"]).column("text").to_pylist()
+                        try:
+                            texts = pf.read_row_group(rg, columns=["text"]).column(
+                                "text").to_pylist()
+                        except ValueError as exc:
+                            raise garbled(f"row group {rg}", exc) from exc
                         rg += 1
                         attempt = 0
                         for t in texts:

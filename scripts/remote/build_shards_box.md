@@ -49,6 +49,13 @@ cd /workspace/quipu && sha256sum artifacts/tokenizer/tokenizer.json
 
 ## 3. Hugging Face token
 
+Use a token made for this build only: on huggingface.co, Settings > Access Tokens >
+Create new token > **Fine-grained**, with only "Read access to contents of all public
+gated repos you can access" (the build only reads public datasets; no write, no
+inference, no org permissions). Revoke it on the same page as soon as the build has
+finished (step 5, exit 0): the box is rented, and whoever has root on it can read the
+environment of your processes.
+
 Type it yourself, in your own SSH session, so it is in no file, no shell history and
 no chat:
 
@@ -100,8 +107,9 @@ files are downloaded ahead into `data/shards-moe/_work/dl`, each deleted once re
 
 What it does, in order: loads the tokenizer (its vocabulary must be 49,152), the
 LID model (so a broken install fails in seconds) and HumanEval + MBPP at their pinned
-commits (~0.2 MB; any code or validation document containing one of their problems
-is dropped, counted per benchmark under `decontamination` in the manifest), the
+commits (~0.2 MB; any code or text document, train or validation, containing one of
+their problems is dropped, counted per benchmark and split under `decontamination` in
+the manifest; on text it costs about 6% of the tokeniser's time), the
 English val split, code (a
 checkpoint after every code file; from the 20th file on it projects the code mix at
 the file cap and stops with an explanation if the projection misses at 5 file ends in
@@ -109,24 +117,27 @@ a row, with 1 pp more room before file 60; the code shares are checked again the
 moment code is collected, before any text is read), English and the nine other
 languages (a checkpoint after every text file), then train, code_val, val_lang and
 `manifest.json`. On success `_work` is deleted. A download or read error that cannot
-succeed on retry (404, no access, a full disk, a corrupt file) stops the build at
-once (exit 1); network blips, 429 and 5xx are retried with backoff (12 attempts,
-about 30 minutes).
+succeed on retry (404, no access, a full disk, a downloaded code file whose
+footer is fine but whose data is corrupt) stops the build at once (exit 1); network blips, text files read
+garbled over the network, 429 and 5xx are retried with backoff (12 attempts, about
+30 minutes).
 
 **If the box is preempted or the build dies:** start the same command again. It reads
 `data/shards-moe/_work/state.json`, truncates the collected files back to the last
 checkpoint, deletes partial downloads and carries on (at most one code file or one
 text file is redone). The result is byte-identical to an uninterrupted build. Running
-it again after it has finished does nothing ("already built (use --fresh to
-rebuild)", exit 0): a finished build is never rebuilt, or its manifest deleted, by
-accident. Exit codes:
+it again after it has finished with the same settings does nothing ("already built
+(use --fresh to rebuild)", exit 0): a finished build is never rebuilt, or its
+manifest deleted, by accident. With other settings (say a new `--train-tokens`) it
+stops with exit 4 and lists what differs from the settings recorded in the manifest;
+`--fresh` rebuilds. Exit codes:
 
 | exit | meaning | what to do |
 |---|---|---|
 | 0 | done (or already built) | copy the shards (below) |
 | 1 | an unexpected error, including a download error that cannot succeed on retry (the last lines of `build.log` name the file and the error) | fix the cause (token, disk space, revision), then rerun the same command: it resumes |
 | 2 | share error: the mix is off target (`collect_report.json` says why) | after code or text collection: decide the weights (or `--train-tokens`), then rerun with `--from-work`: it re-allocates from what was collected, without downloading it again. From the projection during code collection, the message gives two ways on: `--fresh` with changed weights (the code files read so far are downloaded again), or, if the projection is wrong, the same command with a larger `--projection-min-files` (resumes where it stopped) |
-| 4 | the saved build cannot be resumed with these settings (the message lists the differences) | rerun with the original settings, or `--fresh` to start over (everything is downloaded again) |
+| 4 | the saved build cannot be resumed, or the finished build was made, with other settings (the message lists the differences) | rerun with the original settings, or `--fresh` to start over (everything is downloaded again) |
 | 5 | a tokenising worker died (out of memory?) | rerun the same command (fewer `--workers` if it was memory) |
 
 Progress: `tail build.log`; the code checkpoint is `python -m json.tool
@@ -153,14 +164,21 @@ open.
   ```bash
   ssh-keygen -t ed25519 -N "" -C shards-copy -f /root/.ssh/shards_copy
   cat /root/.ssh/shards_copy.pub      # one line: copy it
+  curl -s https://ifconfig.me; echo   # the CPU box's public IP: CPU_BOX_IP below
   ```
 
-  On the GPU box (your own SSH session from the laptop), allow that key:
+  On the GPU box (your own SSH session from the laptop), allow that key from the CPU
+  box's address only, and with `restrict` (no port, agent or X11 forwarding, no
+  terminal), which is all rsync or scp needs:
 
   ```bash
-  echo 'PASTE THE ONE LINE HERE' >> /root/.ssh/authorized_keys
+  echo 'from="CPU_BOX_IP",restrict PASTE THE ONE LINE HERE' >> /root/.ssh/authorized_keys
   mkdir -p /workspace/quipu/data
   ```
+
+  (If the copy is refused with "Permission denied (publickey)", the CPU box leaves
+  through another address: `grep shards-copy /var/log/auth.log` or `journalctl -u ssh`
+  on the GPU box shows the one it came from; put that in `from=`.)
 
   On the CPU box, copy (rsync resumes after a dropped connection; install it on both
   boxes with `apt-get install -y rsync`):
