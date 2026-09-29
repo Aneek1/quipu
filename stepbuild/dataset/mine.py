@@ -112,8 +112,11 @@ def clone(
     repos_dir: Path,
     runner: Callable[..., Any] = subprocess.run,
     timeout: int = CLONE_TIMEOUT,
+    url: str | None = None,
 ) -> Path:
-    """The path of a full bare clone of `repo`, cloning it unless already there."""
+    """The path of a full bare clone of `repo`, cloning it unless already there.
+    `url` is where to clone from (default https://github.com/<repo>.git); the
+    build's mine phase passes the one recorded in candidates.json."""
     dest = Path(repos_dir) / repo_dir_name(repo)
     if dest.exists():
         return dest
@@ -121,7 +124,7 @@ def clone(
     _rmtree(tmp)
     dest.parent.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    cmd = ["git", "clone", "--bare", "--quiet", f"https://github.com/{repo}.git", str(tmp)]
+    cmd = ["git", "clone", "--bare", "--quiet", url or f"https://github.com/{repo}.git", str(tmp)]
     try:
         proc = runner(cmd, capture_output=True, text=True, encoding="utf-8",
                       errors="replace", timeout=timeout, env=env)

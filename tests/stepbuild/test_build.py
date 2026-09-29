@@ -74,7 +74,11 @@ def _alpha_history():
 @pytest.fixture
 def world(tmp_path):
     out = tmp_path / "out"
-    repos = out / "repos"
+    _make_world(out / "repos")
+    return out
+
+
+def _make_world(repos):
     make_repo(repos / "acme__alpha", _alpha_history())
     make_repo(repos / "acme__alpha-mirror", _alpha_history())  # same SHAs
     make_repo(repos / "acme__beta", [
@@ -91,7 +95,6 @@ def world(tmp_path):
         ("Initial project skeleton", {"a.py": "x = 1\n"}),
         ("Add the unidentified licence helper", {"c.py": "def c():\n    return 3\n"}),
     ])
-    return out
 
 
 def _rows(out):
@@ -205,3 +208,131 @@ def test_dedupe_keeps_the_train_copy(tmp_path):
     assert got["examples"] == {"train": 2, "validation": 0, "test": 0}
     sources = (tmp_path / "SOURCES.jsonl").read_text(encoding="utf-8")
     assert train_repo in sources and test_repo not in sources
+
+
+# ------------------------------------------------------------ the two phases
+
+def _no_clone(cmd, **kw):
+    raise AssertionError(f"the discover phase cloned: {cmd}")
+
+
+def _no_gh(args):
+    raise AssertionError(f"the mine phase called gh: {args}")
+
+
+def test_discover_phase_writes_candidates_and_clones_nothing(tmp_path):
+    out = tmp_path / "laptop"
+    got = build(10, out, runner=FakeGh(_handler), sleep=lambda s: None,
+                clone_runner=_no_clone, phase="discover")
+    data = json.loads((out / "candidates.json").read_text(encoding="utf-8"))
+    assert data["version"] == 1 and data["limit"] == 10
+    recs = {r["repo"]: r for r in data["candidates"]}
+    assert set(recs) == set(LICENCES)
+    assert recs["acme/alpha"] == {
+        "repo": "acme/alpha", "tag": "fullstack", "licence": "MIT",
+        "url": "https://github.com/acme/alpha", "stars": None,
+        "clone_url": "https://github.com/acme/alpha.git",
+    }
+    assert recs["acme/gamma"]["licence"] == "GPL-3.0"
+    assert recs["acme/delta"]["licence"] == "NOASSERTION"
+    assert got == {"candidates": 6, "licensed": 4, "path": out / "candidates.json"}
+    # Nothing past discovery: no clones, no manifest, no shards, no report.
+    assert sorted(p.name for p in out.iterdir()) == ["cache", "candidates.json"]
+
+
+def test_mine_phase_matches_the_combined_build_without_gh(world, tmp_path):
+    combined = world
+    build(10, combined, runner=FakeGh(_handler), sleep=lambda s: None,
+          clone_runner=_clone_runner)
+
+    laptop = tmp_path / "laptop"
+    build(10, laptop, runner=FakeGh(_handler), sleep=lambda s: None,
+          clone_runner=_no_clone, phase="discover")
+    cands = (laptop / "candidates.json").read_text(encoding="utf-8")
+    assert cands == (combined / "candidates.json").read_text(encoding="utf-8")
+
+    # On the "remote box" the public repos are cloned for real, from local file://
+    # mirrors standing in for github.com (same commits, so the same SHAs).
+    src = tmp_path / "github"
+    _make_world(src)
+    data = json.loads(cands)
+    for rec in data["candidates"]:
+        mirror = src / rec["repo"].replace("/", "__")
+        if mirror.is_dir():
+            rec["clone_url"] = mirror.as_uri()
+    moved = tmp_path / "moved" / "candidates.json"
+    moved.parent.mkdir()
+    moved.write_text(json.dumps(data), encoding="utf-8")
+
+    cloned = []
+
+    def local_clone(cmd, **kw):
+        if "acme/broken" in cmd[4]:
+            return _clone_runner(cmd, **kw)
+        assert cmd[4].startswith("file://")
+        cloned.append(cmd[4])
+        return subprocess.run(cmd, **kw)
+
+    remote = tmp_path / "remote"
+    gh = FakeGh(_no_gh)
+    build(None, remote, runner=gh, sleep=lambda s: None, clone_runner=local_clone,
+          phase="mine", candidates_path=moved)
+    assert gh.calls == []
+    assert len(cloned) == 3  # alpha, its mirror and beta: the licensed ones
+
+    def shard_names(out):
+        return sorted(p.name for p in out.glob("*.jsonl"))
+
+    assert shard_names(remote) == shard_names(combined)
+    for name in shard_names(combined):
+        assert (remote / name).read_bytes() == (combined / name).read_bytes(), name
+    assert (remote / "manifest.json").read_bytes() == (combined / "manifest.json").read_bytes()
+
+    def report(out):  # everything but the command, the times and the out path
+        lines = (out / "report.md").read_text(encoding="utf-8").splitlines()
+        return [ln for ln in lines if not ln.startswith(("- command", "- started", "- limit"))]
+
+    assert report(remote) == report(combined)
+    assert "- limit 10;" in (remote / "report.md").read_text(encoding="utf-8")
+
+
+def test_mine_phase_records_a_failed_licence_lookup(tmp_path):
+    cands = tmp_path / "candidates.json"
+    cands.write_text(json.dumps({"version": 1, "limit": 2, "candidates": [
+        {"repo": "acme/x", "tag": "flask", "licence": None, "url": "https://github.com/acme/x",
+         "stars": None, "clone_url": "https://github.com/acme/x.git",
+         "licence_error": "GhError: gh api repos/acme/x/license: boom"},
+        {"repo": "acme/y", "tag": "react", "licence": "GPL-3.0",
+         "url": "https://github.com/acme/y", "stars": None,
+         "clone_url": "https://github.com/acme/y.git"},
+    ]}), encoding="utf-8")
+    out = tmp_path / "out"
+    gh = FakeGh(_no_gh)
+    build(None, out, runner=gh, clone_runner=_no_clone, guard=object(), phase="mine",
+          candidates_path=cands)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["repos"]
+    assert manifest["acme/x"] == {"repo": "acme/x", "tag": "flask", "status": "failed",
+                                  "error": "GhError: gh api repos/acme/x/license: boom"}
+    assert manifest["acme/y"]["status"] == "unlicensed"
+    assert gh.calls == []
+    assert "- acme/x: GhError" in (out / "report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("url", [
+    "git@github.com:acme/x.git", "http://github.com/acme/x.git",
+    "https://user:token@github.com/acme/x.git", "ssh://github.com/acme/x.git", None,
+])
+def test_read_candidates_refuses_other_clone_urls(tmp_path, url):
+    path = tmp_path / "candidates.json"
+    path.write_text(json.dumps({"version": 1, "limit": 1, "candidates": [
+        {"repo": "acme/x", "tag": "flask", "licence": "MIT", "clone_url": url}]}),
+        encoding="utf-8")
+    with pytest.raises(ValueError, match="clone_url"):
+        build_mod.read_candidates(path)
+
+
+def test_cli_phase_arguments(tmp_path):
+    with pytest.raises(SystemExit):
+        build_mod.main(["--out", str(tmp_path)])  # --limit needed without --phase mine
+    with pytest.raises(SystemExit):
+        build_mod.main(["--limit", "3", "--candidates", str(tmp_path / "c.json")])

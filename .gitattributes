@@ -1,0 +1,2 @@
+# Shell scripts run on Linux boxes: a CRLF checkout would break them.
+*.sh text eol=lf

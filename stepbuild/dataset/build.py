@@ -1,10 +1,30 @@
 """Build the step dataset (spec §3.1).
 
     python -m stepbuild.dataset.build --limit N --out data/stepbuild
+    python -m stepbuild.dataset.build --phase discover --limit N --out data/stepbuild
+    python -m stepbuild.dataset.build --phase mine --candidates PATH --out data/stepbuild
 
 discover (gh code search) -> licence filter -> clone -> mine -> filter
 (drop_reason) -> format (format_example) -> leakage guard -> dedupe -> split ->
 shards, SOURCES.jsonl, manifest.json and report.md under --out.
+
+Phases. Everything that talks to the GitHub API (code search, the full-stack
+tree checks, the licence lookups; all through the logged-in `gh`, all cached
+under out/cache/) is the discover phase; everything else is the mine phase, which
+needs no GitHub login at all: it clones public repos over https with plain git.
+So the gh login can stay on the owner's laptop while the heavy mining runs on a
+rented machine.
+- `--phase discover` writes out/candidates.json (atomically) and stops: an object
+  {"version", "limit", "candidates"}, one record per candidate in selection order
+  with repo, tag, licence (SPDX id or null), url, stars and clone_url, plus
+  licence_error when the lookup failed. Nothing is cloned.
+- `--phase mine --candidates PATH` reads such a file (default out/candidates.json)
+  and does the rest, making no gh call. A candidate whose licence lookup failed
+  is recorded as failed with that error (rerun discover to retry it). --limit is
+  optional here and keeps only the first N candidates.
+- With no --phase the build runs both, as one command, and also writes
+  out/candidates.json; its shards, manifest and report are those of the two
+  phases run one after the other.
 
 Per repo. A licensed repo is cloned into out/repos/, mined commit by commit, and
 its surviving examples written atomically to out/mined/<owner>__<name>.jsonl;
@@ -56,7 +76,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from quipu.fsio import write_text_atomic
-from stepbuild.dataset.discover import Candidate, discover
+from stepbuild.dataset.discover import Candidate, discover, valid_repo
 from stepbuild.dataset.filters import REASONS, drop_reason
 from stepbuild.dataset.format import format_example
 from stepbuild.dataset.licence import is_allowed, licence_of, source_record
@@ -83,7 +103,81 @@ TOKEN_COUNTER = (
     "caps also fits the harness's prompt budget"
 )
 
+CANDIDATES_FILE = "candidates.json"
+CANDIDATES_VERSION = 1
+PHASES = ("discover", "mine")
+CLONE_SCHEMES = ("https://", "file://")  # file:// is for tests and local mirrors
+
 assert MAX_FILES < MAX_LOAD_FILES  # mine leaves contents out only above MAX_LOAD_FILES
+
+
+# ------------------------------------------------------------ candidates.json
+
+def candidate_record(cand: Candidate, licence: str | None, error: str | None = None) -> dict:
+    rec = {
+        "repo": cand.repo, "tag": cand.tag, "licence": licence,
+        "url": f"https://github.com/{cand.repo}", "stars": cand.stars,
+        "clone_url": f"https://github.com/{cand.repo}.git",
+    }
+    if error is not None:
+        rec["licence_error"] = error
+    return rec
+
+
+def discover_candidates(
+    limit: int,
+    cache: Path,
+    runner: Callable[..., Any] = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[dict]:
+    """The discover phase: candidates and their licences (all gh work, cached)."""
+    candidates = discover(limit, cache, runner=runner, sleep=sleep)
+    log.info("discovered %d candidates (%s)", len(candidates),
+             ", ".join(f"{t} {sum(c.tag == t for c in candidates)}" for t in TAG_ORDER))
+    records = []
+    for cand in candidates:
+        try:
+            licence = licence_of(cand.repo, runner=runner, cache_dir=cache, sleep=sleep)
+        except Exception as e:  # recorded; the mine phase reports it as a failed repo
+            error = f"{type(e).__name__}: {e}"
+            log.warning("%s: licence lookup failed: %s", cand.repo, error)
+            records.append(candidate_record(cand, None, error))
+            continue
+        records.append(candidate_record(cand, licence))
+    return records
+
+
+def write_candidates(path: Path, limit: int, records: Sequence[dict]) -> None:
+    body = {"version": CANDIDATES_VERSION, "limit": limit, "candidates": list(records)}
+    write_text_atomic(Path(path), json.dumps(body, indent=1) + "\n")
+
+
+def _check_clone_url(url: object) -> bool:
+    if not isinstance(url, str) or not url.startswith(CLONE_SCHEMES):
+        return False
+    authority = url.split("://", 1)[1].split("/", 1)[0]
+    return "@" not in authority  # no credentials embedded in the URL
+
+
+def read_candidates(path: Path) -> tuple[int, list[dict]]:
+    """(limit, records) from a candidates.json; ValueError when it is malformed."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("version") != CANDIDATES_VERSION:
+        raise ValueError(f"{path}: not a version {CANDIDATES_VERSION} candidates file")
+    limit, records = data.get("limit"), data.get("candidates")
+    if not isinstance(limit, int) or not isinstance(records, list):
+        raise ValueError(f"{path}: needs an int 'limit' and a 'candidates' list")
+    for i, rec in enumerate(records):
+        ok = (
+            isinstance(rec, dict) and valid_repo(rec.get("repo"))
+            and rec.get("tag") in TAG_ORDER
+            and (rec.get("licence") is None or isinstance(rec.get("licence"), str))
+            and _check_clone_url(rec.get("clone_url"))
+        )
+        if not ok:
+            raise ValueError(f"{path}: candidate {i} is malformed or has a disallowed "
+                             f"clone_url (https:// or file://, no credentials): {rec!r}")
+    return limit, records
 
 
 def _reply_key(row: dict) -> str:
@@ -336,28 +430,49 @@ def render_report(
 
 
 def build(
-    limit: int,
+    limit: int | None,
     out: Path,
     runner: Callable[..., Any] = subprocess.run,
     sleep: Callable[[float], None] = time.sleep,
     clone_runner: Callable[..., Any] | None = None,
     guard=None,
     command: str = "",
+    phase: str | None = None,
+    candidates_path: Path | None = None,
 ) -> dict:
-    """Run the whole build (module docstring); returns the assembly counts."""
+    """Run the build, or one phase of it (module docstring). Returns the assembly
+    counts, or for the discover phase {"candidates", "licensed", "path"}. `runner`
+    runs gh (discover phase only); `clone_runner` runs git clone (mine phase)."""
+    if phase not in (None, *PHASES):
+        raise ValueError(f"phase must be one of {PHASES} or None, got {phase!r}")
     started = datetime.datetime.now().astimezone()
     t0 = time.monotonic()
     out = Path(out)
     cache, repos_dir, mined_dir = out / "cache", out / "repos", out / "mined"
     manifest_path = out / "manifest.json"
+    if phase == "mine":
+        path = Path(candidates_path) if candidates_path else out / CANDIDATES_FILE
+        file_limit, records = read_candidates(path)
+        if limit is not None:
+            records = records[:limit]
+        limit = file_limit if limit is None else limit
+        log.info("read %d candidates from %s", len(records), path)
+    else:
+        if limit is None:
+            raise ValueError("limit is required unless phase is 'mine'")
+        records = discover_candidates(limit, cache, runner=runner, sleep=sleep)
+        path = out / CANDIDATES_FILE
+        write_candidates(path, limit, records)
+        if phase == "discover":
+            licensed = sum(1 for r in records if is_allowed(r["licence"]))
+            log.info("wrote %d candidates (%d licensed) to %s", len(records), licensed, path)
+            return {"candidates": len(records), "licensed": licensed, "path": path}
     if guard is None:
         from stepbuild.bench.run import LeakageGuard
         guard = LeakageGuard()
-    candidates = discover(limit, cache, runner=runner, sleep=sleep)
-    log.info("discovered %d candidates (%s)", len(candidates),
-             ", ".join(f"{t} {sum(c.tag == t for c in candidates)}" for t in TAG_ORDER))
+    candidates = [Candidate(r["repo"], r["tag"], r.get("stars")) for r in records]
     manifest = _load_manifest(manifest_path)
-    for n, cand in enumerate(candidates, start=1):
+    for n, (cand, rec) in enumerate(zip(candidates, records), start=1):
         prev = manifest["repos"].get(cand.repo, {})
         mined_file = mined_dir / f"{repo_dir_name(cand.repo)}.jsonl"
         if prev.get("status") == "mined" and prev.get("params") == PARAMS and mined_file.is_file():
@@ -365,14 +480,21 @@ def build(
             continue
         entry: dict = {"repo": cand.repo, "tag": cand.tag}
         try:
-            licence = licence_of(cand.repo, runner=runner, cache_dir=cache, sleep=sleep)
-            entry["licence"] = licence
-            if not is_allowed(licence):
+            licence = rec["licence"]
+            if rec.get("licence_error") is not None:  # the discover phase's lookup failed
+                entry["status"] = "failed"
+                entry["error"] = rec["licence_error"]
+                log.warning("[%d/%d] %s failed: %s", n, len(candidates), cand.repo,
+                            entry["error"])
+            elif not is_allowed(licence):
+                entry["licence"] = licence
                 entry["status"] = "unlicensed"
                 log.info("[%d/%d] %s: licence %s, skipped", n, len(candidates), cand.repo, licence)
             else:
+                entry["licence"] = licence
                 t = time.monotonic()
-                repo_dir = clone(cand.repo, repos_dir, runner=clone_runner or subprocess.run)
+                repo_dir = clone(cand.repo, repos_dir, runner=clone_runner or subprocess.run,
+                                 url=rec["clone_url"])
                 entry, rows = mine_one(cand, licence, repo_dir, guard)
                 _write_jsonl(mined_file, rows)
                 log.info("[%d/%d] %s (%s, %s): %d commits, %d examples, %.0f s",
@@ -405,16 +527,30 @@ def build(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--limit", type=int, required=True, help="number of repos to use")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="number of repos to use (required unless --phase mine)")
     parser.add_argument("--out", type=Path, default=Path("data") / "stepbuild")
+    parser.add_argument("--phase", choices=PHASES, default=None,
+                        help="discover: gh work only, writes candidates.json; mine: no gh, "
+                             "reads candidates.json; default: both")
+    parser.add_argument("--candidates", type=Path, default=None,
+                        help=f"candidates file for --phase mine (default OUT/{CANDIDATES_FILE})")
     args = parser.parse_args(argv)
-    if args.limit < 1:
+    if args.limit is None and args.phase != "mine":
+        parser.error("--limit is required unless --phase mine")
+    if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
+    if args.candidates is not None and args.phase != "mine":
+        parser.error("--candidates only goes with --phase mine")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stderr)
     argv_list = sys.argv[1:] if argv is None else list(argv)
-    build(args.limit, args.out,
-          command="python -m stepbuild.dataset.build " + " ".join(argv_list))
-    print((args.out / "report.md").read_text(encoding="utf-8"))
+    result = build(args.limit, args.out, phase=args.phase, candidates_path=args.candidates,
+                   command="python -m stepbuild.dataset.build " + " ".join(argv_list))
+    if args.phase == "discover":
+        print(f"wrote {result['candidates']} candidates ({result['licensed']} licensed) "
+              f"to {result['path']}")
+    else:
+        print((args.out / "report.md").read_text(encoding="utf-8"))
     return 0
 
 
