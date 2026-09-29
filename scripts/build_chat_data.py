@@ -19,12 +19,21 @@ Sources (human-written, permissive; the revisions are pinned in the config's [da
   dropped when the benchmark's LeakageGuard finds a bench app's reference in its
   reply, or when its reply copies a test-split reply (whitespace ignored) or has a
   FILE block that is a near-copy of a test-split block for the same path (the same
-  5-shingle Jaccard >= 0.9 the LeakageGuard uses): HeldOutSplitGuard.
+  5-shingle Jaccard >= 0.9 the LeakageGuard uses): HeldOutSplitGuard. Its prompt
+  (most are several thousand tokens: context files and the project tree) is then
+  fitted to the context beside the whole reply, as the benchmark harness fits its
+  prompts (fit_stepbuild_prompt): tree paths go first, then whole context files
+  (never part of one; the files the reply rewrites last); a row is dropped only
+  when its reply alone leaves no room ("reply_too_long") or not even the STEP line
+  fits beside it ("prompt_too_long"). The manifest counts the cut prompts under
+  "prompts_fitted".
 
 Every example, whatever its source, then goes through, in order (each drop counted
 per source in the manifest):
 - the chat format (quipu.chat.validate): content holding a chat special string
   (<|user|> ...) is dropped ("special_tokens"), as are empty turns ("empty");
+  content is encoded as plain text, so the FILE markers stay the plain-text tokens
+  pretraining taught (quipu.chat);
 - decontamination (quipu.decontam, the pretraining shards' rules): the whole
   conversation's text containing a HumanEval or MBPP problem ("decontam_humaneval",
   "decontam_mbpp");
@@ -216,6 +225,8 @@ class SourceStats:
     truncated: int = 0
     languages: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
     licences: Counter = field(default_factory=Counter)
+    # stepbuild: prompts cut to fit the context (fit_stepbuild_prompt)
+    prompts: Counter = field(default_factory=Counter)
 
     def keep(self, ex: Example, ids: Sequence[int], mask: Sequence[int], split: str) -> None:
         c = self.languages[ex.language]
@@ -233,7 +244,9 @@ class SourceStats:
         return {"rows_read": self.rows_read, "drops": dict(sorted(self.drops.items())),
                 "truncated_at_turn_boundary": self.truncated,
                 "kept": dict(sorted(tot.items())), "languages": langs,
-                **({"licences": dict(sorted(self.licences.items()))} if self.licences else {})}
+                **({"licences": dict(sorted(self.licences.items()))} if self.licences else {}),
+                **({"prompts_fitted": dict(sorted(self.prompts.items()))}
+                   if self.prompts else {})}
 
 
 def aya_examples(rows: Iterable[dict[str, Any]], stats: SourceStats) -> Iterator[Example]:
@@ -368,10 +381,155 @@ def _reply(row: dict[str, Any]) -> str | None:
     return msgs[-1]["content"] if msgs and msgs[-1].get("role") == "assistant" else None
 
 
+# ---- fitting a stepbuild prompt to the context ----------------------------------------------------
+
+# Tokens kept free below the context when a stepbuild prompt is fitted: the
+# <|endoftext|> that follows a packed conversation, and a little slack.
+STEPBUILD_RESERVE = 8
+_SB_CONTEXT = "\n\nCONTEXT FILES:\n"
+_SB_TREE = "\nPROJECT TREE:\n"
+_SB_NO_CONTEXT = "(none yet)\n"
+
+
+@dataclass
+class _SbPrompt:
+    """A stepbuild user message taken apart (stepbuild.dataset.format's layout:
+    "STEP: ...", CONTEXT FILES as FILE blocks, PROJECT TREE as tree text)."""
+    head: str                     # "STEP: ..." up to the CONTEXT FILES section
+    blocks: list[Any]             # FileBlocks, in the row's order
+    paths: list[str]              # the tree's paths, de-duplicated, in tree_order
+    hidden: int                   # paths the row itself had left out ("... (N more")
+
+    @property
+    def max_shown(self) -> int:
+        from stepbuild.harness.prompt import TREE_MAX_FILES
+        return min(len(self.paths), TREE_MAX_FILES)
+
+    def render(self, blocks: Sequence[Any], shown: int) -> str:
+        """The message with these context blocks and the first `shown` tree paths,
+        in the harness's own layout: render_blocks, and render_tree's text (tree
+        order, at most TREE_MAX_FILES, then "... (N more files not shown)" counting
+        the paths the row had already left out too)."""
+        from stepbuild.harness.blocks import render_blocks
+        from stepbuild.harness.prompt import render_tree
+        ctx = render_blocks(blocks) if blocks else _SB_NO_CONTEXT
+        tree = render_tree(self.paths, shown)
+        if self.hidden:
+            lines = tree.splitlines()[:shown]
+            lines.append(f"... ({len(self.paths) - shown + self.hidden} more files not shown)")
+            tree = "".join(line + "\n" for line in lines)
+        return f"{self.head}{_SB_CONTEXT}{ctx}{_SB_TREE}{tree}"
+
+
+def _parse_sb_user(user: str) -> _SbPrompt | None:
+    """The row's user message taken apart, or None when it is not the dataset's
+    layout (then it is not re-rendered at all). The context must re-render byte for
+    byte (render_blocks); the tree is read as one path per line. Rows mined before
+    the tree cap list their whole tree sorted; a cut prompt shows it the way the
+    harness does now (tree order, capped)."""
+    import re
+    from stepbuild.harness.blocks import BlockError, render_blocks, parse_blocks
+    from stepbuild.harness.prompt import tree_order
+    i = user.find(_SB_CONTEXT)
+    j = user.rfind(_SB_TREE)
+    if not user.startswith("STEP: ") or i < 0 or j < i + len(_SB_CONTEXT) - 1:
+        return None
+    head, ctx, tree = user[:i], user[i + len(_SB_CONTEXT):j], user[j + len(_SB_TREE):]
+    if ctx == _SB_NO_CONTEXT:
+        blocks = []
+    else:
+        try:
+            blocks = parse_blocks(ctx)
+        except BlockError:
+            return None
+        if render_blocks(blocks) != ctx:
+            return None
+    lines = tree.splitlines()
+    hidden = 0
+    m = re.fullmatch(r"\.\.\. \((\d+) more files not shown\)", lines[-1]) if lines else None
+    if m:
+        hidden = int(m.group(1))
+        lines = lines[:-1]
+    if any(not line.strip() for line in lines):
+        return None
+    return _SbPrompt(head, blocks, tree_order(lines), hidden)
+
+
+def fit_stepbuild_prompt(tok: Any, messages: list[dict[str, str]], context: int,
+                         reserve: int = STEPBUILD_RESERVE
+                         ) -> tuple[list[dict[str, str]] | None, dict[str, Any]]:
+    """The stepbuild conversation (system, user, assistant) with its user message cut
+    to fit `context` - `reserve` tokens beside the whole reply, the way the benchmark
+    harness fits a prompt (stepbuild.harness.prompt.build_messages): the PROJECT
+    TREE is cut first (the largest prefix that fits, the harness's render_tree and
+    its "... (N more files not shown)"), and FILE blocks are never cut in the
+    middle. Where build_messages would then give up (PromptTooLong), a training row
+    drops WHOLE context files instead, the files the reply does not rewrite first
+    (the last shown first), and the tree is refitted to the room that frees. The
+    reply is never touched. Counted with the real tokenizer, exactly as training
+    encodes the conversation.
+
+    Returns (messages, info): messages unchanged when they fit, the cut ones, or
+    None with info["drop"] = "reply_too_long" (the reply alone leaves no room) or
+    "prompt_too_long" (not even the STEP line fits beside it). info also says
+    whether anything was cut ("trimmed") and how many files and tree paths went."""
+    info: dict[str, Any] = {"drop": None, "trimmed": False, "files_dropped": 0,
+                            "tree_paths_dropped": 0}
+    if (len(messages) != 3 or [m["role"] for m in messages] != ["system", "user", "assistant"]):
+        return list(messages), info
+    system, user, reply = messages
+    reply_n = len(chat.encode_turn(tok, reply)[0])
+    if reply_n + reserve > context:
+        info["drop"] = "reply_too_long"
+        return None, info
+    budget = context - reserve - reply_n - len(chat.encode_turn(tok, system)[0])
+
+    def size(text: str) -> int:
+        return len(chat.encode_turn(tok, {"role": "user", "content": text})[0])
+
+    if size(user["content"]) <= budget:
+        return list(messages), info
+    prompt = _parse_sb_user(user["content"])
+    if prompt is None:
+        return list(messages), info     # not the dataset's layout: fit() decides
+    written = {b.path for b in _reply_blocks(reply["content"])}
+    order = ([b for b in reversed(prompt.blocks) if b.path not in written]
+             + [b for b in reversed(prompt.blocks) if b.path in written])
+    for dropped in range(len(order) + 1):
+        gone = {id(b) for b in order[:dropped]}
+        blocks = [b for b in prompt.blocks if id(b) not in gone]
+        if size(prompt.render(blocks, 0)) > budget:
+            continue
+        lo, hi = 0, prompt.max_shown         # the largest tree prefix that fits
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if size(prompt.render(blocks, mid)) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        info.update(trimmed=True, files_dropped=dropped,
+                    tree_paths_dropped=len(prompt.paths) - lo + prompt.hidden)
+        return [dict(system), {"role": "user", "content": prompt.render(blocks, lo)},
+                dict(reply)], info
+    info["drop"] = "prompt_too_long"
+    return None, info
+
+
+def _reply_blocks(reply: str) -> list[Any]:
+    from stepbuild.harness.blocks import BlockError, parse_blocks
+    try:
+        return parse_blocks(reply)
+    except BlockError:
+        return []
+
+
 def stepbuild_examples(rows: Iterable[dict[str, Any]], stats: SourceStats, *,
-                       bench_guard: Any, test_guard: HeldOutSplitGuard | None) -> Iterator[Example]:
+                       bench_guard: Any, test_guard: HeldOutSplitGuard | None,
+                       tok: Any = None, context: int | None = None) -> Iterator[Example]:
     """The stepbuild train split, screened by the bench's LeakageGuard and the
-    test-split guard."""
+    test-split guard; with `tok` and `context`, each prompt fitted to the context
+    (fit_stepbuild_prompt; a row it cannot fit is dropped as "reply_too_long" or
+    "prompt_too_long")."""
     for r in rows:
         stats.rows_read += 1
         if r.get("split") != "train":
@@ -388,6 +546,15 @@ def stepbuild_examples(rows: Iterable[dict[str, Any]], stats: SourceStats, *,
             stats.drops["leakage_test_split"] += 1
             continue
         messages = [{"role": m["role"], "content": m["content"]} for m in r["messages"]]
+        if tok is not None and context is not None:
+            fitted, info = fit_stepbuild_prompt(tok, messages, context)
+            if fitted is None:
+                stats.drops[info["drop"]] += 1
+                continue
+            if info["trimmed"]:
+                stats.prompts["trimmed"] += 1
+                stats.prompts["context_files_dropped"] += info["files_dropped"]
+            messages = fitted
         yield Example(STEPBUILD, f"{r.get('repo')}@{r.get('commit')}", CODE, messages,
                       licence=str(r.get("licence") or ""))
 
@@ -688,7 +855,8 @@ def main(argv: list[str] | None = None) -> int:
             rows = _jsonl_rows(train_files)
             if args.limit is not None:
                 rows = (r for i, r in zip(range(args.limit), rows))
-            return stepbuild_examples(rows, st, bench_guard=bench, test_guard=test_guard)
+            return stepbuild_examples(rows, st, bench_guard=bench, test_guard=test_guard,
+                                      tok=tok, context=context)
         sources[STEPBUILD] = stepbuild_source
 
     decontam = None

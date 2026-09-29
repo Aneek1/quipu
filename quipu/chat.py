@@ -9,14 +9,19 @@ with no other separators: exactly the Hugging Face chat template the export writ
 (scripts/export_hf.py CHAT_TEMPLATE) and hf/modeling_quipu_moe.render_chat, which
 appends an open <|assistant|> for the reply (add_generation_prompt).
 
-Tokens. A turn is [role token] + encode_with_special(content) + [<|end|>]. That is
-what the tokenizer gives for the whole rendered string (special tokens split the
-text before BPE, so nothing merges across them), so training tokens equal the
-tokens the HF template and the standalone loader produce at inference. The one
-consequence: the step-builder's FILE markers ("=== FILE: ", "=== END FILE ===") in
-content become their special tokens, as the tokenizer reserved them for. Content
-that contains a chat special string (<|user|> and the rest, CHAT_SPECIALS) is
-refused (ChatFormatError): parsed at inference it would forge a turn boundary.
+Tokens. A turn is [role token] + encode(content) + [<|end|>]: the content is PLAIN
+text (tok.encode, no special-token parsing), exactly as pretraining encoded every
+document, and only the role tokens, <|end|> and <|endoftext|> are special. So the
+step-builder's FILE markers ("=== FILE: ", "=== END FILE ===") in content stay the
+plain-text tokens the model learned them as in pretraining, never the special ids
+the tokenizer reserved for them (5 and 6), which pretraining never produced. Special
+strings split the text before BPE, so nothing merges across a turn boundary and
+these ids equal the tokens of the rendered string whenever its content holds no
+FILE marker; an inference path that tokenizes the rendered text (the HF template,
+the standalone loader) must therefore parse only the chat specials, not the FILE
+markers. Content that contains a chat special string (<|user|> and the rest,
+CHAT_SPECIALS) is refused (ChatFormatError): rendered as text and parsed at
+inference, it would forge a turn boundary.
 
 Loss mask (spec 13): 1 exactly on the assistant turns' content tokens and their
 closing <|end|>; 0 on role tokens, system and user turns, and padding. mask[i] says
@@ -37,8 +42,9 @@ ROLES = ("system", "user", "assistant")
 ROLE_TOKENS = {"system": "<|system|>", "user": "<|user|>", "assistant": "<|assistant|>"}
 END = "<|end|>"
 EOT = "<|endoftext|>"
-# Strings that must not occur inside content: each is one token under
-# encode_with_special and would change the conversation's structure.
+# Strings that must not occur inside content: each is a structural token when the
+# rendered text is tokenized with the chat specials parsed, and would change the
+# conversation's structure.
 CHAT_SPECIALS = (EOT, "<|system|>", "<|user|>", "<|assistant|>", END)
 # Targets the loss ignores (torch's cross_entropy default ignore_index).
 IGNORE_INDEX = -100
@@ -91,7 +97,8 @@ def _ids(tok: Any) -> dict[str, int]:
 def encode_turn(tok: Any, message: dict[str, Any]) -> tuple[list[int], list[int]]:
     """One turn's tokens and loss mask (1 on an assistant's content and <|end|>)."""
     role_id = tok.special_id(ROLE_TOKENS[message["role"]])
-    content = tok.encode_with_special(message["content"]) if message["content"] else []
+    # Plain text: a FILE marker in the content stays text (see the module docstring).
+    content = tok.encode(message["content"]) if message["content"] else []
     ids = [role_id] + content + [tok.special_id(END)]
     on = 1 if message["role"] == "assistant" else 0
     return ids, [0] + [on] * (len(content) + 1)

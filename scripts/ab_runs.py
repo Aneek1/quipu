@@ -131,12 +131,13 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from quipu import childproc
-from quipu.config import Config, load_config, parse_overrides
+from quipu.config import INHERIT_KEYS, Config, load_config, parse_overrides
 from quipu.fsio import write_text_atomic
 from quipu.spend import TICK_S, Ledger, LedgerError, Ticker
 
@@ -548,6 +549,14 @@ class Orchestrator:
         if refused:
             raise ValueError("; ".join(f"--override {k} is not allowed: {RESERVED_OVERRIDES[k]}"
                                        for k in refused) + " (orchestrator-owned key)")
+        # The cache key and the provenance hash the config file alone; a base pulled
+        # in through `inherit` could change under a cached result unseen.
+        own = tomllib.loads(self.config_path.read_text(encoding="utf-8"))
+        used = [k for k in INHERIT_KEYS if k in own]
+        if used:
+            raise ValueError(
+                f"{self.config_path} uses {', '.join(used)}: the A/B orchestrator takes a "
+                "self-contained config (write the merged values into it)")
         self.cfg: Config = load_config(self.config_path, self._parse(self.extra))
         self.config_sha = hashlib.sha256(self.config_path.read_bytes()).hexdigest()
         # The box ledger (never written until run() begins: a dry run changes nothing).

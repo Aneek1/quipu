@@ -113,7 +113,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quipu import childproc
-from quipu.config import _merge, load_config, parse_overrides
+from quipu.config import INHERIT_KEYS, _merge, load_config, parse_overrides
 from quipu.fsio import write_text_atomic
 from quipu.spend import TICK_S, Ledger, LedgerError, SessionEnded, Ticker
 
@@ -354,15 +354,29 @@ def gate_reuse_note(train: dict[str, Any], gate_step: int, old_steps: int,
 
 # ---- the run config --------------------------------------------------------------------
 
+def _refuse_inherit(where: str, table: dict[str, Any]) -> None:
+    used = [k for k in INHERIT_KEYS if k in table]
+    if used:
+        raise ValueError(
+            f"{where} uses {', '.join(used)}: the launcher takes a self-contained config "
+            "(write the merged values into it; `inherit` is for quipu.train configs such "
+            "as quipu-moe-sft.toml)")
+
+
 def resolve_raw(config: str | Path, winners: str | Path | None,
                 overrides: list[str]) -> dict[str, Any]:
     """The config file with the winners and --override flags merged in (as
-    load_config merges them). Launcher-owned train keys are refused."""
+    load_config merges them). Launcher-owned train keys are refused, and so is a
+    config or winners file that uses `inherit` / `inherit_if_present`: this merge
+    reads the TOML itself and writes the result elsewhere, where an inherit path
+    would resolve against the wrong directory (or its base be dropped unseen)."""
     raw = tomllib.loads(Path(config).read_text(encoding="utf-8"))
+    _refuse_inherit(f"config {config}", raw)
     layers: list[tuple[str, dict[str, Any]]] = []
     if winners:
         layers.append((f"winners {winners}", tomllib.loads(
             Path(winners).read_text(encoding="utf-8"))))
+        _refuse_inherit(*layers[-1])
     if overrides:
         layers.append(("--override", parse_overrides(overrides)))
     for where, layer in layers:

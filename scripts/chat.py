@@ -16,7 +16,10 @@ Each turn: the conversation so far in the chat template (quipu.chat), an open
 --max-new-tokens). --temperature 0 is greedy; otherwise sampling from softmax
 (logits / T) restricted to --top-p. The reply is printed as it comes. When the
 conversation no longer fits the context with room for a reply, the oldest turns
-are dropped (the system message is kept). Commands: /reset (new conversation),
+are dropped (the system message is kept); a single turn still too long loses the
+start of its content, never its role token or <|end|> (prompt_ids). Content is
+encoded as plain text (quipu.chat), so the terminal checkpoint path and the
+exported folder tokenize a turn the same way. Commands: /reset (new conversation),
 /system TEXT (set the system message and reset), /quit (or end of input).
 """
 from __future__ import annotations
@@ -65,15 +68,31 @@ class StreamPrinter:
 
 def prompt_ids(tok: Any, messages: list[dict[str, str]], budget: int) -> list[int]:
     """The conversation ready for the reply, oldest user/assistant turns dropped
-    until it fits `budget` tokens (the system message stays). The newest user turn
-    alone is left-cropped if even it is too long."""
+    until it fits `budget` tokens (the system message stays). When the newest user
+    turn alone is still too long, its CONTENT is cropped from the front (the newest
+    text is kept); the role tokens and <|end|>s never are, so the model always sees a
+    well-formed conversation. The system message goes only when not even one
+    content token of the user turn would fit beside it."""
     system = messages[:1] if messages and messages[0]["role"] == "system" else []
     turns = messages[len(system):]
     while True:
         ids, _ = chat.encode(tok, system + turns, add_generation_prompt=True)
-        if len(ids) <= budget or len(turns) <= 1:
-            return ids[-budget:]
+        if len(ids) <= budget:
+            return ids
+        if len(turns) <= 1:
+            break
         turns = turns[2:]
+    last = turns[-1]
+    content = tok.encode(last["content"])
+    for head in (system, []) if system else ([],):
+        # frame = head, then [role] <|end|> <|assistant|> around an empty content
+        frame, _ = chat.encode(tok, head + [{"role": last["role"], "content": ""}],
+                               add_generation_prompt=True)
+        room = budget - len(frame)
+        if room > 0 or (room == 0 and not head):
+            return frame[:-2] + (content[-room:] if room else []) + frame[-2:]
+    # A budget under 3 tokens cannot hold even [role] <|end|> <|assistant|>.
+    return frame[-budget:]
 
 
 def run_chat(model: Callable[[torch.Tensor], torch.Tensor], tok: Any, *, context: int,

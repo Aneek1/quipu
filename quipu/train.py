@@ -73,9 +73,14 @@ cores (or on CPU) is a usage error, exit 2.
 
 Chat fine-tune (spec 13), train.mode "sft": the data is scripts/build_chat_data.py's
 blocks read by quipu.loader.MaskedBlockStream, whose targets outside assistant turns
-are IGNORE_INDEX, so the loss (cross_entropy with that ignore_index, the mean over a
-micro-batch's assistant targets) is on assistant tokens only; pretraining targets
-never hold IGNORE_INDEX, so its loss is unchanged. train.max_epochs caps the run's
+are IGNORE_INDEX, so the loss is on assistant tokens only. A step's loss (and its
+gradient, and the logged train_loss) is the mean over EVERY assistant target of the
+step: the step's grad_accum micro-batches are read first, their targets counted
+(N), and each micro-batch adds its summed cross-entropy / N; no division by
+grad_accum. So a token weighs the same whichever micro-batch it lands in, exactly as
+in one full batch. The <|endoftext|> padding and separators are left out of the MoE
+balance update (_drop_padding_scores). Pretraining is untouched: a mean per
+micro-batch divided by grad_accum, as before. train.max_epochs caps the run's
 length at that many passes over the training blocks (total_tokens cut to whole
 steps; warmup must still fit, milestones past the end are dropped); the run log
 notes it under "sft_epoch_cap". `--init-from PATH` loads model weights (a training
@@ -109,6 +114,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from quipu.bpe import EOT as BPE_EOT, SPECIAL_TOKENS
 from quipu.childproc import TRAIN_LOG_ENV
 from quipu.config import Config, ModelConfig, TrainConfig, load_config, parse_overrides
 from quipu.eval import estimate_loss
@@ -136,6 +142,10 @@ MOE_HEALTH_WINDOW = 500
 # over the micro-batches). 65,536 x 64 experts x 4 bytes = 16 MiB a layer; the whole
 # 524k-token step would be 128 MiB a layer, 2 GiB over 16 layers.
 BALANCE_SAMPLE_TOKENS = 65_536
+# The chat data's padding and conversation separator, <|endoftext|>: its id in the
+# BPE tokenizer (fixed low ids, the same in every tokenizer trained here; the chat
+# data needs that tokenizer). SFT leaves it out of the balance update.
+SFT_PAD_ID = SPECIAL_TOKENS.index(BPE_EOT)
 # torch.compile backend for train.compile. Tests use "eager" to run real dynamo
 # without Triton or a C++ compiler.
 COMPILE_BACKEND = "inductor"
@@ -611,6 +621,21 @@ class Trainer:
                     muon_lr = group["lr"]
         return muon_lr
 
+    def _drop_padding_scores(self, x: torch.Tensor) -> None:
+        """SFT: leave the <|endoftext|> positions (block padding and the separators
+        between packed conversations) out of the router scores the latest forward
+        stashed, before accumulate_balance_scores takes them, so the balancer learns
+        from the tokens the model reads, not from a block's padding. Expert counts
+        and drops (logging) still include them."""
+        keep = x.reshape(-1) != SFT_PAD_ID
+        if bool(keep.all()):
+            return
+        for block in self.model.blocks:
+            moe = block.moe
+            scores = moe._last_scores
+            if scores is not None and scores.shape[0] == keep.numel():
+                moe._last_scores = scores[keep]
+
     def train_step(self) -> float:
         cfg = self.train_cfg
         lr = self.lr_at(self.step)
@@ -638,19 +663,40 @@ class Trainer:
             # per step: no host sync per micro-batch.
             total_t = torch.zeros((), dtype=torch.float64, device=self.device)
             use_amp = self.device.startswith("cuda")
-            for _ in range(cfg.grad_accum):
-                x, y = self.stream.next_batch()
+            sft = cfg.mode == "sft"
+            if sft:
+                # The step's micro-batches are read up front (CPU tensors from the
+                # memmaps) to count its assistant targets N: each micro-batch then
+                # adds its summed loss / N, so the step's gradient and loss are the
+                # mean over every assistant token of the step, as one full batch
+                # would give. A mean per micro-batch would weight a token by how
+                # few assistant tokens happened to share its micro-batch.
+                batches = [self.stream.next_batch() for _ in range(cfg.grad_accum)]
+                n_targets = sum(int((y != IGNORE_INDEX).sum()) for _, y in batches)
+            for i in range(cfg.grad_accum):
+                x, y = batches[i] if sft else self.stream.next_batch()
                 x, y = x.to(self.device), y.to(self.device)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                     logits = self.forward_model(x)
-                    # IGNORE_INDEX is cross_entropy's default: pretraining targets
-                    # never hold it; SFT targets outside assistant turns do.
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1),
-                                           ignore_index=IGNORE_INDEX)
-                # Divide before backward so the accumulated gradient is the mean over
-                # the whole batch, not the sum over micro-batches.
-                (loss / cfg.grad_accum).backward()
-                total_t += loss.detach().double() / cfg.grad_accum
+                    if sft:
+                        # Targets outside assistant turns are IGNORE_INDEX; every
+                        # block has one at least (MaskedBlockStream), so N > 0.
+                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                               y.reshape(-1), ignore_index=IGNORE_INDEX,
+                                               reduction="sum") / n_targets
+                    else:
+                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                               y.reshape(-1))
+                if sft:
+                    loss.backward()
+                    total_t += loss.detach().double()
+                else:
+                    # Divide before backward so the accumulated gradient is the mean
+                    # over the whole batch, not the sum over micro-batches.
+                    (loss / cfg.grad_accum).backward()
+                    total_t += loss.detach().double() / cfg.grad_accum
+                if self.is_moe and sft:
+                    self._drop_padding_scores(x)
                 if self.is_moe:
                     # last_stats and the stashed scores cover this micro-batch only;
                     # summed here, the step's balance update and load logging see
@@ -1066,6 +1112,73 @@ class Trainer:
             raise
 
 
+@torch.no_grad()
+def evaluate_by_source(model: nn.Module, root: str | Path, context: int,
+                       device: str) -> dict[str, dict[str, Any]]:
+    """Held-out chat loss per source (spec 13): for each <root>/<source>/ of
+    scripts/build_chat_data.py's val_by_source split, every block once at
+    micro_batch 1, the summed cross-entropy over its assistant targets / their
+    count (the mean over the source's assistant tokens, whatever the blocks hold).
+    Loop dispatch, the training autocast on CUDA. {} when there is nothing there."""
+    from quipu.eval import loop_dispatch
+
+    root = Path(root)
+    out: dict[str, dict[str, Any]] = {}
+    if not root.is_dir():
+        return out
+    was_training = model.training
+    model.eval()
+    try:
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            if not any(d.glob("shard_*.bin")):
+                continue
+            stream = MaskedBlockStream(d, 1, context)
+            nll = torch.zeros((), dtype=torch.float64, device=device)
+            n = 0
+            try:
+                with loop_dispatch(model), torch.autocast(
+                        "cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda")):
+                    for _ in range(stream.n_blocks):
+                        x, y = stream.next_batch()
+                        n += int((y != IGNORE_INDEX).sum())
+                        logits = model(x.to(device))
+                        nll += F.cross_entropy(logits.view(-1, logits.size(-1)).float(),
+                                               y.to(device).reshape(-1),
+                                               ignore_index=IGNORE_INDEX,
+                                               reduction="sum").double()
+                blocks = stream.n_blocks
+            finally:
+                stream.close()
+            out[d.name] = {"loss": float(nll) / n, "assistant_tokens": n, "blocks": blocks}
+    finally:
+        if isinstance(model, QuipuMoE):
+            model.clear_balance_scores()     # eval forwards must not reach a balance update
+        model.train(was_training)
+    return out
+
+
+def write_val_by_source(trainer: "Trainer", root: Path, out: Path, run_id: str) -> None:
+    """evaluate_by_source on the trained model, written to `out` (JSON) with the step
+    and run id; nothing when the split is absent. A failure here is a warning: the
+    trained checkpoint is already saved."""
+    try:
+        results = evaluate_by_source(trainer.model, root, trainer.model_cfg.context,
+                                     trainer.device)
+        if not results:
+            return
+        from quipu.fsio import write_text_atomic
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(out, json.dumps(
+            {"run_id": run_id, "step": trainer.step, "micro_batch": 1,
+             "loss": "mean cross-entropy (nats) over each source's assistant tokens",
+             "sources": results}, indent=2))
+        print("held-out chat loss per source: " + ", ".join(
+            f"{k} {v['loss']:.4f}" for k, v in results.items()) + f" -> {out}", flush=True)
+    except (OSError, ValueError) as exc:
+        print(f"warning: per-source held-out loss not written: {exc}", file=sys.stderr,
+              flush=True)
+
+
 def _pick_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -1095,6 +1208,11 @@ def main(argv: list[str] | None = None) -> None:
                         help="start from these model weights with a fresh optimizer and "
                              "schedule (train.mode sft); ignored when --resume finds the "
                              "run's own checkpoint")
+    parser.add_argument("--val-by-source-out", default="results/sft/val_by_source.json",
+                        metavar="JSON",
+                        help="train.mode sft: after a completed run, the held-out chat loss "
+                             "per source (<shard_dir>/val_by_source/*, micro_batch 1) goes "
+                             "here; '' to skip")
     args = parser.parse_args(argv)
 
     try:
@@ -1152,6 +1270,9 @@ def main(argv: list[str] | None = None) -> None:
     elif args.init_from:
         trainer.init_weights_from(args.init_from)
     trainer.run()
+    if cfg.train.mode == "sft" and args.val_by_source_out:
+        write_val_by_source(trainer, Path(cfg.data.shard_dir) / "val_by_source",
+                            Path(args.val_by_source_out), args.run_id)
 
 
 # SIGHUP (POSIX): a trainer whose terminal or launcher went away checkpoints too.

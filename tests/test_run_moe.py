@@ -4,6 +4,7 @@ the CPU with a fake clock and a fake trainer (no torch model is built), except o
 test that drives a real child process through SIGINT / CTRL_BREAK."""
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -239,7 +240,9 @@ def test_dump_toml_round_trips_the_resolved_config(tmp_path):
     assert tomllib.loads(text) == raw
     path = tmp_path / "run.toml"
     path.write_text(text, encoding="utf-8")
-    assert load_config(path) == load_config(MOE)
+    # the same config; only `layers` (which files it was read from) differs
+    assert dataclasses.replace(load_config(path), layers=()) == dataclasses.replace(
+        load_config(MOE), layers=())
 
 
 def test_winners_and_overrides_are_merged_and_launcher_keys_refused(tmp_path):
@@ -256,6 +259,21 @@ def test_winners_and_overrides_are_merged_and_launcher_keys_refused(tmp_path):
         rm.resolve_raw(MOE, bad, [])
     with pytest.raises(ValueError, match="milestones"):
         rm.resolve_raw(MOE, None, ["train.milestones=[5]"])
+
+
+@pytest.mark.parametrize("line", ['inherit = "quipu-moe.toml"',
+                                  'inherit_if_present = ["x.toml"]'])
+def test_a_config_that_inherits_is_refused_with_a_clear_message(tmp_path, line):
+    # resolve_raw reads the TOML itself and writes the result next to the run: an
+    # `inherit` there would be re-resolved against the wrong directory, or dropped.
+    cfg = tmp_path / "child.toml"
+    cfg.write_text(f'name = "child"\n{line}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="inherit"):
+        rm.resolve_raw(cfg, None, [])
+    winners = tmp_path / "winners.toml"
+    winners.write_text(f"{line}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="inherit"):
+        rm.resolve_raw(MOE, winners, [])
 
 
 # ---- the launcher, end to end with a fake trainer -------------------------------------------

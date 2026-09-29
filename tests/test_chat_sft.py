@@ -89,9 +89,14 @@ def test_render_is_the_export_template_and_the_standalone_loaders():
 
 def test_render_tokenize_parse_round_trips(tok):
     ids, mask = chat.encode(tok, CONVERSATION)
-    # The per-turn tokens are the tokenizer's tokens of the whole rendered string, so
-    # training sees what the HF template and the standalone loader produce.
-    assert ids == tok.encode_with_special(chat.render(CONVERSATION))
+    # A turn is its role token, its content encoded as PLAIN text (as pretraining
+    # encoded every document), then <|end|>: only the role tokens, <|end|> and
+    # <|endoftext|> are special.
+    want = []
+    for m in CONVERSATION:
+        want += ([tok.special_id(chat.ROLE_TOKENS[m["role"]])] + tok.encode(m["content"])
+                 + [tok.special_id(chat.END)])
+    assert ids == want
     assert len(mask) == len(ids)
     assert chat.parse(tok, ids) == CONVERSATION
     # trailing <|endoftext|> padding parses away; tokens after it do not
@@ -101,8 +106,12 @@ def test_render_tokenize_parse_round_trips(tok):
         chat.parse(tok, ids + [eot] + ids[:3])
     with pytest.raises(chat.ChatFormatError):
         chat.parse(tok, ids[:-1])                     # last turn not closed
-    # the FILE marker is its special token inside the reply
-    assert tok.special_id("=== FILE: ") in ids
+    # the FILE markers stay plain text, as in the pretraining shards: never their
+    # reserved special ids, and the reply's tokens are exactly encode()'s
+    assert tok.special_id("=== FILE: ") not in ids
+    assert tok.special_id("=== END FILE ===") not in ids
+    reply_ids = ids[-1 - len(tok.encode(REPLY_FILE)):-1]
+    assert reply_ids == tok.encode(REPLY_FILE) and tok.decode(reply_ids) == REPLY_FILE
 
 
 def test_mask_covers_exactly_the_assistant_spans_and_their_end(tok):
@@ -118,7 +127,7 @@ def test_mask_covers_exactly_the_assistant_spans_and_their_end(tok):
             expected.append(1 if current == "assistant" else 0)   # content and <|end|>
     assert mask == expected
     # and, counted directly: assistant content + one <|end|> per assistant turn
-    n_asst = sum(len(tok.encode_with_special(m["content"])) + 1
+    n_asst = sum(len(tok.encode(m["content"])) + 1
                  for m in CONVERSATION if m["role"] == "assistant")
     assert sum(mask) == n_asst
     ends = [i for i, t in enumerate(ids) if t == end]
@@ -264,6 +273,91 @@ def test_the_trainer_loss_is_the_mean_over_assistant_targets_only(tmp_path, tok)
     assert tr.train_step() == pytest.approx(float(sum(nll) / len(nll)), rel=1e-5)
 
 
+def test_the_sft_step_is_one_mean_over_every_assistant_token_of_its_micro_batches(
+        tmp_path, tok, monkeypatch):
+    # Two blocks (one conversation each) with very different assistant token counts,
+    # one per micro-batch: the step's gradient and logged loss must be the mean over
+    # ALL the step's assistant targets, as one full batch would give -- not the mean
+    # of the two micro-batch means, which would weight the short reply's tokens more.
+    rows = [{"inputs": "Say hello.", "targets": "Hi.", "language": "English",
+             "language_code": "eng"},
+            {"inputs": "Say more.", "targets": " ".join(["Two plus two is four."] * 3),
+             "language": "English", "language_code": "eng"}]
+    bcd.build({bcd.AYA: lambda st: bcd.aya_examples(rows, st)}, tmp_path / "chat", tok=tok,
+              context=CONTEXT, val_fraction=0.0, packed=False, shard_tokens=10_000)
+    masks = np.fromfile(tmp_path / "chat" / "train" / "shard_000.mask", dtype=np.uint8)
+    counts = [int(masks[b * CONTEXT + 1:(b + 1) * CONTEXT].sum()) for b in range(2)]
+    assert counts[0] != counts[1] and min(counts) > 0
+    cfg = sft_cfg(tmp_path, tok, micro_batch=1, batch_tokens=2 * CONTEXT)   # grad_accum 2
+    assert cfg.train.grad_accum == 2
+    tr = sft_trainer(tmp_path, cfg, val=False)
+    # weights AND buffers (the balancer's bias moves after the step)
+    ref = {k: v.detach().clone() for k, v in tr.model.state_dict().items()}
+    grads = {}
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def capture(params, *a, **k):
+        params = list(params)
+        grads["step"] = [None if p.grad is None else p.grad.detach().clone() for p in params]
+        return real_clip(params, *a, **k)
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", capture)
+    loss = tr.train_step()
+    # the reference: the same weights, both blocks as ONE batch, cross_entropy's mean
+    tr.model.load_state_dict(ref)
+    tr.model.zero_grad(set_to_none=True)
+    tr.model.clear_balance_scores()
+    probe = MaskedBlockStream(tmp_path / "chat" / "train", 2, CONTEXT)
+    x, y = probe.next_batch()
+    full = F.cross_entropy(tr.model(x).view(-1, tok.vocab_size), y.view(-1),
+                           ignore_index=IGNORE_INDEX)
+    full.backward()
+    assert loss == pytest.approx(full.item(), rel=1e-5)
+    for p, g in zip(tr.model.parameters(), grads["step"]):
+        if p.grad is None:
+            assert g is None or not g.any()
+            continue
+        torch.testing.assert_close(g, p.grad, rtol=1e-4, atol=1e-6)
+    log = json.loads((tmp_path / "runs" / "sft.json").read_text(encoding="utf-8"))
+    assert log["steps"][0]["train_loss"] == pytest.approx(full.item(), rel=1e-5)
+
+
+def test_the_sft_balance_update_leaves_out_the_padding(tmp_path, tok):
+    build_sft_data(tmp_path, tok)
+    cfg = sft_cfg(tmp_path, tok)                                  # grad_accum 2
+    tr = sft_trainer(tmp_path, cfg, val=False)
+    seen = []
+    for block in tr.model.blocks:
+        real = block.moe.balancer.update
+        block.moe.balancer.update = lambda s, real=real: (seen.append(s.shape[0]), real(s))
+    probe = MaskedBlockStream(tmp_path / "chat" / "train", 2, CONTEXT)
+    xs = [probe.next_batch()[0] for _ in range(cfg.train.grad_accum)]
+    eot = tok.special_id(chat.EOT)
+    real_tokens = sum(int((x != eot).sum()) for x in xs)
+    assert real_tokens < sum(x.numel() for x in xs)               # the fixture has padding
+    tr.train_step()
+    assert seen == [real_tokens] * cfg.model.n_layer
+
+
+def test_val_by_source_is_the_mean_over_each_sources_assistant_tokens(tmp_path, tok):
+    build_sft_data(tmp_path, tok, rows=qa_rows(60), val_fraction=0.3)
+    tr = sft_trainer(tmp_path, sft_cfg(tmp_path, tok), val=False)
+    root = tmp_path / "chat" / "val_by_source"
+    got = train_mod.evaluate_by_source(tr.model, root, CONTEXT, "cpu")
+    assert set(got) == {"aya"}
+    # by hand: every block, summed nll over its assistant targets / their count
+    blocks = np.fromfile(root / "aya" / "shard_000.bin", dtype="<u2")
+    masks = np.fromfile(root / "aya" / "shard_000.mask", dtype=np.uint8)
+    x = torch.from_numpy(blocks.astype(np.int64)).view(-1, CONTEXT)
+    m = torch.from_numpy(masks.astype(bool)).view(-1, CONTEXT)
+    with torch.no_grad():
+        logp = torch.log_softmax(tr.model(x).double(), -1)
+    nll = [-logp[b, t, x[b, t + 1]] for b in range(x.shape[0]) for t in range(CONTEXT - 1)
+           if m[b, t + 1]]
+    assert got["aya"]["assistant_tokens"] == len(nll)
+    assert got["aya"]["blocks"] == x.shape[0]
+    assert got["aya"]["loss"] == pytest.approx(float(sum(nll) / len(nll)), rel=1e-5)
+
+
 def _pretrained_checkpoint(tmp_path, tok) -> Path:
     """A 'pretraining' checkpoint of the same model: a few plain steps on tokens."""
     cfg = sft_cfg(tmp_path, tok, mode="pretrain", ckpt_dir=str(tmp_path / "ckpt-pre"))
@@ -346,7 +440,7 @@ def test_max_epochs_caps_the_run_to_the_data(tmp_path, tok):
 
 def _sft_toml(tmp_path, tok) -> Path:
     """A real config file that inherits the smoke config (the SFT config's pattern)."""
-    build_sft_data(tmp_path, tok)
+    build_sft_data(tmp_path, tok, rows=qa_rows(48), val_fraction=0.4)
     path = tmp_path / "sft.toml"
     path.write_text(
         f'name = "sft-test"\ninherit = "{SMOKE.as_posix()}"\n'
@@ -408,12 +502,20 @@ def test_sft_respects_the_budget_backstop_like_pretraining(tmp_path, tok, monkey
     assert record["config_layers"][-1] == str(config)
     # A retry resumes the SFT's own checkpoint; --init-from is then ignored.
     out = capsys.readouterr()
+    vbs = tmp_path / "results" / "val_by_source.json"
     assert run_main(_args(config, "--init-from", str(ckpt.parent), "--resume",
                           "--override", "train.budget_usd=1.0",
-                          "--override", "train.usd_per_hour=3.6")) == EXIT_OK
+                          "--override", "train.usd_per_hour=3.6",
+                          "--val-by-source-out", str(vbs))) == EXIT_OK
     assert "ignored" in capsys.readouterr().out
     record = json.loads((tmp_path / "runs" / "sft.json").read_text(encoding="utf-8"))
     assert record["status"] == "completed" and record["resumes"][-1]["from_step"] == 7
+    # notes written before the resume survive its truncate_to (M8)
+    assert record["config_layers"][-1] == str(config) and "init_from" in record
+    # a completed SFT writes the held-out chat loss per source
+    held = json.loads(vbs.read_text(encoding="utf-8"))
+    assert held["step"] == 40 and held["run_id"] == "sft"
+    assert set(held["sources"]) == {"aya"} and held["sources"]["aya"]["loss"] > 0
     del out
 
 
@@ -576,6 +678,100 @@ def test_stepbuild_train_split_only_with_both_leakage_guards():
     assert st.drops == {"leakage_bench": 1, "leakage_test_split": 1, "not_train_split": 2}
 
 
+SB_FILES = [("app.py", "def handler():\n    return 1\n" * 8),
+            ("util.py", "def helper(a, b):\n    return a + b\n" * 8),
+            ("other.py", "The quick brown fox jumps.\n" * 8)]
+SB_TREE = [f"src/mod_{i}.py" for i in range(30)] + [p for p, _ in SB_FILES]
+
+
+def _sb_messages(files=SB_FILES, tree=SB_TREE, shown=None, reply_body="x = 1\n",
+                 reply_path="app.py"):
+    """A stepbuild row's messages exactly as stepbuild.dataset.format lays them out."""
+    from stepbuild.harness.blocks import FileBlock, render_blocks
+    from stepbuild.harness.prompt import SYSTEM_PROMPT, render_tree
+    ctx = render_blocks([FileBlock(p, c) for p, c in files]) if files else "(none yet)\n"
+    user = (f"STEP: add the handler\n\nCONTEXT FILES:\n{ctx}\nPROJECT TREE:\n"
+            + render_tree(tree, len(tree) if shown is None else shown))
+    return [{"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+            {"role": "assistant",
+             "content": render_blocks([FileBlock(reply_path, reply_body)])}]
+
+
+def _context_blocks(user: str):
+    from stepbuild.harness.blocks import parse_blocks
+    ctx = user.split("\n\nCONTEXT FILES:\n", 1)[1].rsplit("\nPROJECT TREE:\n", 1)[0]
+    return [] if ctx == "(none yet)\n" else [(b.path, b.content) for b in parse_blocks(ctx)]
+
+
+def _n(tok, messages) -> int:
+    return len(chat.encode(tok, messages)[0])
+
+
+def test_a_stepbuild_prompt_that_fits_is_left_alone(tok):
+    msgs = _sb_messages()
+    got, info = bcd.fit_stepbuild_prompt(tok, msgs, _n(tok, msgs) + bcd.STEPBUILD_RESERVE)
+    assert got == msgs and info["drop"] is None and not info["trimmed"]
+
+
+def test_a_stepbuild_prompt_loses_tree_paths_first(tok):
+    msgs = _sb_messages()
+    no_tree = _n(tok, _sb_messages(shown=0))
+    context = (no_tree + _n(tok, msgs)) // 2 + bcd.STEPBUILD_RESERVE
+    got, info = bcd.fit_stepbuild_prompt(tok, msgs, context)
+    assert info["drop"] is None and info["trimmed"] and info["files_dropped"] == 0
+    assert _n(tok, got) <= context - bcd.STEPBUILD_RESERVE
+    assert got[0] == msgs[0] and got[2] == msgs[2]                  # system, reply untouched
+    assert _context_blocks(got[1]["content"]) == SB_FILES          # every file, whole
+    tree = got[1]["content"].rsplit("\nPROJECT TREE:\n", 1)[1].splitlines()
+    shown = tree[:-1]
+    assert 0 < len(shown) < len(SB_TREE)
+    # the harness's own tree text: the first paths in tree order, then the count left out
+    assert tree[-1] == f"... ({len(SB_TREE) - len(shown)} more files not shown)"
+    assert got == _sb_messages(shown=len(shown))                    # exactly render_tree's
+
+
+def test_a_stepbuild_prompt_then_loses_whole_context_files_never_part_of_one(tok):
+    msgs = _sb_messages()
+    no_tree = _n(tok, _sb_messages(shown=0))
+    context = no_tree + bcd.STEPBUILD_RESERVE - 1        # all three files cannot fit
+    got, info = bcd.fit_stepbuild_prompt(tok, msgs, context)
+    assert info["drop"] is None and info["trimmed"] and info["files_dropped"] >= 1
+    assert _n(tok, got) <= context - bcd.STEPBUILD_RESERVE
+    kept = _context_blocks(got[1]["content"])
+    assert kept and all(b in SB_FILES for b in kept)                # whole files only
+    assert ("app.py", SB_FILES[0][1]) in kept                       # the file the reply rewrites
+    assert len(kept) == len(SB_FILES) - info["files_dropped"]
+    # nothing left but the reply's own file and still too long: "(none yet)", then drop
+    bare = _n(tok, _sb_messages(files=[], shown=0))
+    got, info = bcd.fit_stepbuild_prompt(tok, msgs, bare + bcd.STEPBUILD_RESERVE)
+    assert info["drop"] is None and _context_blocks(got[1]["content"]) == []
+    got, info = bcd.fit_stepbuild_prompt(tok, msgs, bare + bcd.STEPBUILD_RESERVE - 1)
+    assert got is None and info["drop"] == "prompt_too_long"
+
+
+def test_a_stepbuild_row_whose_reply_alone_does_not_fit_is_dropped(tok):
+    msgs = _sb_messages(reply_body="def handler():\n    return 1\n" * 30)
+    reply = len(chat.encode_turn(tok, msgs[2])[0])
+    got, info = bcd.fit_stepbuild_prompt(tok, msgs, reply + bcd.STEPBUILD_RESERVE - 1)
+    assert got is None and info["drop"] == "reply_too_long"
+
+
+def test_stepbuild_examples_fit_their_prompts_to_the_context(tok):
+    rows = [{"repo": "o/a", "licence": "MIT", "tag": "flask", "commit": "c1", "split": "train",
+             "messages": _sb_messages()},
+            {"repo": "o/b", "licence": "MIT", "tag": "flask", "commit": "c2", "split": "train",
+             "messages": _sb_messages(reply_body="def handler():\n    return 1\n" * 200)}]
+    context = _n(tok, _sb_messages(shown=0)) + bcd.STEPBUILD_RESERVE - 1
+    st = bcd.SourceStats()
+    ex = list(bcd.stepbuild_examples(rows, st, bench_guard=None, test_guard=None, tok=tok,
+                                     context=context))
+    assert [e.key for e in ex] == ["o/a@c1"]
+    assert _n(tok, ex[0].messages) <= context - bcd.STEPBUILD_RESERVE
+    assert st.drops == {"reply_too_long": 1}
+    assert st.as_dict()["prompts_fitted"] == {"trimmed": 1, "context_files_dropped": 1}
+
+
 def test_build_decontaminates_dedupes_fits_and_counts_everything(tmp_path, tok):
     solution = ("def is_palindrome_number(value):\n    text = str(value)\n"
                 "    return text == text[::-1] and len(text) > 0\n")
@@ -720,6 +916,25 @@ def test_chat_drops_the_oldest_turns_to_fit(tok):
     back = chat.parse(tok, ids[:-1])               # minus the open <|assistant|>
     assert back[0]["content"] == "S" and back[-1]["content"] == "last question"
     assert len(back) < len(msgs) and len(ids) <= len(full) - 1
+
+
+def test_chat_crops_the_content_of_a_too_long_turn_never_its_headers(tok):
+    msgs = [{"role": "system", "content": "S"},
+            {"role": "user", "content": "the start. " + "Two plus two is four. " * 30
+             + "the end"}]
+    full, _ = chat.encode(tok, msgs, add_generation_prompt=True)
+    budget = len(full) // 2
+    ids = chat_script.prompt_ids(tok, msgs, budget)
+    assert len(ids) == budget
+    assert ids[-1] == tok.special_id("<|assistant|>")
+    back = chat.parse(tok, ids[:-1])          # still a well-formed conversation
+    assert [m["role"] for m in back] == ["system", "user"]
+    assert back[0]["content"] == "S"
+    # the newest text is kept, the start of the turn cut
+    assert back[1]["content"].endswith("the end") and "the start" not in back[1]["content"]
+    # too small even for the headers: the system message goes, the user turn stays
+    tiny = chat_script.prompt_ids(tok, msgs, 6)
+    assert len(tiny) <= 6 and [m["role"] for m in chat.parse(tok, tiny[:-1])] == ["user"]
 
 
 def test_chat_answers_the_same_from_a_checkpoint_and_the_hf_export(tmp_path, tok):

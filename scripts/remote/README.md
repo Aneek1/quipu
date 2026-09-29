@@ -140,27 +140,41 @@ $/hour from the Vast instance card.
    (paid from the reserve), then its evaluation. **The SFT runs under the same
    ledger guard**: launch it the way run_moe launches the trainer (spend guard + its
    own session), or at the least with the trainer's backstop set to what is left of
-   the $20, less a copy-back margin (here $0.10), computed so that it fails closed:
+   the $20, less a copy-back margin (here $0.10), computed so that it fails closed.
+   LEFT is computed **immediately before the trainer command**, after the data build:
+   the build's ~10-15 minutes are box time too, and a LEFT taken before it would let
+   the SFT spend them a second time.
 
    ```bash
+   # the chat data (Aya + oasst2 + stepbuild train split; ~10-15 min of CPU, pinned
+   # revisions from the config; writes data/chat-sft/ and its manifest.json):
+   uv run python scripts/build_chat_data.py --config configs/quipu-moe-sft.toml || exit 1
+   # what is left NOW, right before the SFT starts:
    SPENT=$(python3 -m quipu.spend show --usd-only) || exit 1
    LEFT=$(python3 -c "import sys; left = round(20 - $SPENT - 0.10, 4); \
    print(left) if left > 0 else sys.exit('nothing left of the budget')") || exit 1
-   # the chat data (Aya + oasst2 + stepbuild train split; ~10-15 min of CPU, pinned
-   # revisions from the config; writes data/chat-sft/ and its manifest.json):
-   uv run python scripts/build_chat_data.py --config configs/quipu-moe-sft.toml
    # the SFT, from the final pretraining checkpoint (fresh optimizer, step 0):
    uv run python -m quipu.train --config configs/quipu-moe-sft.toml --run-id quipu-moe-sft \
        --init-from checkpoints/quipu-moe --override train.budget_usd=$LEFT \
        --override train.usd_per_hour=R
    ```
 
+   The trainer's backstop clock starts at zero in every process: it counts only its
+   own wall time, not what earlier attempts spent. So before any `--resume` (after a
+   crash, a stop or an interrupt) run the SPENT and LEFT lines again and pass the new
+   LEFT; reusing the first one would grant the whole amount a second time. The
+   ledger's ticker has counted every attempt's box time, so the new LEFT is what is
+   really left.
+
    `configs/quipu-moe-sft.toml` inherits `quipu-moe.toml` with `results/ab/winners.toml`
    merged on top (so the model, optimizer and precision are the pretrained run's; the
    LR is 0.1x its peak) and stops after 3 epochs of the chat data or 100M tokens,
    whichever is first. If the long run was given `--override train.micro_batch=N`,
-   pass the same here. A crash or a stop: the same command plus
-   `--resume` continues the SFT's own checkpoint (`--init-from` is then ignored). Its
+   pass the same here. A crash or a stop: recompute LEFT (above), then the same
+   command with that LEFT plus `--resume` continues the SFT's own checkpoint
+   (`--init-from` is then ignored). A completed SFT writes its held-out chat loss per
+   source (`data/chat-sft/val_by_source/*`, micro-batch 1) to
+   `results/sft/val_by_source.json`; copy it back with the rest. Its
    config has `budget_usd = 0.5` so a launch without the override is still bounded;
    never with `train.budget_usd 0` (no backstop at all). Try it:
    `uv run python scripts/chat.py --config configs/quipu-moe-sft.toml --temperature 0`.

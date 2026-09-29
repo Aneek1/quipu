@@ -159,6 +159,18 @@ def test_train_cli_applies_overrides(tmp_path, monkeypatch):
     assert Path(seen["run_dir"]) == tmp_path / "runs"
 
 
+def test_an_ab_config_that_inherits_is_refused_with_a_clear_message(tmp_path, capsys):
+    # The cache key hashes the config file alone and the runs are compared on it:
+    # a base pulled in through `inherit` could change unseen under a cached result.
+    cfg = tmp_path / "ab.toml"
+    cfg.write_text(f'inherit = "{AB.as_posix()}"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="inherit"):
+        ab.Orchestrator(cfg, tmp_path / "out", None, budget_usd=100.0, usd_per_hour=0.55)
+    assert ab.main(["--config", str(cfg), "--out", str(tmp_path / "out"), "--dry-run",
+                    "--tokens-per-second", "150000"]) == ab.EXIT_USAGE
+    assert "inherit" in capsys.readouterr().err
+
+
 def test_train_cli_bad_override_is_a_usage_error():
     from quipu.train import EXIT_USAGE, run_main
 
