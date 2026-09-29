@@ -97,12 +97,32 @@ def bits_per_byte(
     fragment would count replacement characters instead of the bytes it holds.
     `device` defaults to the model's; amp as in estimate_loss (bf16 on CUDA only).
     """
+    nll, _, total_bytes = nll_tokens_bytes(model, batches, tokenizer.token_byte_lengths(),
+                                           device, amp)
+    if total_bytes == 0:
+        raise ValueError("bits_per_byte: the targets hold 0 bytes")
+    return nll / (total_bytes * math.log(2))
+
+
+@torch.no_grad()
+def nll_tokens_bytes(
+    model: nn.Module,
+    batches: Iterable[tuple[torch.Tensor, torch.Tensor]],
+    byte_lengths: list[int] | torch.Tensor,
+    device: str | torch.device | None = None,
+    amp: bool = True,
+) -> tuple[float, int, int]:
+    """(summed NLL in nats, target tokens, target bytes) over `batches`, with loop
+    dispatch; the sums behind bits_per_byte, for callers that also want the mean loss
+    per token (nll / tokens) or the sample size. byte_lengths as
+    tokenizer.token_byte_lengths()."""
     device = torch.device(device) if device is not None else _device_of(model)
-    lens = torch.as_tensor(tokenizer.token_byte_lengths(), dtype=torch.long, device=device)
+    lens = torch.as_tensor(byte_lengths, dtype=torch.long, device=device)
     was_training = model.training
     model.eval()
     nll = torch.zeros((), dtype=torch.float64, device=device)
     n_bytes = torch.zeros((), dtype=torch.long, device=device)
+    n_tokens = 0
     try:
         with loop_dispatch(model), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=amp and device.type == "cuda"
@@ -115,13 +135,11 @@ def bits_per_byte(
                     reduction="sum",
                 ).double()
                 n_bytes += lens[y].sum()
+                n_tokens += y.numel()
     finally:
         if was_training:
             model.train()
-    total_bytes = int(n_bytes)
-    if total_bytes == 0:
-        raise ValueError("bits_per_byte: the targets hold 0 bytes")
-    return float(nll) / (total_bytes * math.log(2))
+    return float(nll), n_tokens, int(n_bytes)
 
 
 @torch.no_grad()

@@ -53,7 +53,9 @@ from quipu.memory.dense import DenseIndex, E5Embedder, Embedder
 from quipu.memory.fusion import reciprocal_rank_fusion
 from quipu.memory.window import ORDERS, join_with_break, pack_window
 from quipu.model import Quipu
-from quipu.tokenizer import Tokenizer
+from quipu.tokenizer import Tokenizer, make_tokenizer
+from quipu import evalsets
+from quipu.eval import loop_dispatch
 from quipu.train import LATEST
 
 HAYSTACK_DIRS = {"text": "val", "code": "code_val"}
@@ -194,12 +196,7 @@ def load_model(cfg: Config, path: Path, device: str) -> Quipu:
     """Read-only. A training checkpoint holds {"model": ..., "optimizer": ...}; a
     milestone is the bare (bf16) state_dict. Either loads strictly, so a mismatched
     file fails loudly rather than evaluating half-random weights."""
-    obj = torch.load(path, map_location="cpu", weights_only=False)
-    state = obj["model"] if isinstance(obj, dict) and "model" in obj else obj
-    model = Quipu(cfg.model)
-    model.load_state_dict(state, strict=True)
-    assert model.lm_head.weight is model.embed.weight, "lm_head/embed tie was broken"
-    return model.to(device).eval()
+    return evalsets.load_model(cfg.model, path, device)   # dense or MoE, by the config
 
 
 @torch.no_grad()
@@ -209,7 +206,9 @@ def greedy_continue(model: Quipu, tokens: Sequence[int], n: int, device: str) ->
     assert len(tokens) + n <= model.cfg.context
     idx = torch.tensor([list(tokens)], dtype=torch.long, device=device)
     out: list[int] = []
-    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda")):
+    # MoE: loop dispatch (padded dispatch would make the answer depend on the batch).
+    with loop_dispatch(model), torch.autocast("cuda", dtype=torch.bfloat16,
+                                              enabled=str(device).startswith("cuda")):
         for _ in range(n):
             next_id = model(idx)[:, -1, :].argmax(dim=-1, keepdim=True)
             out.append(int(next_id))
@@ -698,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
           f"depths {depths}, {trials} trials, conditions {conditions}", flush=True)
     t0 = time.perf_counter()
     model = load_model(cfg, ckpt, device)
-    tok = Tokenizer()
+    tok = make_tokenizer(cfg.data.tokenizer)
     haystacks = {k: load_haystack(Path(cfg.data.shard_dir), k) for k in kinds}
     run(
         model=model, tok=tok, haystacks=haystacks, sizes=sizes, depths=depths, trials=trials,
