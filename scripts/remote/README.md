@@ -10,10 +10,14 @@ Building the quipu-moe shards needs no GPU: see
 
 ## The quipu-moe session
 
-The order of a quipu-moe GPU session (the plan's "Session runbook"). The budget
-(`--budget-usd 20`) is the box ledger's, `quipu/spend.py` (`results/spend.json` on the
-box): everything the GPU box costs from the moment it starts, setup included. R is
-the box's $/hour from the Vast instance card.
+The order of a quipu-moe GPU session (the plan's "Session runbook"). The money is a
+**non-refundable $24.06 credit**; the owner's allocation: **$20 for the whole GPU
+session on one ledger**, of which the A/B step may use $3, with a $1.00 reserve
+inside the $20 for the chat SFT, the evals and the copy-back. The ledger is
+`quipu/spend.py` (`results/spend.json` on the box): everything the GPU box costs from
+the moment it starts, setup included, plus the CPU shard box as an adjustment. Every
+`--budget-usd` caps that ledger's **total**, not the tool's own spend. R is the box's
+$/hour from the Vast instance card.
 
 0. **Shards** on a cheap CPU-only box: [build_shards_box.md](build_shards_box.md),
    steps 1-5. They are copied to the GPU box in step 3; destroy the CPU box after that.
@@ -29,39 +33,81 @@ the box's $/hour from the Vast instance card.
    (`quipu.spend` is standard library only, so the system python3 runs it before
    the venv exists; add `--box-start EPOCH` to count from when the box was rented.)
 2. **Setup**: `bash /workspace/quipu/scripts/remote/setup.sh --branch pipeline-114m`
-   (section 2).
+   (section 2). **Then check the ledger against the bill**: compare the Vast console's
+   credit balance (and the instance's charges so far) with
+   `python3 -m quipu.spend show`. They should agree to within a few cents; if the
+   console shows more spent, record the difference (`python3 -m quipu.spend adjust
+   --key console-diff --usd <amount>`) before going on.
 3. **Tokenizer and shards**: copy the tokenizer from the laptop and check its hash
    (as in build_shards_box.md step 2), copy the shards from the CPU box and verify
    them (build_shards_box.md step 6: `sha256sum -c SHA256SUMS`, shard sizes against
-   the manifest).
+   the manifest). **Destroy the CPU box, then record what it cost** (its total from
+   the Vast console's billing page) on the same ledger:
+
+   ```bash
+   python3 -m quipu.spend adjust --key cpu-box --usd <amount>
+   python3 -m quipu.spend show
+   ```
+
+   (The same key again replaces the amount, never adds it twice.)
 4. **A/B runs** (~3.5-4 h; FP8 stays off, the owner's decision, so no `--with-fp8`),
-   inside `tmux`:
+   inside `tmux`, with the A/B budget of spec section 8:
 
    ```bash
    uv run python scripts/ab_runs.py --config configs/quipu-moe-ab.toml --out results/ab \
-       --budget-usd 20 --usd-per-hour R
+       --budget-usd 3 --usd-per-hour R
    ```
 
-   It writes `results/ab/summary.md` and `results/ab/winners.toml`.
+   `--budget-usd 3` caps the ledger total, so the setup and the CPU box (steps 1-3)
+   already count against it: check `python3 -m quipu.spend show` first and run
+   `--dry-run` to see whether the run list fits what is left (`--shared-noise` runs
+   one seed re-run instead of three; off unless the owner chooses it). It writes
+   `results/ab/summary.md` and `results/ab/winners.toml`; a budget stop (exit 4) still
+   writes both, with the missing arms keeping the simpler option.
 5. **The full run**, inside `tmux`:
 
    ```bash
    uv run python scripts/remote/run_moe.py --config configs/quipu-moe.toml \
-       --winners results/ab/winners.toml --budget-usd 20 --usd-per-hour R
+       --winners results/ab/winners.toml --budget-usd 20 --reserve-usd 1.00 --usd-per-hour R
    ```
 
    A 15-minute throughput gate (`--gate-minutes`) measures tokens/s on the real
    model, then `results/moe/plan.md` shows the tokens, hours and cost that fit the
-   budget (spend so far + the run + a `--reserve-usd` 0.50 reserve for the chat SFT
-   and final eval/export), and what was trimmed. Show it to the owner; on approval
+   budget (spend so far + the run + the `--reserve-usd` 1.00 reserve for the chat SFT,
+   the evals and the copy-back), and what was trimmed. The plan is costed at 95% of
+   the measured rate (`--headroom 0.05`) plus each interval's eval and checkpoint
+   time, which a 15-minute gate barely sees; after the long run's first full
+   interval the rate is checked once more and the run trimmed (never extended) if it
+   is more than 2% slower. Show plan.md to the owner; on approval
    `touch results/moe/GO`. Waiting costs the box's rate (the launcher prints the
-   per-minute cost while it waits). The long run then resumes from the gate's
-   checkpoint (the gate's 15 minutes of training are kept), retries crashes from the
-   last checkpoint, and stops cleanly (interrupt checkpoint, exit 4) if spend + the
-   next eval interval + the reserve would pass the budget. At the end it runs
-   milestone_eval and writes `results/moe/summary.md`. Run it again after any stop:
-   it reuses `results/moe/plan.json` and resumes (a larger `--budget-usd` continues a
-   run the budget stopped).
+   per-minute cost while it waits). **The wait is bounded**: after
+   `--go-max-wait-min` (90) minutes, or as soon as less than 80% of the approved
+   tokens would still fit, the launcher writes plan.md and summary.md and exits 5. **If
+   the owner cannot answer within that window**, stop the instance from the Vast
+   console (the disk is kept; a stopped instance bills only a little for it): first
+   `python3 -m quipu.spend stop` (so the stopped time is not counted), later start
+   the instance, `python3 -m quipu.spend start --usd-per-hour R`, read plan.md again
+   (an 80% stop re-fits it) and run the same command; it reuses
+   `results/moe/plan.json` (no second gate). Restart `sync.sh` on the laptop too:
+   it stops when it sees summary.md, which exit 5 writes.
+
+   The long run then resumes from the gate's checkpoint (the gate's 15 minutes of
+   training are kept), retries crashes from the last checkpoint, and stops cleanly
+   (interrupt checkpoint, exit 4) if spend + the next eval interval + the reserve
+   would pass the budget. **A crash in the gate is not retried**: the launcher exits
+   (summary.md says why); fix the cause and run the same command again. The trainer
+   runs in its own session: if the launcher is killed or its terminal hangs up
+   (SIGTERM/SIGHUP take the Ctrl+C path: the trainer checkpoints, exit 130), and
+   should the launcher die outright, every trainer carries its own backstop
+   (`train.budget_usd` = the budget left at its launch less the reserve): it
+   checkpoints and exits 4 on its own before it can overrun. `python -m quipu.spend
+   stop` refuses while the launcher or ab_runs is ticking the ledger (within the
+   last 2 minutes; `--force` overrides, and the launcher treats a session ended
+   under it as a budget stop). At the end it runs milestone_eval and writes
+   `results/moe/summary.md`, and plan.json records the run as completed, so the same
+   command again does nothing. Run it again after any other stop: it reuses
+   `results/moe/plan.json` and resumes (a larger `--budget-usd` continues a run the
+   budget stopped).
 6. **On the laptop, during the long run** (Git Bash, from the repo):
 
    ```bash
@@ -72,10 +118,19 @@ the box's $/hour from the Vast instance card.
    points to, `checkpoints/quipu-moe/milestones/` and `results/` (no inductor caches)
    into `remote-runs/quipu-moe/`, and stops after the cycle that sees
    `results/moe/summary.md` on the box. It uses `~/.ssh/id_ed25519` (`SSH_KEY`), never
-   agent forwarding, and never deletes a local file: old `step_*.pt` copies (~12 GB
-   each) stay until you remove them. rsync when installed, else scp (Git Bash).
+   agent forwarding, and `BatchMode=yes` (no password prompt: a key problem fails the
+   cycle). Old `step_*.pt` copies (~12 GB each) stay unless you set `KEEP_LOCAL=N`
+   (keep the N newest; the one `latest.pt` points to and `milestones/` are never
+   deleted); `KEEP_LOCAL=N bash scripts/remote/sync.sh --prune-only` prunes once.
+   rsync when installed (an interrupted file waits in `.rsync-partial/` and resumes),
+   else scp (Git Bash).
 7. **After pretraining**: its evaluation, then the chat SFT (M12) in the same session
-   (paid from the reserve), then its evaluation.
+   (paid from the reserve), then its evaluation. **The SFT runs under the same
+   ledger guard**: launch it the way run_moe launches the trainer (spend guard + its
+   own session), or at the least with the trainer's backstop set to what is left,
+   `--override train.budget_usd=<budget left - copy-back margin> --override
+   train.usd_per_hour=R` (check `python3 -m quipu.spend show` first); never with
+   `train.budget_usd 0`.
 8. **Copy everything back** (sync.sh's final cycle, plus the SFT outputs), verify on
    the laptop (the checkpoints load; sha256 against the box), get the owner's
    go-ahead, then destroy the box (section 5).

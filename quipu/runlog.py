@@ -38,9 +38,17 @@ class RunLog:
                 ) from exc
             record["status"] = "running"
             last_step = max((s["step"] for s in record.get("steps", [])), default=0)
-            record.setdefault("resumes", []).append(
-                {"at": datetime.now(timezone.utc).isoformat(), "from_step": last_step}
-            )
+            entry: dict[str, Any] = {"at": datetime.now(timezone.utc).isoformat(),
+                                     "from_step": last_step}
+            # The resumed process's own run length and milestones: a launcher may
+            # trim them between attempts, and the config block above is the first's.
+            train = config.get("train") if isinstance(config, dict) else None
+            if isinstance(train, dict):
+                for key in ("total_tokens", "milestones", "budget_usd"):
+                    if key in train:
+                        entry[key] = (list(train[key]) if isinstance(train[key], tuple)
+                                      else train[key])
+            record.setdefault("resumes", []).append(entry)
             self.record: dict[str, Any] = record
         else:
             # Starting a "new" run must never silently clobber an old one's

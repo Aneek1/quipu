@@ -16,7 +16,7 @@ import pytest
 import quipu.train as train_mod
 from quipu.data import write_shard
 from quipu.train import (
-    EXIT_CRASH, EXIT_INTERRUPTED, EXIT_NONFINITE, EXIT_OK, EXIT_USAGE,
+    EXIT_BUDGET, EXIT_CRASH, EXIT_INTERRUPTED, EXIT_NONFINITE, EXIT_OK, EXIT_USAGE,
     NonFiniteStop, Trainer, UsageError, run_main,
 )
 
@@ -280,7 +280,8 @@ def test_the_real_process_exits_3_on_the_non_finite_stop(tmp_path):
     assert "non-finite" in proc.stderr
 
 
-STOP_SIGNALS = [s for s in ("SIGTERM", "SIGBREAK") if hasattr(__import__("signal"), s)]
+STOP_SIGNALS = [s for s in ("SIGTERM", "SIGHUP", "SIGBREAK")
+                if hasattr(__import__("signal"), s)]
 
 
 @pytest.mark.parametrize("name", STOP_SIGNALS)
@@ -429,3 +430,91 @@ def test_the_real_process_survives_a_second_sigint_during_its_checkpoint(tmp_pat
     assert "again; still saving the interrupt checkpoint" in err
     assert "checkpoint step 3 saved in" in out
     assert (tmp_path / "ckpt" / "step_000003.pt").exists()
+
+
+# ---- the spend backstop: train.budget_usd x usd_per_hour on the trainer's own clock -----------
+
+class StepClock:
+    """The backstop's clock: one second per training step."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _budgeted(config: Path, budget: float, rate: float) -> list[str]:
+    return args(config, "--override", f"train.budget_usd={budget}",
+                "--override", f"train.usd_per_hour={rate}")
+
+
+def test_the_budget_backstop_checkpoints_and_exits_4(in_tmp, monkeypatch, capsys):
+    # $3.60/h = $0.001 a second; a $0.0065 budget is reached after the 7th step's
+    # second: the trainer checkpoints at step 7 and exits 4 before step 8.
+    clock = StepClock()
+    monkeypatch.setattr(train_mod, "_clock", clock)
+    real_step = Trainer.train_step
+
+    def timed_step(self):
+        loss = real_step(self)
+        clock.t += 1.0
+        return loss
+    monkeypatch.setattr(Trainer, "train_step", timed_step)
+    assert run_main(_budgeted(tiny_config(in_tmp), 0.0065, 3.6)) == EXIT_BUDGET
+    record = json.loads(run_log(in_tmp).read_text(encoding="utf-8"))
+    assert record["status"] == "stopped_budget"
+    assert [s["step"] for s in record["steps"]][-1] == 7
+    ckpt = in_tmp / "ckpt"
+    assert (ckpt / "step_000007.pt").exists() and (ckpt / "latest.pt").exists()
+    err = capsys.readouterr().err
+    assert "budget backstop" in err and "exit 4" in err
+    # A resume with a fresh budget (a new process: its clock starts again) finishes the
+    # run, and the run log's resume entry records the resumed run's length and budget.
+    assert run_main(_budgeted(tiny_config(in_tmp), 1.0, 3.6) + ["--resume"]) == EXIT_OK
+    record = json.loads(run_log(in_tmp).read_text(encoding="utf-8"))
+    assert record["status"] == "completed"
+    assert [s["step"] for s in record["steps"]] == list(range(1, 21))
+    resume = record["resumes"][-1]
+    assert resume["from_step"] == 7 and resume["total_tokens"] == 640
+    assert resume["milestones"] == [3, 7] and resume["budget_usd"] == 1.0
+
+
+def test_budget_0_means_no_backstop(in_tmp, monkeypatch):
+    clock = StepClock()
+    clock.t = 0.0
+    monkeypatch.setattr(train_mod, "_clock", lambda: clock.t)
+    real_step = Trainer.train_step
+
+    def timed_step(self):
+        clock.t += 10_000.0                     # hours of box time: no guard without a budget
+        return real_step(self)
+    monkeypatch.setattr(Trainer, "train_step", timed_step)
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_OK
+
+
+def test_a_resumed_trainer_over_budget_at_once_does_not_rewrite_its_checkpoint(
+        in_tmp, monkeypatch):
+    config = tiny_config(in_tmp)
+    clock = StepClock()
+    monkeypatch.setattr(train_mod, "_clock", clock)
+    real_step = Trainer.train_step
+
+    def timed_step(self):
+        loss = real_step(self)
+        clock.t += 1.0
+        return loss
+    monkeypatch.setattr(Trainer, "train_step", timed_step)
+    assert run_main(_budgeted(config, 0.0045, 3.6)) == EXIT_BUDGET     # stops after step 5
+    saved = []
+    real_save = Trainer.save_checkpoint
+    monkeypatch.setattr(Trainer, "save_checkpoint",
+                        lambda self: saved.append(self.step) or real_save(self))
+    real_init = Trainer.__init__
+
+    def late_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        self.started_at -= 3600.0            # an hour already gone: over budget at once
+    monkeypatch.setattr(Trainer, "__init__", late_init)
+    assert run_main(_budgeted(config, 0.5, 3.6) + ["--resume"]) == EXIT_BUDGET
+    assert saved == []                       # checkpoint 5 is already on disk

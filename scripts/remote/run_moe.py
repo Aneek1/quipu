@@ -3,7 +3,7 @@ plan Task M9).
 
     python -m quipu.spend start --usd-per-hour R          # once, when the box starts
     python scripts/remote/run_moe.py --config configs/quipu-moe.toml \\
-        --winners results/ab/winners.toml --budget-usd 20 --usd-per-hour R
+        --winners results/ab/winners.toml --budget-usd 20 --reserve-usd 1.00 --usd-per-hour R
 
 What it does, in order (everything lands in --out, default results/moe):
 
@@ -20,16 +20,24 @@ What it does, in order (everything lands in --out, default results/moe):
    keeping the evals and checkpoints in between, so it is the rate the long run will
    really get.
 3. The plan (plan.md for the owner, plan.json for the launcher): hours and cost of
-   the configured tokens at the measured rate (less --headroom), plus the box's
-   spend so far (the shared ledger, quipu/spend.py) plus the long run's startup plus
-   --reserve-usd (the chat SFT and the final eval/export, spec 13). If that is over
-   --budget-usd, total_tokens is cut to what fits, rounded down to whole batches, and
-   the milestones are rescaled by their fraction of the run (deduplicated, none past
+   the configured tokens at the planning rate, plus the box's spend so far (the
+   shared ledger, quipu/spend.py) plus the long run's startup plus --reserve-usd
+   (default $1.00: the chat SFT, evals and the copy-back, spec 13). The planning
+   rate is the measured rate less --headroom (5%), with each eval / checkpoint
+   interval's overhead added back: EVAL_OVERHEAD_S per eval_every steps and the
+   longest checkpoint save the gate reported (else SAVE_OVERHEAD_S) per ckpt_every
+   steps (a 15-minute gate usually sees neither). If that is over --budget-usd,
+   total_tokens is cut to what fits, rounded down to whole batches, and the
+   milestones are rescaled by their fraction of the run (deduplicated, none past
    the end). Then it waits for the GO file (--go-file, default <out>/GO; the
    controller creates it once the owner approves), printing what each minute of
-   waiting costs; the ledger keeps ticking. At GO the plan is checked again against
-   the spend then: if the wait made it unaffordable it is trimmed again (plan.md
-   says so), and if nothing fits it stops with exit 4.
+   waiting costs; the ledger keeps ticking. The wait is bounded: after
+   --go-max-wait-min (90), or as soon as what still fits falls below RETRIM_FLOOR
+   (80%) of the approved tokens (the plan is then re-fitted for a fresh approval),
+   it writes plan.md + summary.md (stop the instance from the Vast console; resume
+   later with the same command) and exits 5. At GO the plan is checked again
+   against the spend then: if the wait made it unaffordable it is trimmed again
+   (plan.md says so), and if nothing fits it stops with exit 4.
 4. The long run resumes from the gate's checkpoint, so the gate's steps are kept,
    not thrown away. The LR schedule depends on the run's length only after warm-up,
    so when the gate ended inside warm-up (the normal case: warmup_steps 500 is ~40
@@ -38,8 +46,14 @@ What it does, in order (everything lands in --out, default results/moe):
    puts inside the gate move to the gate's checkpoint step (the resumed trainer
    writes that milestone from the weights it just loaded).
    Crashes are retried from the last checkpoint (like weekend.py): exit 1 or
-   anything unexpected, up to --max-retries; 2 (usage), 3 (non-finite stop) and
-   interrupts are not retried.
+   anything unexpected, up to --max-retries; 2 (usage), 3 (non-finite stop), 4 (the
+   trainer's budget backstop) and interrupts are not retried. The gate is not
+   retried: a crash there ends the launch (run it again). Once, after the long
+   run's first full eval/checkpoint interval, the measured rate is compared with the
+   planning rate: if it is more than REFIT_TOLERANCE (2%) lower, total_tokens is
+   re-fitted at the measured rate (only ever trimmed, never extended), the trainer is
+   interrupted (checkpoint) and resumed with the new length and rescaled milestones,
+   and plan.md records it.
 5. Spend guard: while a child trains (and before each launch) the launcher polls
    spend + cost of the next eval interval (min(eval_every, steps left) at the slower
    of the planned and the attempt's measured rate) + --reserve-usd; once that is
@@ -48,18 +62,28 @@ What it does, in order (everything lands in --out, default results/moe):
    if that is longer, then terminate, then kill) and the launcher exits 4. The
    budget is the box ledger's: what remains is --budget-usd minus everything the box
    has cost so far (setup, shards, the A/B runs, earlier invocations), so a restart
-   with a larger --budget-usd resumes where it stopped.
+   with a larger --budget-usd resumes where it stopped. A box session ended under the
+   launcher (`spend stop --force`) is a budget stop too.
+   Backstop, if the launcher dies: every trainer it launches gets train.budget_usd =
+   the budget left at launch less the reserve (the gate: at most GATE_BACKSTOP_FACTOR
+   x the gate's cost) and train.usd_per_hour = the box rate, so an orphaned trainer
+   checkpoints and exits 4 on its own before it can overrun (quipu/train.py). The
+   trainer runs in a session of its own (POSIX; a process group on Windows), so a
+   terminal hangup never reaches it directly; SIGTERM / SIGHUP to the launcher take
+   Ctrl+C's path: the trainer is sent the interrupt and given its grace to write its
+   checkpoint, then the launcher exits 130.
 6. At the end: scripts/milestone_eval.py on the run config, and summary.md. summary.md
    is written only when the run is over (completed, stopped by the guard, or failed
-   for good); sync.sh stops syncing when it appears.
+   for good); sync.sh stops syncing when it appears. plan.json then records
+   "completed" (and "evaluated"), so running the same command again does nothing.
 
 Restarts: plan.json is reused (no second gate) as long as the resolved config is the
 same (anything else is exit 2: move <out> and the checkpoints aside to start over);
 a GO from before the plan existed is removed.
 
 Exit codes: 0 done, 1 training failed (after retries) or the gate could not measure,
-2 usage error, 3 the trainer's non-finite stop, 4 stopped by the budget, 130
-interrupted.
+2 usage error, 3 the trainer's non-finite stop, 4 stopped by the budget, 5 no GO in
+time (or the wait cost too much of the plan), 130 interrupted.
 """
 from __future__ import annotations
 
@@ -80,9 +104,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from quipu import childproc
 from quipu.config import _merge, load_config, parse_overrides
 from quipu.fsio import write_text_atomic
-from quipu.spend import TICK_S, Ledger, LedgerError, Ticker
+from quipu.spend import TICK_S, Ledger, LedgerError, SessionEnded, Ticker
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -91,18 +116,26 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_NONFINITE = 3
 EXIT_BUDGET = 4
+EXIT_NO_GO = 5
 EXIT_INTERRUPTED = 130
 # The trainer's exit codes (quipu.train): 0 ok, 1 crash, 2 usage, 3 non-finite stop,
-# 130 interrupt; Windows reports a Ctrl+C'd child as STATUS_CONTROL_C_EXIT.
-TRAIN_USAGE, TRAIN_NONFINITE = 2, 3
+# 4 its budget backstop, 130 interrupt; Windows reports a Ctrl+C'd child as
+# STATUS_CONTROL_C_EXIT.
+TRAIN_USAGE, TRAIN_NONFINITE, TRAIN_BUDGET = 2, 3, 4
 TRAIN_INTERRUPT_CODES = frozenset({130, -1073741510, 3221225786})
 
 RUN_ID = "quipu-moe"
 DEFAULT_OUT = "results/moe"
 DEFAULT_CKPT_DIR = "checkpoints/quipu-moe"
 GATE_MINUTES = 15.0
-RESERVE_USD = 0.50          # chat SFT (~$0.25, spec 13) + final eval/export
-HEADROOM = 0.03             # plan at 97% of the measured tokens/s
+RESERVE_USD = 1.00          # chat SFT (~$0.25, spec 13) + evals + copy-back
+HEADROOM = 0.05             # plan at 95% of the measured tokens/s
+EVAL_OVERHEAD_S = 30.0      # one eval (eval_batches forwards), per eval_every steps
+SAVE_OVERHEAD_S = 60.0      # one checkpoint save when the gate saw none, per ckpt_every
+REFIT_TOLERANCE = 0.02      # the long run's first interval this much slower: re-fit
+GO_MAX_WAIT_MIN = 90.0      # the GO wait gives up after this long (exit 5)
+RETRIM_FLOOR = 0.80         # ... or once less than this share of the approved run fits
+GATE_BACKSTOP_FACTOR = 2.0  # an orphaned gate trainer stops after 2 x the gate's cost
 WARMUP_SKIP_STEPS = 20      # steps left out of the throughput measurement
 STOP_GRACE_S = 300.0        # an interrupted child's time to write its checkpoint
 KILL_WAIT_S = 30.0          # after terminate() before kill()
@@ -136,6 +169,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _echo(line: str) -> None:
+    """print, but a closed terminal (a hangup: EIO, a broken pipe) does not stop the
+    launcher mid-run: the log files still get everything."""
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 # ---- measurement, projection, trimming ---------------------------------------------------
 
 def effective_tokens_per_s(events: list[tuple[float, int]], batch_tokens: int,
@@ -150,6 +192,20 @@ def effective_tokens_per_s(events: list[tuple[float, int]], batch_tokens: int,
     if t1 <= t0 or s1 <= s0:
         return None
     return (s1 - s0) * batch_tokens / (t1 - t0)
+
+
+def planning_tokens_per_s(tokens_per_s: float, *, headroom: float, batch_tokens: int,
+                          eval_every: int, ckpt_every: int, eval_s: float,
+                          save_s: float) -> float:
+    """The rate the plan is costed at: the measured tokens/s less `headroom`, with
+    each interval's overhead spread over its steps (eval_s every eval_every steps,
+    save_s every ckpt_every steps). A short gate sees few or no evals and saves, so
+    its measured rate alone overstates what the long run gets."""
+    if tokens_per_s <= 0:
+        return 0.0
+    step_s = (batch_tokens / (tokens_per_s * (1 - headroom))
+              + eval_s / max(1, eval_every) + save_s / max(1, ckpt_every))
+    return batch_tokens / step_s
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,7 +225,13 @@ class Projection:
 
     @property
     def hours(self) -> float:
-        return (self.tokens_left / self.tokens_per_s + self.startup_s) / 3600
+        if not self.tokens_left:
+            train_s = 0.0
+        elif self.tokens_per_s <= 0:
+            train_s = math.inf
+        else:
+            train_s = self.tokens_left / self.tokens_per_s
+        return (train_s + self.startup_s) / 3600
 
     @property
     def train_usd(self) -> float:
@@ -234,6 +296,28 @@ def guard_margin_usd(steps_left: int, eval_every: int, batch_tokens: int,
 def over_budget(spent_usd: float, margin_usd: float, reserve_usd: float,
                 budget_usd: float) -> bool:
     return spent_usd + margin_usd + reserve_usd > budget_usd + 1e-9
+
+
+def refit_milestones(config_milestones, cfg_steps: int, old_steps: int, new_steps: int,
+                     gate_step: int, at_step: int) -> tuple[int, ...]:
+    """Milestones after a mid-run trim at `at_step`, one per configured milestone: one
+    the run already reached (its current position, as rescale_milestones placed it for
+    old_steps, is at or before at_step) stays where it is; the others are rescaled to
+    new_steps, and one that now falls before at_step moves to at_step (the resumed
+    trainer writes it from the weights it loads). Deduplicated, none at or past the end."""
+    out: set[int] = set()
+    for m in config_milestones:
+        old = max(1, round(m * old_steps / cfg_steps))
+        if gate_step and old <= gate_step:
+            old = gate_step
+        if old <= at_step:
+            if old < old_steps:
+                out.add(old)
+            continue
+        new = max(at_step, round(m * new_steps / cfg_steps))
+        if new < new_steps:
+            out.add(new)
+    return tuple(sorted(out))
 
 
 def lr_at(step: int, lr: float, lr_min: float, warmup: int, steps: int) -> float:
@@ -357,7 +441,11 @@ class SubprocessChild:
     returns a reason the child is interrupted (SIGINT; on Windows CTRL_BREAK to its
     own process group, which the trainer handles as SIGBREAK) and given grace_s to
     write its interrupt checkpoint, then terminated, then killed (the same ladder as
-    ab_runs.SubprocessRunner). The children share a persistent inductor cache, so the
+    ab_runs.SubprocessRunner). The child runs in a session of its own on POSIX (a
+    process group on Windows; quipu.childproc.popen_kwargs), so a terminal hangup or
+    Ctrl+C never reaches it directly: a Ctrl+C here, or SIGTERM / SIGHUP (main
+    installs handlers that raise KeyboardInterrupt), is forwarded to it explicitly,
+    with the same grace. The children share a persistent inductor cache, so the
     long run reuses the gate's compile."""
 
     def __init__(self, cwd: str | Path = ROOT, echo: Callable[[str], None] | None = None,
@@ -365,7 +453,7 @@ class SubprocessChild:
                  poll_s: float = POLL_S, inductor_cache: Path | None = None,
                  clock: Callable[[], float] = time.time) -> None:
         self.cwd = Path(cwd)
-        self.echo = echo or (lambda s: print(s, flush=True))
+        self.echo = echo or _echo
         self.grace_s = grace_s
         self.kill_wait_s = kill_wait_s
         self.poll_s = poll_s
@@ -432,8 +520,7 @@ class SubprocessChild:
         started = self.clock()
         proc = subprocess.Popen(
             cmd, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", env=env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+            encoding="utf-8", errors="replace", env=env, **childproc.popen_kwargs())
 
         def watch() -> None:
             while not done.wait(self.poll_s):
@@ -469,7 +556,8 @@ class SubprocessChild:
         except KeyboardInterrupt:
             done.set()
             self.echo("[moe] interrupted: letting the trainer write its checkpoint")
-            self._stop_child(proc, child_got_it=os.name != "nt")
+            # Its own session / process group: the child did not get the signal.
+            self._stop_child(proc, child_got_it=False)
             raise
         except BaseException:
             done.set()
@@ -492,7 +580,7 @@ def run_command(cmd: list[str], log_path: Path) -> int:
                                 errors="replace", env=dict(os.environ, PYTHONUNBUFFERED="1"))
         for line in proc.stdout:
             log.write(line)
-            print(line, end="", flush=True)
+            _echo(line.rstrip("\n"))
         return proc.wait()
 
 
@@ -520,12 +608,17 @@ class Launcher:
                  echo: Callable[[str], None] | None = None, poll_s: float = POLL_S,
                  wait_print_s: float = WAIT_PRINT_S, max_retries: int = MAX_RETRIES,
                  retry_wait_s: float = RETRY_WAIT_S, headroom: float = HEADROOM,
-                 warmup_skip_steps: int = WARMUP_SKIP_STEPS) -> None:
+                 warmup_skip_steps: int = WARMUP_SKIP_STEPS,
+                 go_max_wait_min: float = GO_MAX_WAIT_MIN, refit: bool = True,
+                 eval_overhead_s: float = EVAL_OVERHEAD_S,
+                 save_overhead_s: float = SAVE_OVERHEAD_S) -> None:
         self.config = Path(config)
         self.winners = Path(winners) if winners else None
         self.budget = float(budget_usd)
         self.rate_arg = float(usd_per_hour)
         self.ledger = ledger
+        if ledger.tool is None:
+            ledger.tool = "run_moe"          # `spend stop` refuses while this ticks
         self.run_child = run_child
         self.reserve = float(reserve_usd)
         self.gate_s = gate_minutes * 60
@@ -538,13 +631,17 @@ class Launcher:
         self.run_cmd = run_cmd
         self.clock = clock
         self.sleep = sleep
-        self.echo = echo or (lambda s: print(s, flush=True))
+        self.echo = echo or _echo
         self.poll_s = poll_s
         self.wait_print_s = wait_print_s
         self.max_retries = max_retries
         self.retry_wait_s = retry_wait_s
         self.headroom = headroom
         self.skip = warmup_skip_steps
+        self.go_max_wait_s = go_max_wait_min * 60
+        self.refit = refit
+        self.eval_overhead_s = eval_overhead_s
+        self.save_overhead_s = save_overhead_s
 
         self.run_dir = self.out / "runs"
         self.run_log = self.run_dir / f"{run_id}.json"
@@ -565,11 +662,27 @@ class Launcher:
         rate = self.ledger.usd_per_hour
         return self.rate_arg if rate is None else rate
 
-    def _tick(self) -> None:
+    def _tick(self, stop_on_end: bool = True) -> None:
+        """Tick the ledger (at most once per TICK_S). A box session ended under the
+        launcher (`spend stop --force`: the box is going away) is a budget stop:
+        Stop(EXIT_BUDGET), unless stop_on_end is False (then only reported)."""
         try:
             self.ledger.tick_if_due(TICK_S)
+        except SessionEnded as exc:
+            if stop_on_end:
+                raise Stop(EXIT_BUDGET, f"stopped by the budget: the box session was ended "
+                                        f"under the launcher ({exc})") from exc
+            self.echo(f"[moe] warning: {exc}")
         except (OSError, LedgerError) as exc:
             self.echo(f"[moe] warning: spend ledger tick failed ({exc})")
+
+    def _tick_in_check(self) -> str | None:
+        """_tick for a should_stop check: a stop reason when the session was ended."""
+        try:
+            self._tick()
+        except Stop as stop:
+            return f"budget: {stop.status}"
+        return None
 
     def spent(self) -> float:
         return self.ledger.spent_usd()
@@ -607,6 +720,22 @@ class Launcher:
     def batch_tokens(self) -> int:
         return int(self.raw["train"]["batch_tokens"])
 
+    @property
+    def interval_steps(self) -> int:
+        """One full eval + checkpoint interval."""
+        train = self.raw["train"]
+        return max(int(train["eval_every"]), int(train["ckpt_every"]))
+
+    def _tps_plan(self) -> float:
+        """The planning rate: the gate's measured tokens/s less the headroom, with
+        each eval and checkpoint interval's overhead added (plan.json keeps both)."""
+        p, train = self.plan, self.raw["train"]
+        return planning_tokens_per_s(
+            p["tokens_per_s"], headroom=self.headroom, batch_tokens=self.batch_tokens,
+            eval_every=int(train["eval_every"]), ckpt_every=int(train["ckpt_every"]),
+            eval_s=p.get("eval_s", self.eval_overhead_s),
+            save_s=p.get("save_s", self.save_overhead_s))
+
     # -- the whole launch --
 
     def run(self) -> int:
@@ -620,16 +749,24 @@ class Launcher:
         if code == EXIT_USAGE:
             # Not the end of the run (a mistyped restart): no summary, so sync.sh goes on.
             self.echo(f"error: {status}")
+        elif status is None:
+            pass                        # nothing to do: the summary on disk stands
         else:
             self._write_summary(status, code)
         return code
 
-    def _run(self) -> tuple[int, str]:
+    def _run(self) -> tuple[int, str | None]:
         try:
             self.raw = resolve_raw(self.config, self.winners, self.overrides)
             load_config(self.config, None)          # the file itself must load
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise Stop(EXIT_USAGE, f"usage: {exc}") from exc
+        if self.plan_json.exists():
+            self.plan = done = self._load_plan()
+            if done.get("completed") and done.get("evaluated"):
+                self.echo(f"[moe] the run in {self.out} is complete and evaluated "
+                          f"({self.summary}); nothing to do")
+                return EXIT_OK, None
         self.out.mkdir(parents=True, exist_ok=True)
         try:
             if self.ledger.ensure_session(self.rate_arg):
@@ -643,7 +780,8 @@ class Launcher:
         self.echo(f"[moe] box spend so far ${self.spent_at_start:.2f} of ${self.budget:.2f} "
                   f"(ledger {self.ledger.path}; ${self.rate:.2f}/h)")
 
-        self.plan = self._load_plan()
+        if self.plan is None:
+            self.plan = self._load_plan()
         if self.summary.exists():
             self.summary.unlink()                   # a new launch; sync.sh waits for the new one
         if self.plan is None:
@@ -657,6 +795,9 @@ class Launcher:
             self._long_run()
         self._run_evals()
         failed = [e["name"] for e in self.evals if e["code"] != 0]
+        if not failed:
+            self.plan["evaluated"] = True
+            self._save_plan()
         status = "completed" + (f"; evaluation failed: {', '.join(failed)}" if failed else "")
         return EXIT_OK, status
 
@@ -692,9 +833,13 @@ class Launcher:
             raise Stop(EXIT_BUDGET, (
                 f"stopped by the budget before the gate: spent ${self.spent():.2f} + gate "
                 f"${gate_usd:.2f} + reserve ${self.reserve:.2f} > ${self.budget:.2f}"))
+        # The trainer's own backstop, should the launcher die during the gate: at most
+        # GATE_BACKSTOP_FACTOR x the gate's cost, never past the budget less the reserve.
+        backstop = min(self.budget - self.spent() - self.reserve, GATE_BACKSTOP_FACTOR * gate_usd)
         self._write_run_config(with_train(
             self.raw, total_tokens=cfg_total, milestones=[],
-            ckpt_dir=self.ckpt_dir.as_posix(), budget_usd=0.0, usd_per_hour=0.0))
+            ckpt_dir=self.ckpt_dir.as_posix(), budget_usd=round(max(backstop, 0.01), 4),
+            usd_per_hour=self.rate))
         resume = self.run_log.exists()
         start_step = self._last_logged_step() if resume else 0
         deadline = self.clock() + self.gate_s
@@ -702,7 +847,9 @@ class Launcher:
                   + (" (resuming)" if resume else ""))
 
         def should_stop(events: list[tuple[float, int]]) -> str | None:
-            self._tick()
+            ended = self._tick_in_check()
+            if ended:
+                return ended
             if self.clock() >= deadline:
                 return "gate time is up"
             if self.spent() + self.reserve > self.budget + 1e-9:
@@ -712,12 +859,15 @@ class Launcher:
         outcome = self.run_child(self._train_cmd(resume), self.out / "logs" / "gate.log",
                                  should_stop)
         self._record_attempt("gate", outcome)
-        self._tick()
         if outcome.stop_reason and outcome.stop_reason.startswith("budget"):
             raise Stop(EXIT_BUDGET, f"stopped by the spend guard during the gate at step "
-                                    f"{self._last_logged_step()}")
+                                    f"{self._last_logged_step()} ({outcome.stop_reason})")
+        if outcome.code == TRAIN_BUDGET and outcome.stop_reason is None:
+            raise Stop(EXIT_BUDGET, f"the gate's trainer stopped on its budget backstop at "
+                                    f"step {self._last_logged_step()} (exit 4)")
         if outcome.code != 0 and outcome.stop_reason is None:
             raise Stop(*self._failure(outcome.code, "the gate"))
+        self._tick()
 
         bt = self.batch_tokens
         tps = effective_tokens_per_s(outcome.events, bt, start_step + self.skip)
@@ -744,35 +894,33 @@ class Launcher:
         gate_step = self._last_logged_step()
         if not (self.ckpt_dir / "latest.pt").exists():
             gate_step = 0          # no checkpoint to resume from: the run starts over
+        seen_save = max(outcome.save_s) if outcome.save_s else None
         self.plan = {
             "base_hash": base_hash(self.raw), "made_at": _now_iso(),
             "tokens_per_s": tps, "startup_s": startup, "gate_step": gate_step,
             "gate_minutes": self.gate_s / 60,
             "config_total_tokens": cfg_total, "config_milestones": list(train.get("milestones", [])),
+            # Per-interval overhead the gate's rate misses (see planning_tokens_per_s).
+            "eval_s": self.eval_overhead_s,
+            "save_s": seen_save if seen_save is not None else self.save_overhead_s,
+            "save_observed": seen_save is not None,
             "completed": False, "notes": [],
         }
         self.echo(f"[moe] gate: {tps:,.0f} tok/s after the first {self.skip} steps; startup "
-                  f"{startup:.0f} s; checkpoint at step {gate_step}")
+                  f"{startup:.0f} s; checkpoint at step {gate_step}; planning at "
+                  f"{self._tps_plan():,.0f} tok/s (headroom {self.headroom:.0%}, eval "
+                  f"{self.plan['eval_s']:.0f} s + save {self.plan['save_s']:.0f} s per interval)")
         self._fit(first=True)
 
-    def _fit(self, first: bool) -> None:
+    def _fit(self, first: bool, why: str = "re-trimmed at GO (the wait cost money)") -> None:
         """Set plan total_tokens / milestones to what fits now; write plan.md. Raises
         Stop(4) if not even one more step fits."""
         plan, train = self.plan, self.raw["train"]
         bt = self.batch_tokens
-        tps = plan["tokens_per_s"] * (1 - self.headroom)
         gate_step = plan["gate_step"]
         want = plan["config_total_tokens"] if first else plan["total_tokens"]
         spent = self.spent()
-        proj = project(tokens_total=want, tokens_done=gate_step * bt, tokens_per_s=tps,
-                       usd_per_hour=self.rate, spent_usd=spent, reserve_usd=self.reserve,
-                       startup_s=plan["startup_s"], budget_usd=self.budget)
-        total = want
-        if not proj.fits:
-            total = fit_total_tokens(budget_usd=self.budget, spent_usd=spent,
-                                     reserve_usd=self.reserve, usd_per_hour=self.rate,
-                                     tokens_per_s=tps, startup_s=plan["startup_s"],
-                                     tokens_done=gate_step * bt, batch_tokens=bt)
+        total = self._affordable_total(want, spent)
         steps = total // bt
         cfg_steps = plan["config_total_tokens"] // bt
         if steps <= max(gate_step, int(train["warmup_steps"])):
@@ -784,9 +932,7 @@ class Launcher:
             self._save_plan()
             raise Stop(EXIT_BUDGET, "stopped by the budget: the run does not fit (plan.md)")
         if not first and total != want:
-            plan["notes"].append(
-                f"{_now_iso()}: re-trimmed at GO (the wait cost money): total_tokens "
-                f"{want:,} -> {total:,}")
+            plan["notes"].append(f"{_now_iso()}: {why}: total_tokens {want:,} -> {total:,}")
             self.echo(f"[moe] the approved plan no longer fits: re-trimmed to {total:,} tokens")
         plan.update(
             total_tokens=total, trimmed=total < plan["config_total_tokens"], fits=True,
@@ -800,10 +946,29 @@ class Launcher:
                   f"${self.budget:.2f} with the ${self.reserve:.2f} reserve"
                   + (" (TRIMMED)" if plan["trimmed"] else "") + f" -> {self.plan_md}")
 
+    def _affordable_total(self, want: int, spent: float) -> int:
+        """`want` if the rest of it (from the gate's checkpoint) fits the budget at the
+        planning rate with the startup and the reserve, else the largest whole-batch
+        total that does (may be <= the gate's tokens: nothing fits)."""
+        plan, bt = self.plan, self.batch_tokens
+        tps = self._tps_plan()
+        done = plan.get("done_step", plan["gate_step"]) * bt
+        proj = project(tokens_total=want, tokens_done=done, tokens_per_s=tps,
+                       usd_per_hour=self.rate, spent_usd=spent, reserve_usd=self.reserve,
+                       startup_s=plan["startup_s"], budget_usd=self.budget)
+        if proj.fits:
+            return want
+        return min(want, fit_total_tokens(
+            budget_usd=self.budget, spent_usd=spent, reserve_usd=self.reserve,
+            usd_per_hour=self.rate, tokens_per_s=tps, startup_s=plan["startup_s"],
+            tokens_done=done, batch_tokens=bt))
+
     def _projection(self, total: int) -> Projection:
         plan = self.plan
-        return project(tokens_total=total, tokens_done=plan["gate_step"] * self.batch_tokens,
-                       tokens_per_s=plan["tokens_per_s"] * (1 - self.headroom),
+        # From the gate's checkpoint; after a mid-run re-fit, from the step it was made at.
+        done = plan.get("done_step", plan["gate_step"])
+        return project(tokens_total=total, tokens_done=done * self.batch_tokens,
+                       tokens_per_s=self._tps_plan(),
                        usd_per_hour=self.rate, spent_usd=self.spent(),
                        reserve_usd=self.reserve, startup_s=plan["startup_s"],
                        budget_usd=self.budget)
@@ -820,16 +985,26 @@ class Launcher:
                       "Raise --budget-usd (if the owner agrees) and run the launcher again.", ""]
         cfg = self._projection(cfg_total)
         plan = self._projection(total)
+        train = self.raw["train"]
+        save_src = ("the longest save the gate reported" if p.get("save_observed")
+                    else "a default: the gate saved no checkpoint")
         lines += [
             f"- Measured throughput: **{p['tokens_per_s']:,.0f} tokens/s** (effective: step "
             f"lines' arrival times after the first {self.skip} steps, evals and checkpoints "
-            f"included; {p['gate_minutes']:.0f}-minute gate); planned at "
-            f"{(1 - self.headroom):.0%} of it.",
+            f"in that window included; {p['gate_minutes']:.0f}-minute gate).",
+            f"- Planned at **{self._tps_plan():,.0f} tokens/s**: {(1 - self.headroom):.0%} of "
+            f"it, plus each interval's overhead: an eval ({p.get('eval_s', self.eval_overhead_s):.0f} s) "
+            f"every {train['eval_every']} steps and a checkpoint save "
+            f"({p.get('save_s', self.save_overhead_s):.0f} s, {save_src}) every "
+            f"{train['ckpt_every']} steps. After the long run's first full interval "
+            f"({self.interval_steps} steps) the measured rate is checked once: more than "
+            f"{REFIT_TOLERANCE:.0%} below this, the run is re-fitted (trimmed, never "
+            "extended) and this file says so.",
             f"- Startup of the long run (resume + compile), from the gate: {p['startup_s']:.0f} s.",
             f"- Box rate ${self.rate:.2f}/h = **${per_min:.4f}/min**. Box spend so far "
             f"${self.spent():.2f} (ledger {self.ledger.path}).",
-            f"- Budget ${self.budget:.2f}; reserve ${self.reserve:.2f} kept for the chat SFT "
-            "and the final eval/export.", "",
+            f"- Budget ${self.budget:.2f}; reserve ${self.reserve:.2f} kept for the chat SFT, "
+            "the evals and the copy-back.", "",
             "| | configured | planned |", "|---|---|---|",
             f"| tokens | {cfg_total:,} | {total:,} |",
             f"| steps | {cfg_total // bt:,} | {total // bt:,} |",
@@ -858,7 +1033,11 @@ class Launcher:
                       "from step 0.", ""]
         lines += [f"Waiting costs money: every minute before GO is ${per_min:.4f}. To start: "
                   f"`touch {self.go.as_posix()}` on the box. If the wait makes this plan "
-                  "unaffordable, it is trimmed again at GO and this file says so.", ""]
+                  "unaffordable, it is trimmed again at GO and this file says so. The launcher "
+                  f"waits at most {self.go_max_wait_s / 60:.0f} min, and stops sooner if less "
+                  f"than {RETRIM_FLOOR:.0%} of the planned tokens would still fit (exit 5): "
+                  "then stop the instance from the Vast console and run the same command "
+                  "later.", ""]
         if p.get("notes"):
             lines += ["## Notes", ""] + [f"- {n}" for n in p["notes"]] + [""]
         return "\n".join(lines)
@@ -873,6 +1052,9 @@ class Launcher:
         next_print = t0
         self.echo(f"[moe] plan written to {self.plan_md}; waiting for {self.go} "
                   f"(${per_min:.4f}/min while waiting)")
+        approved = int(self.plan["total_tokens"])
+        idle = (f"the box idles at ~${self.rate:.2f}/h: stop the instance from the Vast "
+                "console (its disk is kept) and resume later with the same command")
         while not self.go.exists():
             self._tick()
             now = self.clock()
@@ -889,6 +1071,24 @@ class Launcher:
                 self.plan["fits"] = False
                 self._save_plan()
                 raise Stop(EXIT_BUDGET, "stopped by the budget while waiting for GO")
+            if now - t0 >= self.go_max_wait_s:
+                status = (f"GO not given within {self.go_max_wait_s / 60:.0f} min; {idle}")
+                self.plan["notes"].append(f"{_now_iso()}: {status}")
+                self._save_plan()
+                raise Stop(EXIT_NO_GO, status)
+            fits = self._affordable_total(approved, spent)
+            if fits < RETRIM_FLOOR * approved:
+                why = (f"while waiting for GO the plan shrank below {RETRIM_FLOOR:.0%} of the "
+                       f"approved {approved:,} tokens (only {fits:,} fit now); re-fitted for a "
+                       "fresh approval")
+                self._fit(first=False, why=why)       # Stop(4) if nothing fits at all
+                status = (f"GO not given before the wait cost more than {1 - RETRIM_FLOOR:.0%} "
+                          f"of the approved run (plan.md is re-fitted to "
+                          f"{self.plan['total_tokens']:,} tokens and needs a fresh approval); "
+                          f"{idle}")
+                self.plan["notes"].append(f"{_now_iso()}: {status}")
+                self._save_plan()
+                raise Stop(EXIT_NO_GO, status)
             self.sleep(self.poll_s)
         self._tick()
         self.echo(f"[moe] GO after {(self.clock() - t0) / 60:.1f} min")
@@ -904,17 +1104,13 @@ class Launcher:
     # -- 3. the long run --
 
     def _long_run(self) -> None:
-        plan, train = self.plan, self.raw["train"]
+        plan = self.plan
         bt = self.batch_tokens
-        steps = plan["total_tokens"] // bt
-        planned_tps = plan["tokens_per_s"]
-        remaining = max(0.0, self.budget - self.spent())
-        self._write_run_config(with_train(
-            self.raw, total_tokens=plan["total_tokens"], milestones=plan["milestones"],
-            ckpt_dir=self.ckpt_dir.as_posix(), budget_usd=round(remaining, 4),
-            usd_per_hour=self.rate))
         retries = 0
         while True:
+            self._tick()
+            steps = plan["total_tokens"] // bt
+            planned_tps = self._tps_plan()
             start = self._last_logged_step() if self.run_log.exists() else 0
             if over_budget(self.spent(), self._margin(steps, start, planned_tps), self.reserve,
                            self.budget):
@@ -923,10 +1119,27 @@ class Launcher:
                     f"spent ${self.spent():.2f} + next interval "
                     f"${self._margin(steps, start, planned_tps):.2f} + reserve "
                     f"${self.reserve:.2f} > ${self.budget:.2f}"))
+            # Written for every attempt: the trainer's backstop is the budget left NOW
+            # (less the reserve), timed from its own start, so no attempt, orphaned or
+            # not, can spend past it.
+            backstop = self.budget - self.spent() - self.reserve
+            self._write_run_config(with_train(
+                self.raw, total_tokens=plan["total_tokens"], milestones=plan["milestones"],
+                ckpt_dir=self.ckpt_dir.as_posix(), budget_usd=round(max(backstop, 0.01), 4),
+                usd_per_hour=self.rate))
+            refit: dict[str, Any] = {}
 
             def should_stop(events: list[tuple[float, int]], start: int = start) -> str | None:
-                self._tick()
+                ended = self._tick_in_check()
+                if ended:
+                    return ended
                 live = effective_tokens_per_s(events, bt, start + self.skip)
+                if live is not None and self.refit and not plan.get("refit_checked"):
+                    kept = [s for _, s in events if s >= start + self.skip]
+                    if kept[-1] - kept[0] >= self.interval_steps:
+                        reason = self._check_refit(live, kept[-1], refit)
+                        if reason:
+                            return reason
                 tps = planned_tps if live is None else min(planned_tps, live)
                 # Step lines come every 10 steps: extrapolate from the last one (at the
                 # conservative rate, so this never overestimates progress by much).
@@ -947,15 +1160,24 @@ class Launcher:
             outcome = self.run_child(self._train_cmd(resume),
                                      self.out / "logs" / f"train_{len(self.attempts)}.log",
                                      should_stop)
-            self._record_attempt("train", outcome)
-            self._tick()
+            self._record_attempt("train", outcome, note=refit.get("note", ""))
+            if refit and outcome.stop_reason == refit.get("reason"):
+                self._apply_refit(refit)
+                continue                         # resume with the re-fitted length
             if outcome.stop_reason:
                 raise Stop(EXIT_BUDGET, (
                     f"stopped by the spend guard at step {self._last_logged_step()}/{steps} "
-                    "(interrupt checkpoint written; run again with a larger --budget-usd to "
-                    "continue)"))
+                    f"({outcome.stop_reason}; interrupt checkpoint written; run again with a "
+                    "larger --budget-usd to continue)"))
             if outcome.code == 0:
+                plan["completed"] = True         # a rerun of the same command is a no-op
+                self._save_plan()
+                self._tick(stop_on_end=False)
                 return
+            if outcome.code == TRAIN_BUDGET:
+                raise Stop(EXIT_BUDGET, (
+                    f"the trainer's budget backstop stopped it at step "
+                    f"{self._last_logged_step()}/{steps} (exit 4, checkpoint written)"))
             if (outcome.code in (TRAIN_USAGE, TRAIN_NONFINITE)
                     or outcome.code in TRAIN_INTERRUPT_CODES or retries >= self.max_retries):
                 raise Stop(*self._failure(outcome.code, "the long run"))
@@ -963,7 +1185,74 @@ class Launcher:
             self.echo(f"[moe] trainer exited {outcome.code}; retry {retries}/"
                       f"{self.max_retries} from the last checkpoint in {self.retry_wait_s:.0f} s")
             self.sleep(self.retry_wait_s)
-            self._tick()
+
+    def _check_refit(self, live: float, at_step: int, refit: dict[str, Any]) -> str | None:
+        """Once, after the long run's first full interval: the measured rate against the
+        planning rate. More than REFIT_TOLERANCE slower: what fits at the measured rate
+        (less the headroom, one more startup) is computed, and if that is less than the
+        plan, `refit` gets it and a stop reason is returned (the trainer checkpoints and
+        is resumed with the new length). Never extends the run."""
+        plan, bt = self.plan, self.batch_tokens
+        planned = self._tps_plan()
+        plan["refit_checked"] = True
+        short = 1 - live / planned if planned > 0 else 0.0
+        head = (f"first full interval of the long run (to step {at_step}): {live:,.0f} "
+                f"tok/s measured vs {planned:,.0f} planned")
+        if short <= REFIT_TOLERANCE:
+            plan["notes"].append(f"{_now_iso()}: {head}: within {REFIT_TOLERANCE:.0%}, no re-fit")
+            self._save_plan()
+            return None
+        total = plan["total_tokens"]
+        new_total = min(total, fit_total_tokens(
+            budget_usd=self.budget, spent_usd=self.spent(), reserve_usd=self.reserve,
+            usd_per_hour=self.rate, tokens_per_s=live * (1 - self.headroom),
+            startup_s=plan["startup_s"], tokens_done=at_step * bt, batch_tokens=bt))
+        if new_total >= total:
+            plan["notes"].append(f"{_now_iso()}: {head} ({short:.1%} slower); the plan "
+                                 "still fits at the measured rate, no re-fit")
+            self._save_plan()
+            return None
+        if new_total // bt <= at_step + int(self.raw["train"]["eval_every"]):
+            plan["notes"].append(f"{_now_iso()}: {head} ({short:.1%} slower); too little "
+                                 "would be left to re-fit, the spend guard handles it")
+            self._save_plan()
+            return None
+        refit.update(total=new_total, live=live, planned=planned, at_step=at_step,
+                     reason=(f"re-fit: {live:,.0f} tok/s measured, {short:.1%} below the "
+                             f"planned {planned:,.0f}; total_tokens {total:,} -> {new_total:,}"),
+                     note=f"interrupted for the re-fit to {new_total:,} tokens")
+        self._save_plan()
+        return refit["reason"]
+
+    def _apply_refit(self, refit: dict[str, Any]) -> None:
+        """The trainer has checkpointed: trim total_tokens, rescale the milestones still
+        ahead, record it in plan.md. The next attempt resumes with them."""
+        plan, bt = self.plan, self.batch_tokens
+        at = self._last_logged_step()
+        old_total = plan["total_tokens"]
+        new_total = refit["total"]
+        new_steps = new_total // bt
+        if new_steps <= at:
+            plan["notes"].append(f"{_now_iso()}: re-fit to {new_total:,} tokens dropped: the "
+                                 f"run is already at step {at}")
+            self._save_plan()
+            return
+        cfg_steps = plan["config_total_tokens"] // bt
+        milestones = list(refit_milestones(plan["config_milestones"], cfg_steps,
+                                           old_total // bt, new_steps, plan["gate_step"], at))
+        plan["notes"].append(
+            f"{_now_iso()}: re-fitted after the long run's first full interval: "
+            f"{refit['live']:,.0f} tok/s measured vs {refit['planned']:,.0f} planned; "
+            f"total_tokens {old_total:,} -> {new_total:,} ({new_steps:,} steps), milestones "
+            f"{plan.get('milestones')} -> {milestones}; resumed from step {at} (the cosine "
+            "schedule shortens from here)")
+        plan.update(total_tokens=new_total, milestones=milestones, trimmed=True,
+                    done_step=at, refit={"at_step": at, "from_total": old_total,
+                                         "to_total": new_total, "measured_tps": refit["live"],
+                                         "planned_tps": refit["planned"]})
+        self._save_plan()
+        self.echo(f"[moe] re-fitted: total_tokens {old_total:,} -> {new_total:,}; resuming "
+                  f"from step {at} ({self.plan_md})")
 
     def _margin(self, steps: int, at_step: int, tokens_per_s: float) -> float:
         return guard_margin_usd(steps - at_step, int(self.raw["train"]["eval_every"]),
@@ -988,7 +1277,7 @@ class Launcher:
         self.echo("[moe] milestone evaluation")
         code = self.run_cmd(cmd, self.out / "logs" / "milestone_eval.log")
         self.evals.append({"name": "milestone_eval", "code": code, "cmd": cmd})
-        self._tick()
+        self._tick(stop_on_end=False)
 
     def _write_summary(self, status: str, code: int) -> None:
         try:
@@ -1026,6 +1315,11 @@ class Launcher:
                       f"{p.get('milestones')}; see {self.plan_md}.",
                       f"- Gate reuse: resumed from the gate's checkpoint at step {p.get('gate_step')}"
                       f" ({p.get('lr_note', '-')})."]
+            if p.get("refit"):
+                r = p["refit"]
+                lines.append(f"- Re-fitted at step {r['at_step']} after the first full interval: "
+                             f"{r['measured_tps']:,.0f} tok/s measured vs {r['planned_tps']:,.0f} "
+                             f"planned; total_tokens {r['from_total']:,} -> {r['to_total']:,}.")
         if steps:
             lines.append(f"- Trained to step {last.get('step')} ({last.get('tokens', 0):,} tokens), "
                          f"last train loss {last.get('train_loss', float('nan')):.4f}"
@@ -1048,6 +1342,13 @@ class Launcher:
         elif code == EXIT_BUDGET:
             lines.append("The checkpoint is kept. To continue, run the launcher again with a "
                          "larger --budget-usd (the owner decides); otherwise evaluate what is there.")
+        elif code == EXIT_NO_GO:
+            lines += [f"GO not given; box idle ~${self.rate:.2f}/h. Stop the instance from the "
+                      "Vast console; its disk is kept. First end the box session so the stopped "
+                      "time is not counted: `python -m quipu.spend stop`. To resume later: "
+                      "start the instance, `python -m quipu.spend start --usd-per-hour R`, "
+                      f"then the same run_moe.py command (it reuses {self.plan_json}; "
+                      f"read {self.plan_md} again first, it may have been re-fitted)."]
         else:
             lines.append("See the attempt logs in " + str(self.out / "logs") + ".")
         try:
@@ -1069,10 +1370,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="the box's rate (required; starts the box session if `python -m "
                         "quipu.spend start` was not run)")
     p.add_argument("--reserve-usd", type=float, default=RESERVE_USD,
-                   help="kept back for the chat SFT and the final eval/export")
+                   help=f"kept back for the chat SFT, the evals and the copy-back "
+                        f"(default {RESERVE_USD:.2f})")
     p.add_argument("--gate-minutes", type=float, default=GATE_MINUTES)
     p.add_argument("--headroom", type=float, default=HEADROOM,
-                   help="plan at (1 - headroom) x the measured tokens/s")
+                   help="plan at (1 - headroom) x the measured tokens/s, before the "
+                        "per-interval eval/checkpoint overhead")
+    p.add_argument("--go-max-wait-min", type=float, default=GO_MAX_WAIT_MIN,
+                   help="give up waiting for GO after this many minutes (exit 5: stop the "
+                        "instance, run the same command later)")
     p.add_argument("--warmup-skip-steps", type=int, default=WARMUP_SKIP_STEPS)
     p.add_argument("--out", default=DEFAULT_OUT)
     p.add_argument("--ckpt-dir", default=DEFAULT_CKPT_DIR)
@@ -1090,7 +1396,8 @@ def main(argv: list[str] | None = None) -> int:
     if rate is None or not math.isfinite(rate) or rate <= 0:
         print("error: pass --usd-per-hour > 0 (the box's rate)", file=sys.stderr)
         return EXIT_USAGE
-    for name, allow_zero in (("budget_usd", False), ("reserve_usd", True), ("gate_minutes", False)):
+    for name, allow_zero in (("budget_usd", False), ("reserve_usd", True), ("gate_minutes", False),
+                             ("go_max_wait_min", False)):
         v = getattr(args, name)
         if not math.isfinite(v) or v < 0 or (v == 0 and not allow_zero):
             print(f"error: --{name.replace('_', '-')} must be a number > 0"
@@ -1115,9 +1422,21 @@ def main(argv: list[str] | None = None) -> int:
         overrides=args.override, go_file=Path(args.go_file).resolve() if args.go_file else None,
         run_child=SubprocessChild(inductor_cache=out / "inductor-cache"),
         max_retries=args.max_retries, retry_wait_s=args.retry_wait_s,
-        headroom=args.headroom, warmup_skip_steps=args.warmup_skip_steps)
-    with Ticker(ledger):
-        return launcher.run()
+        headroom=args.headroom, warmup_skip_steps=args.warmup_skip_steps,
+        go_max_wait_min=args.go_max_wait_min)
+    return run_until_stopped(launcher, ledger)
+
+
+def run_until_stopped(launcher: Launcher, ledger: Ledger) -> int:
+    """launcher.run() with the ledger ticker and the stop signals: SIGTERM / SIGHUP
+    (POSIX) take Ctrl+C's path, so the trainer is interrupted and checkpoints before
+    the launcher exits 130."""
+    previous = childproc.install_stop_signals(_echo, "[moe]")
+    try:
+        with Ticker(ledger):
+            return launcher.run()
+    finally:
+        childproc.restore_signals(previous)
 
 
 if __name__ == "__main__":

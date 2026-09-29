@@ -11,6 +11,7 @@ import dataclasses
 import importlib.util
 import json
 import math
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -207,6 +208,104 @@ def test_dry_run_cost_follows_the_throughput_assumption(capsys, tmp_path):
     # 2.0e9 tokens / 250k tok/s = 8000 s, + 13 runs x 180 s overhead = 10340 s.
     hours = (2e9 / 250_000 + 13 * ab.PRIOR_OVERHEAD_S) / 3600
     assert f"${hours * 0.55:.2f}" in out
+
+
+def test_dry_run_with_shared_noise_lists_one_seed_rerun_and_costs_less(capsys, tmp_path):
+    base = ["--config", str(AB), "--out", str(tmp_path / "ab"), "--dry-run",
+            "--tokens-per-second", "150000", "--usd-per-hour", "0.55"]
+    assert ab.main(base) == 0
+    full = capsys.readouterr().out
+    assert ab.main(base + ["--shared-noise"]) == 0
+    out = capsys.readouterr().out
+    assert "11 runs" in out and "1,600,000,000 tokens" in out     # 13 - 2 seed re-runs
+    lines = [ln for ln in out.splitlines() if ln.lstrip()[:3].strip().isdigit()]
+    assert [ln.split()[1] for ln in lines].count("seed") == 1
+    assert "p1-winner-seed1338" in lines[-1]
+    assert "--shared-noise" in out
+
+    def cost(text):
+        return float(re.search(r"h, \$([\d.]+)", text).group(1))
+    hours = (1.6e9 / 150_000 + 11 * ab.PRIOR_OVERHEAD_S) / 3600
+    assert cost(out) == pytest.approx(round(hours * 0.55, 2)) and cost(out) < cost(full)
+
+
+def test_shared_noise_runs_only_pair_1s_seed_rerun_and_uses_it_for_every_pair(tmp_path):
+    clock = FakeClock()
+    runner = FakeRunner(clock, val_by_settings)
+    o = orch(tmp_path, runner, clock, skip_sweeps=True, shared_noise=True)
+    assert o.run() == 0
+    seeds = [c for c in runner.calls if "seed" in c]
+    assert len(seeds) == 1 and seeds[0].startswith("p1-")       # pair 1's winner only
+    noises = {d.noise for _, d, _ in o.decisions}
+    assert len(noises) == 1 and noises.pop() == pytest.approx(0.001)   # the seed step
+    for pair, d, _ in o.decisions:
+        if pair.number > 1:
+            assert "shared noise" in d.reason
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    assert "Noise estimate is shared" in summary and "0.0010" in summary
+    # AttnRes (0.05 better, beyond the shared 0.001) is kept as without the flag.
+    assert o.winners()["model"]["attnres_blocks"] == 4
+
+
+def test_shared_noise_is_off_by_default(tmp_path):
+    clock = FakeClock()
+    runner = FakeRunner(clock, val_by_settings)
+    o = orch(tmp_path, runner, clock, skip_sweeps=True)
+    o.run()
+    assert not o.shared_noise
+    assert "Noise estimate is shared" not in (tmp_path / "ab" / "summary.md").read_text("utf-8")
+
+
+def test_shared_noise_unknown_keeps_the_simpler_option():
+    d = ab.decide_pair("attnres", res(3.0), res(2.9), None, shared=True, shared_noise=None)
+    assert d.keep == "simple" and "shared noise estimate" in d.reason
+    d = ab.decide_pair("attnres", res(3.0), res(2.9), None, shared=True, shared_noise=0.01)
+    assert d.keep == "complex" and d.noise == 0.01
+
+
+# ---- the trainer's own backstop ------------------------------------------------------------------
+
+def test_each_attempt_passes_the_budget_left_as_the_trainers_backstop(tmp_path):
+    clock = FakeClock()
+    seen = []
+
+    def outcome(spec):
+        return val_by_settings(spec)
+
+    class Spy(FakeRunner):
+        def __call__(self, spec, ctx):
+            flags = dict(f.split("=", 1) for f in ctx.overrides)
+            seen.append((float(flags["train.budget_usd"]), float(flags["train.usd_per_hour"]),
+                         o.guard.spent()))
+            return super().__call__(spec, ctx)
+
+    o = orch(tmp_path, Spy(clock, outcome), clock, skip_sweeps=True, pairs=("attnres",),
+             seed_reruns=False, budget_usd=5.0, usd_per_hour=0.36)
+    assert o.run() == 0
+    assert len(seen) == 2
+    grace_usd = ab.STOP_GRACE_S / 3600 * 0.36
+    for budget, rate, spent in seen:
+        assert rate == 0.36
+        assert budget == pytest.approx(5.0 - spent - grace_usd, abs=1e-4)
+    assert seen[1][0] < seen[0][0]                     # the second run has less left
+    # The orchestrator's own overrides stay refused from the command line.
+    assert "train.budget_usd" in ab.RESERVED_OVERRIDES
+
+
+def test_the_trainers_backstop_exit_is_stopped_budget(tmp_path, monkeypatch):
+    # The trainer stopped itself on its backstop (exit 4) with its checkpoint written:
+    # a budget stop (resumed next time with more budget), not a crash to retry.
+    behave = {"losses": [3.0] * 5, "exit": 4}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave)
+    o = orch(tmp_path, runner, arm_tokens=100 * 524_288)
+    spec = one_spec(o)
+    r = runner(spec, o.context_for(spec, None))
+    assert r.status == "stopped_budget" and "backstop" in r.reason
+
+
+def test_the_orchestrator_tags_its_ledger_ticks(tmp_path):
+    o = orch(tmp_path, FakeRunner(FakeClock(), val_by_settings))
+    assert o.ledger.tool == "ab_runs"
 
 
 # ---- decision rules ---------------------------------------------------------------------

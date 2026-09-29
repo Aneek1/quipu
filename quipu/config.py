@@ -163,8 +163,9 @@ class TrainConfig:
     # matmuls in FP8 (quipu.fp8); kind "moe" on CUDA only. Kept for the full run only
     # if A/B pair 4 shows >= 1.2x tokens/s with loss within seed noise.
     precision: str = "bf16"              # "bf16" | "fp8"
-    # Spend guard (spec section 6.4): stop cleanly once elapsed hours x usd_per_hour
-    # reaches budget_usd. budget_usd 0 = no guard.
+    # Spend backstop (spec section 6.4): the trainer stops cleanly (checkpoint, exit 4)
+    # once its own elapsed hours x usd_per_hour reach budget_usd. budget_usd 0 = none.
+    # The box tools set both per launch (the budget left then, less their reserve).
     budget_usd: float = 0.0
     usd_per_hour: float = 0.0
 

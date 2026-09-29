@@ -18,7 +18,11 @@ ledger anchors spend to the box, not to a process or an --out directory:
   a detached `nohup python -m quipu.spend tick --loop 60` whose PID is kept in
   <ledger>.ticker.pid. It prints what it installed. `python -m quipu.spend stop`
   removes it and ends the session (last_seen = now, marked ended): a stopped box
-  costs nothing more, and a stray tick cannot revive the session.
+  costs nothing more, and a stray tick cannot revive the session. It refuses (exit 2)
+  while a tool is running: the tools (Ledger.tool set: ab_runs, run_moe) record
+  tool / tool_seen with each tick, and a tool tick within TOOL_ACTIVE_S (2 min) means
+  one still is; `stop --force` overrides. run_moe treats an ended session as a
+  budget stop (the trainer is interrupted and checkpoints).
 - tick() records last_seen on the latest session (the tools tick at start and every
   TICK_S as well). What is lost when the box dies: at most one ticker interval
   (60 s) with the ticker installed. Without it (`start --no-ticker`, or a session a
@@ -71,6 +75,7 @@ ENV_VAR = "QUIPU_SPEND_LEDGER"
 DEFAULT_RELATIVE = Path("results") / "spend.json"
 TICK_S = 60.0
 STALE_NOTE_S = 600.0     # a session not seen for this long may be a box that stopped
+TOOL_ACTIVE_S = 120.0    # a tool that ticked this recently is still running (spend stop)
 LOCK_TIMEOUT_S = 30.0
 READ_ATTEMPTS = 6        # a read racing a Windows replace: 0.05 s .. 1.6 s backoff
 CRON_TAG = "quipu-spend-ticker"
@@ -131,6 +136,11 @@ def _parse(text: str, path: Path) -> tuple[list[dict[str, Any]], dict[str, float
         session: dict[str, Any] = {k: float(s[k]) for k in ("box_start", "usd_per_hour", "last_seen")}
         if s.get("ended"):
             session["ended"] = True
+        if "tool_seen" in s:
+            if not _finite(s["tool_seen"]) or not isinstance(s.get("tool", ""), str):
+                raise LedgerError(f"spend ledger {path}: bad session {s!r}")
+            session["tool_seen"] = float(s["tool_seen"])
+            session["tool"] = str(s.get("tool", ""))
         out.append(session)
     adj: dict[str, float] = {}
     for k, v in adjustments.items():
@@ -197,6 +207,9 @@ class Ledger:
         self.adjustments = adjustments
         self.clock = clock
         self.lock_timeout_s = LOCK_TIMEOUT_S
+        # A tool (ab_runs, run_moe) sets its name: its ticks then also record
+        # tool / tool_seen, which `spend stop` checks (the idle ticker leaves it None).
+        self.tool: str | None = None
         self._lock = threading.RLock()
         self._last_tick: float | None = None
         # The latest session's box_start as this process last saw it: a tick that
@@ -363,9 +376,23 @@ class Ledger:
                       file=sys.stderr, flush=True)
             now = self.clock()
             cur["last_seen"] = max(cur["last_seen"], now)
+            if tool:
+                cur["tool_seen"] = now
+                cur["tool"] = tool
             return now
 
+        tool = self.tool
         self._last_tick = self._update(change)
+
+    def active_tool(self, now: float | None = None,
+                    within_s: float = TOOL_ACTIVE_S) -> tuple[str, float] | None:
+        """(tool, seconds since its last tick) when a tool ticked the running session
+        within `within_s`: it is still running. None otherwise."""
+        cur = self.current
+        if cur is None or cur.get("ended") or "tool_seen" not in cur:
+            return None
+        ago = (self.clock() if now is None else now) - cur["tool_seen"]
+        return (cur.get("tool") or "a tool", ago) if ago < within_s else None
 
     def tick_if_due(self, every: float = TICK_S) -> bool:
         with self._lock:
@@ -613,7 +640,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--box-start", type=float, help="epoch seconds the box started (default now)")
     s.add_argument("--no-ticker", action="store_true",
                    help="do not install the ticker (idle box time is then not counted)")
-    sub.add_parser("stop", help="the box is stopping: remove the ticker, end the session")
+    st = sub.add_parser("stop", help="the box is stopping: remove the ticker, end the session")
+    st.add_argument("--force", action="store_true",
+                    help="stop even though a tool (ab_runs, run_moe) ticked the ledger in "
+                         f"the last {TOOL_ACTIVE_S / 60:.0f} minutes")
     a = sub.add_parser("adjust", help="set a named extra spend (same key = replaced)")
     a.add_argument("--key", required=True)
     a.add_argument("--usd", type=float, required=True)
@@ -636,6 +666,15 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[spend] WARNING: no idle ticker ({exc}); box time with no tool "
                           "running is not counted", file=sys.stderr)
         elif args.cmd == "stop":
+            active = led.active_tool()
+            if active and not args.force:
+                tool, ago = active
+                print(f"error: {tool} ticked the ledger {ago:.0f} s ago: it is still running, "
+                      "and ending the box session under it breaks its spend accounting "
+                      "(run_moe stops at its next tick). Stop it first (Ctrl+C in its tmux "
+                      "window; the trainer checkpoints), or pass --force",
+                      file=sys.stderr)
+                return 2
             for what in remove_ticker(led.path):
                 print(f"[spend] {what}")
             print("[spend] ended the box session" if led.end_session()

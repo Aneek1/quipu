@@ -407,6 +407,61 @@ def test_stop_removes_the_ticker_and_ends_the_session(tmp_path, fake_system, mon
     assert led.ensure_session(RATE) is True                    # the next tool starts a new one
 
 
+def test_stop_refuses_while_a_tool_is_ticking_unless_forced(tmp_path, monkeypatch, capsys):
+    clock = FakeClock()
+    monkeypatch.setattr(spend.time, "time", clock)
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.36",
+                       "--no-ticker"]) == 0
+    tool = Ledger.load(path, clock=clock)
+    tool.tool = "run_moe"
+    clock.t += 30
+    tool.tick()                                        # run_moe is running
+    idle = Ledger.load(path, clock=clock)
+    clock.t += 30
+    idle.tick()                                        # the idle ticker: no tool tag
+    capsys.readouterr()
+    assert spend.main(["--ledger", str(path), "stop"]) == 2
+    err = capsys.readouterr().err
+    assert "run_moe" in err and "30 s ago" in err and "--force" in err
+    assert not Ledger.load(path, clock=clock).current.get("ended")
+    # Two minutes after the tool's last tick it is taken as gone.
+    clock.t += spend.TOOL_ACTIVE_S
+    assert spend.main(["--ledger", str(path), "stop"]) == 0
+    assert Ledger.load(path, clock=clock).current["ended"]
+
+
+def test_stop_force_ends_the_session_under_a_running_tool(tmp_path, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(spend.time, "time", clock)
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.36",
+                       "--no-ticker"]) == 0
+    tool = Ledger.load(path, clock=clock)
+    tool.tool = "ab_runs"
+    tool.tick()
+    assert spend.main(["--ledger", str(path), "stop", "--force"]) == 0
+    assert Ledger.load(path, clock=clock).current["ended"]
+    assert Ledger.load(path, clock=clock).active_tool() is None
+
+
+def test_the_tool_tag_survives_a_round_trip_and_bad_tags_are_refused(tmp_path):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    led = Ledger.load(path, clock=clock)
+    led.tool = "ab_runs"
+    led.start_session(RATE)
+    led.tick()
+    again = Ledger.load(path, clock=clock)
+    assert again.current["tool"] == "ab_runs" and again.current["tool_seen"] == clock.t
+    assert again.active_tool() == ("ab_runs", 0.0)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["sessions"][-1]["tool_seen"] = "soon"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(LedgerError):
+        Ledger.load(path, clock=clock)
+
+
 def test_the_tick_loop_exits_when_its_pid_file_is_replaced_or_the_session_ends(tmp_path):
     import os
 

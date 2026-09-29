@@ -12,9 +12,16 @@ post-run evaluation to see how the model changed over the run.
 
 Exit codes of `python -m quipu.train` (the weekend launcher decides whether to retry
 from these; see run_main): 0 completed, 1 any other crash, 2 a usage/config error,
-3 the non-finite stop, 130 an interrupt. SIGTERM (and SIGBREAK on Windows) is
-handled like Ctrl+C: the interrupt checkpoint is written, then it exits 130. Only
-the first of these signals raises; repeats during the checkpoint are ignored.
+3 the non-finite stop, 4 the spend backstop, 130 an interrupt. SIGTERM, SIGHUP
+(POSIX) and SIGBREAK (Windows) are handled like Ctrl+C: the interrupt checkpoint
+is written, then it exits 130. Only the first of these signals raises; repeats
+during the checkpoint are ignored.
+
+Spend backstop (spec 6.4): with train.budget_usd > 0, the trainer stops cleanly
+(checkpoint, run log "stopped_budget", exit 4) before the first step at which its
+own wall time since start x train.usd_per_hour has reached budget_usd. The box
+tools pass the budget that remains when they launch it (less their reserve), so a
+trainer orphaned by a dead launcher still cannot overrun the box budget.
 
 Models and optimizers (quipu-moe, M6): the model comes from build_model (dense
 Quipu or QuipuMoE) and the optimizers from build_optimizers (one AdamW, or Muon +
@@ -103,7 +110,11 @@ EXIT_OK = 0
 EXIT_CRASH = 1
 EXIT_USAGE = 2
 EXIT_NONFINITE = 3
+EXIT_BUDGET = 4
 EXIT_INTERRUPTED = 130
+
+# The spend backstop's clock (tests swap it for a fake).
+_clock: Callable[[], float] = time.monotonic
 
 # SetThreadExecutionState flags (winbase.h).
 ES_CONTINUOUS = 0x80000000
@@ -114,6 +125,13 @@ class NonFiniteStop(RuntimeError):
     """The non-finite guard gave up. Retrying from the last checkpoint would replay
     the same data into the same weights and fail the same way, so it has its own
     exit code (3) that the launcher does not retry."""
+
+
+class BudgetStop(Exception):
+    """The spend backstop (train.budget_usd > 0): this process's wall time x
+    train.usd_per_hour reached train.budget_usd. The interrupt checkpoint is written
+    and the process exits 4, so a trainer whose launcher died cannot overrun the
+    budget the launcher gave it."""
 
 
 class UsageError(Exception):
@@ -214,6 +232,8 @@ class Trainer:
         val_dir: str | Path | None = None,
         resume: bool = False,
     ) -> None:
+        # The spend backstop counts from here: model build and compile are box time too.
+        self.started_at = _clock()
         torch.manual_seed(train_cfg.seed)
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
@@ -738,10 +758,25 @@ class Trainer:
         finally:
             _set_thread_execution_state(ES_CONTINUOUS)
 
+    def budget_spent_usd(self) -> float:
+        """This process's box time so far at train.usd_per_hour."""
+        return (_clock() - self.started_at) / 3600 * self.train_cfg.usd_per_hour
+
+    def _check_budget(self) -> None:
+        """The spend backstop: raise BudgetStop once this process's wall time x
+        usd_per_hour reaches budget_usd (budget_usd 0 = no backstop)."""
+        cfg = self.train_cfg
+        if cfg.budget_usd > 0 and self.budget_spent_usd() >= cfg.budget_usd:
+            raise BudgetStop(
+                f"budget backstop: {(_clock() - self.started_at) / 3600:.2f} h x "
+                f"${cfg.usd_per_hour:.2f}/h = ${self.budget_spent_usd():.2f} reached "
+                f"train.budget_usd ${cfg.budget_usd:.2f} at step {self.step}")
+
     def _run(self) -> None:
         cfg = self.train_cfg
         milestones = set(cfg.milestones)
         saved_at = None
+        start_step = self.step        # a resumed run's checkpoint is already on disk
         # Resumed from checkpoint N whose milestone never got written (a Ctrl+C
         # during the milestone write or the eval before it saves checkpoint N and
         # exits): the weights just loaded are exactly the step-N weights.
@@ -749,6 +784,7 @@ class Trainer:
             if self.step > 0 and (self.step in milestones or self.step == cfg.steps):
                 self.save_milestone()      # no-op when the file exists
             while self.step < cfg.steps:
+                self._check_budget()
                 before = self.step
                 loss = self.train_step()
                 if self.step == before:
@@ -774,6 +810,13 @@ class Trainer:
             if saved_at != self.step:
                 self.save_checkpoint()
             self._safe_log(self.log.finish, "completed")
+        except BudgetStop as exc:
+            print(f"{exc}: stopping (checkpoint, exit {EXIT_BUDGET})", file=sys.stderr,
+                  flush=True)
+            if self.step > 0 and saved_at != self.step and self.step != start_step:
+                self.save_checkpoint()
+            self._safe_log(self.log.finish, "stopped_budget")
+            raise
         except KeyboardInterrupt:
             self.save_checkpoint()
             self._safe_log(self.log.finish, "interrupted")
@@ -845,7 +888,9 @@ def main(argv: list[str] | None = None) -> None:
     trainer.run()
 
 
-STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGBREAK") if hasattr(signal, n))
+# SIGHUP (POSIX): a trainer whose terminal or launcher went away checkpoints too.
+STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGBREAK")
+                     if hasattr(signal, n))
 
 
 def _install_stop_handlers() -> dict[int, Any]:
@@ -888,8 +933,9 @@ def _install_stop_handlers() -> dict[int, Any]:
 def run_main(argv: list[str] | None = None) -> int:
     """main() with every outcome mapped to the exit code the launcher relies on:
     0 completed, 1 any other crash, 2 usage/config error, 3 non-finite stop,
-    130 interrupt (Ctrl+C, SIGINT, SIGTERM or SIGBREAK: all checkpoint first).
-    Codes 2, 3 and 130 are not worth retrying; 1 may be."""
+    4 spend backstop (checkpointed), 130 interrupt (Ctrl+C, SIGINT, SIGTERM, SIGHUP
+    or SIGBREAK: all checkpoint first). Codes 2, 3, 4 and 130 are not worth
+    retrying; 1 may be."""
     previous = _install_stop_handlers()
     try:
         return _run_main(argv)
@@ -904,6 +950,8 @@ def _run_main(argv: list[str] | None) -> int:
     except NonFiniteStop as exc:
         print(f"stopped: {exc}", file=sys.stderr, flush=True)
         return EXIT_NONFINITE
+    except BudgetStop:
+        return EXIT_BUDGET
     except UsageError as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return EXIT_USAGE

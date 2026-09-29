@@ -52,11 +52,12 @@ class FakeTrainer:
     checkpoint is written at the current step and the child exits 130."""
 
     def __init__(self, clock: FakeClock, tps, startup_s: float = 30.0,
-                 crash_at: int | None = None) -> None:
+                 crash_at: int | None = None, backstop_at: int | None = None) -> None:
         self.clock = clock
         self.tps = tps                       # a number, or a function of the attempt number
         self.startup_s = startup_s
         self.crash_at = crash_at
+        self.backstop_at = backstop_at       # the trainer's own budget stop: exit 4
         self.calls: list[dict] = []
         self.checkpoint_step = 0
         self.sigints = 0
@@ -73,6 +74,8 @@ class FakeTrainer:
         tps = self.tps(attempt) if callable(self.tps) else self.tps
         self.calls.append({"resume": resume, "total_tokens": total,
                            "milestones": raw["train"]["milestones"],
+                           "budget_usd": raw["train"]["budget_usd"],
+                           "usd_per_hour": raw["train"]["usd_per_hour"],
                            "start": self.checkpoint_step if resume else 0})
         run_log = run_dir / f"{run_id}.json"
         ckpt_dir = Path(raw["train"]["ckpt_dir"])
@@ -98,6 +101,12 @@ class FakeTrainer:
             if self.crash_at is not None and step == self.crash_at:
                 self.crash_at = None
                 return rm.ChildOutcome(code=1, stop_reason=None, events=events,
+                                       started_at=started)
+            if self.backstop_at is not None and step == self.backstop_at:
+                self._checkpoint(ckpt_dir, step)
+                log["status"] = "stopped_budget"
+                run_log.write_text(json.dumps(log), encoding="utf-8")
+                return rm.ChildOutcome(code=4, stop_reason=None, events=events,
                                        started_at=started)
             reason = should_stop(list(events))
             if reason:
@@ -549,6 +558,352 @@ def test_summary_reports_each_attempts_longest_checkpoint_save(tmp_path):
     assert summary.count("longest checkpoint save 30.0 s") == 2     # gate + long run
 
 
+# ---- the trainer's backstop, the no-op rerun, an ended session -------------------------------
+
+def test_every_trainer_gets_the_budget_left_at_its_launch_as_its_backstop(tmp_path):
+    clock = FakeClock()
+    ledger = Ledger.load(tmp_path / "spend.json", clock=clock)
+    trainer = FakeTrainer(clock, tps=BT / 2.0, crash_at=300)
+    spent_at_launch = []
+
+    def spy(cmd, log_path, should_stop):
+        spent_at_launch.append(ledger.spent_usd())
+        return trainer(cmd, log_path, should_stop)
+
+    launcher = make_launcher(tmp_path, clock, spy, budget=20.0, reserve=1.0, gate_minutes=5.0,
+                             go_after=1, ledger=ledger)
+    assert launcher.run() == 0
+    gate, first, retry = trainer.calls
+    assert all(c["usd_per_hour"] == RATE for c in trainer.calls)
+    # The gate's trainer: at most 2 x the gate's cost (5 min = $0.30), so an orphaned
+    # gate cannot train the whole configured run.
+    assert gate["budget_usd"] == pytest.approx(rm.GATE_BACKSTOP_FACTOR * 0.30, abs=1e-4)
+    # Each long-run attempt: the budget left at its launch, less the reserve (a retry
+    # gets less: its trainer's clock starts again at zero).
+    for call, spent in zip((first, retry), spent_at_launch[1:]):
+        assert call["budget_usd"] == pytest.approx(20.0 - spent - 1.0, abs=1e-3)
+    assert retry["budget_usd"] < first["budget_usd"]
+
+
+def test_the_trainers_backstop_exit_is_a_budget_stop_and_not_retried(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0, backstop_at=300)
+    launcher = make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0,
+                             go_after=1)
+    assert launcher.run() == rm.EXIT_BUDGET
+    assert len(trainer.calls) == 2                    # the gate, one long-run attempt
+    summary = (tmp_path / "results" / "moe" / "summary.md").read_text(encoding="utf-8")
+    assert "backstop" in summary and "step 300" in summary
+    assert launcher.eval_calls == []
+
+
+def test_a_completed_run_is_marked_so_the_same_command_again_is_a_no_op(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+    assert make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0).run() == 0
+    plan = plan_json(tmp_path)
+    assert plan["completed"] and plan["evaluated"]
+    summary = tmp_path / "results" / "moe" / "summary.md"
+    before = summary.read_text(encoding="utf-8")
+    calls = len(trainer.calls)
+    again = make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0)
+    assert again.run() == 0
+    assert len(trainer.calls) == calls and again.eval_calls == []     # nothing re-run
+    assert summary.read_text(encoding="utf-8") == before              # the summary stands
+    assert any("nothing to do" in s for s in lines)
+
+
+def test_a_box_session_ended_under_the_long_run_is_a_budget_stop(tmp_path):
+    clock = FakeClock()
+    ledger = Ledger.load(tmp_path / "spend.json", clock=clock)
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+
+    def ends_the_session(cmd, log_path, should_stop):
+        if not trainer.calls:                          # the gate runs normally
+            return trainer(cmd, log_path, should_stop)
+        n = {"checks": 0}
+
+        def check(events):
+            n["checks"] += 1
+            if n["checks"] == 50:                      # `spend stop --force` mid-run
+                Ledger.load(tmp_path / "spend.json", clock=clock).end_session()
+            return should_stop(events)
+        return trainer(cmd, log_path, check)
+
+    launcher = make_launcher(tmp_path, clock, ends_the_session, budget=20.0, gate_minutes=5.0,
+                             go_after=1, ledger=ledger)
+    assert launcher.run() == rm.EXIT_BUDGET
+    assert trainer.sigints == 2                        # the gate's stop, then this one
+    assert trainer.checkpoint_step < CFG_STEPS
+    summary = (tmp_path / "results" / "moe" / "summary.md").read_text(encoding="utf-8")
+    assert "session was ended" in summary
+
+
+def test_the_launcher_tags_its_ledger_ticks_so_spend_stop_refuses(tmp_path):
+    clock = FakeClock()
+    ledger = Ledger.load(tmp_path / "spend.json", clock=clock)
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+    assert make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0,
+                         ledger=ledger).run() == 0
+    assert ledger.tool == "run_moe"
+    assert Ledger.load(tmp_path / "spend.json", clock=clock).active_tool()[0] == "run_moe"
+
+
+# ---- the GO wait is bounded ----------------------------------------------------------------
+
+def test_no_go_within_the_limit_writes_the_note_and_exits_5(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+    launcher = make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0,
+                             go_after=None, go_max_wait_min=30.0)
+    assert launcher.run() == rm.EXIT_NO_GO
+    assert len(trainer.calls) == 1 and launcher.sleep.calls == 30      # 30 polls of 60 s
+    out = tmp_path / "results" / "moe"
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert "GO not given" in summary and f"${RATE:.2f}/h" in summary
+    assert "Vast console" in summary and "disk is kept" in summary
+    assert "same run_moe.py command" in summary and "quipu.spend stop" in summary
+    assert "GO not given within 30 min" in (out / "plan.md").read_text(encoding="utf-8")
+    assert launcher.eval_calls == []
+    # Later, the same command: no second gate, a new wait, GO, the long run resumes.
+    again = make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0,
+                          go_after=2, go_max_wait_min=30.0)
+    assert again.run() == 0
+    assert len(trainer.calls) == 2 and trainer.calls[-1]["resume"]
+
+
+def test_the_wait_stops_once_less_than_80_percent_of_the_approved_run_fits(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 10.0)        # a slow run the budget trims
+    launcher = make_launcher(tmp_path, clock, trainer, budget=3.5, reserve=0.5,
+                             gate_minutes=10.0, go_after=None)
+    approved = None
+
+    class Watch(GoAfter):
+        def __call__(self, seconds):
+            nonlocal approved
+            if approved is None:
+                approved = plan_json(tmp_path)["total_tokens"]
+            super().__call__(seconds)
+
+    launcher.sleep = Watch(clock, tmp_path / "results" / "moe" / "GO", None)
+    assert launcher.run() == rm.EXIT_NO_GO
+    assert len(trainer.calls) == 1
+    waited_min = launcher.sleep.calls
+    assert 0 < waited_min < rm.GO_MAX_WAIT_MIN          # well before the time limit
+    plan = plan_json(tmp_path)
+    # plan.md is re-fitted to what fits now (< 80% of the approved run) for a new approval.
+    assert plan["total_tokens"] < 0.8 * approved and plan["total_tokens"] % BT == 0
+    md = (tmp_path / "results" / "moe" / "plan.md").read_text(encoding="utf-8")
+    assert "fresh approval" in md and f"{approved:,}" in md
+    summary = (tmp_path / "results" / "moe" / "summary.md").read_text(encoding="utf-8")
+    assert "GO not given" in summary
+
+
+# ---- the gate's overhead and the one re-fit after the first interval ------------------------
+
+def test_planning_rate_adds_the_eval_and_checkpoint_overhead_per_interval():
+    # 1000 tok/s less 5% = 1052.6 s per 1M tokens; batch 1000 tokens: 1.0526 s a step,
+    # + 30 s per 100 steps (eval) + 60 s per 200 steps (save) = 1.6526 s a step.
+    tps = rm.planning_tokens_per_s(1000.0, headroom=0.05, batch_tokens=1000, eval_every=100,
+                                   ckpt_every=200, eval_s=30.0, save_s=60.0)
+    assert tps == pytest.approx(1000 / (1000 / 950 + 0.3 + 0.3))
+    assert rm.planning_tokens_per_s(1000.0, headroom=0.0, batch_tokens=1000, eval_every=100,
+                                    ckpt_every=100, eval_s=0.0, save_s=0.0) == pytest.approx(1000)
+    assert rm.HEADROOM == 0.05 and rm.RESERVE_USD == 1.00
+
+
+def test_the_plan_uses_the_gates_longest_save_or_the_default(tmp_path):
+    import dataclasses
+
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+
+    def with_saves(cmd, log_path, should_stop):
+        return dataclasses.replace(trainer(cmd, log_path, should_stop), save_s=[12.5, 40.0])
+
+    assert make_launcher(tmp_path / "a", clock, with_saves, budget=20.0,
+                         gate_minutes=5.0).run() == 0
+    plan = json.loads((tmp_path / "a" / "results" / "moe" / "plan.json").read_text("utf-8"))
+    assert plan["save_s"] == 40.0 and plan["save_observed"] and plan["eval_s"] == 30.0
+    md = (tmp_path / "a" / "results" / "moe" / "plan.md").read_text(encoding="utf-8")
+    assert "longest save the gate reported" in md
+    assert make_launcher(tmp_path / "b", clock, FakeTrainer(clock, tps=BT / 2.0), budget=20.0,
+                         gate_minutes=5.0).run() == 0
+    plan = json.loads((tmp_path / "b" / "results" / "moe" / "plan.json").read_text("utf-8"))
+    assert plan["save_s"] == rm.SAVE_OVERHEAD_S and not plan["save_observed"]
+
+
+def test_the_overhead_makes_the_plan_trim_more_than_the_bare_rate_would(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 10.0)
+    launcher = make_launcher(tmp_path, clock, trainer, budget=3.5, reserve=0.5,
+                             gate_minutes=10.0, go_after=1)
+    launcher.run()
+    plan = plan_json(tmp_path)
+    bare = rm.fit_total_tokens(budget_usd=3.5, spent_usd=plan["spent_at_plan"], reserve_usd=0.5,
+                               usd_per_hour=RATE, tokens_per_s=BT / 10.0,
+                               startup_s=plan["startup_s"],
+                               tokens_done=plan["gate_step"] * BT, batch_tokens=BT)
+    with_overhead = rm.fit_total_tokens(
+        budget_usd=3.5, spent_usd=plan["spent_at_plan"], reserve_usd=0.5, usd_per_hour=RATE,
+        tokens_per_s=BT / (10.0 + 30 / 100 + 60 / 100), startup_s=plan["startup_s"],
+        tokens_done=plan["gate_step"] * BT, batch_tokens=BT)
+    assert with_overhead < bare
+    assert plan["total_tokens"] <= with_overhead
+
+
+def test_a_long_run_slower_than_planned_is_refitted_once_after_its_first_interval(tmp_path):
+    clock = FakeClock()
+    # The gate measures 2 s a step (planned with the default overhead: 2.9 s); the long
+    # run takes 4 s a step, so its first full interval is ~28% slower than planned.
+    trainer = FakeTrainer(clock, tps=lambda a: BT / 2.0 if a == 1 else BT / 4.0)
+    launcher = make_launcher(tmp_path, clock, trainer, budget=2.2, reserve=0.5,
+                             gate_minutes=5.0, go_after=1)
+    assert launcher.run() == 0
+    plan = plan_json(tmp_path)
+    refit = plan["refit"]
+    assert refit["from_total"] == 2_000_000 and refit["to_total"] < 2_000_000
+    assert refit["to_total"] % BT == 0 and plan["total_tokens"] == refit["to_total"]
+    gate, interrupted, resumed = trainer.calls              # re-fitted once, then no more
+    assert interrupted["total_tokens"] == 2_000_000 and trainer.sigints == 2
+    assert resumed["resume"] and resumed["total_tokens"] == refit["to_total"]
+    assert resumed["milestones"] == plan["milestones"]
+    # Milestones already reached stay; none lands past the new end.
+    assert all(m < refit["to_total"] // BT for m in plan["milestones"])
+    at = refit["at_step"]
+    assert at - plan["gate_step"] >= 100                    # a full interval after the gate
+    assert tuple(plan["milestones"]) == rm.refit_milestones(
+        [100, 250], CFG_STEPS, refit["from_total"] // BT, refit["to_total"] // BT,
+        plan["gate_step"], at)
+    md = (tmp_path / "results" / "moe" / "plan.md").read_text(encoding="utf-8")
+    assert "re-fitted after the long run's first full interval" in md
+    spent = Ledger.load(tmp_path / "spend.json", clock=clock).spent_usd()
+    assert spent + 0.5 <= 2.2 + 1e-6                        # the reserve survived
+    summary = (tmp_path / "results" / "moe" / "summary.md").read_text(encoding="utf-8")
+    assert "Re-fitted at step" in summary
+
+
+def test_a_long_run_as_fast_as_planned_is_never_refitted_or_extended(tmp_path):
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0)            # faster than the planning rate
+    launcher = make_launcher(tmp_path, clock, trainer, budget=20.0, gate_minutes=5.0)
+    assert launcher.run() == 0
+    plan = plan_json(tmp_path)
+    assert "refit" not in plan and plan["refit_checked"]
+    assert plan["total_tokens"] == 2_000_000 and len(trainer.calls) == 2
+    assert any("no re-fit" in n for n in plan["notes"])
+
+
+def test_refit_milestones_keep_the_reached_ones_and_rescale_the_rest():
+    # 488 -> 400 steps at step 260 (gate at 135): 100 (at the gate step, 135) and 250 are
+    # reached and stay; a later one is rescaled; one that would fall behind moves to 260.
+    assert rm.refit_milestones([100, 250, 400], 488, 488, 400, 135, 260) == (135, 250, 328)
+    assert rm.refit_milestones([100, 300], 488, 488, 300, 0, 260) == (100, 260)
+    assert rm.refit_milestones([450], 488, 488, 300, 0, 260) == (277,)
+
+
+# ---- the child runs in its own session; stop signals take the checkpoint path -----------------
+
+def test_the_trainer_is_started_in_its_own_session_or_process_group(tmp_path, monkeypatch):
+    seen = {}
+
+    class NoPopen:
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+            raise OSError("not starting anything")
+
+    monkeypatch.setattr(rm.subprocess, "Popen", NoPopen)
+    with pytest.raises(OSError):
+        rm.SubprocessChild(echo=lambda s: None)(["x"], tmp_path / "log", lambda e: None)
+    expected = rm.childproc.popen_kwargs()
+    assert {k: seen[k] for k in expected} == expected
+
+
+def test_ctrl_c_is_forwarded_to_the_trainer_which_checkpoints(tmp_path):
+    """The trainer no longer shares the terminal's process group: it only learns of a
+    Ctrl+C (or SIGTERM / SIGHUP, which raise the same KeyboardInterrupt) from the
+    launcher, which must send it."""
+    script = tmp_path / "child.py"
+    script.write_text(FAKE_CHILD, encoding="utf-8")
+    marker = tmp_path / "marker.txt"
+
+    def echo(line):
+        if line.startswith("step 3/"):
+            raise KeyboardInterrupt
+
+    child = rm.SubprocessChild(poll_s=0.1, grace_s=30.0, kill_wait_s=5.0, echo=echo)
+    with pytest.raises(KeyboardInterrupt):
+        child([sys.executable, str(script), str(marker)], tmp_path / "child.log", lambda e: None)
+    assert marker.read_text() == "interrupt checkpoint"
+
+
+def test_a_stop_signal_raises_keyboard_interrupt_once():
+    said = []
+    handler = rm.childproc.stop_signal_handler(said.append, "[moe]")
+    with pytest.raises(KeyboardInterrupt):
+        handler(15, None)
+    handler(1, None)                                    # a hangup after the SIGTERM: ignored
+    assert len(said) == 2 and "again" in said[1] and said[0].startswith("[moe]")
+
+
+SIGNAL_CHILD = r'''
+import os, signal, sys, time
+from pathlib import Path
+marker, sid_out = Path(sys.argv[1]), Path(sys.argv[2])
+sid_out.write_text(str(os.getsid(0)))
+def stop(signum, frame):
+    marker.write_text("interrupt checkpoint")
+    print("checkpoint step 9 saved in 0.5 s (1.4 GB)", flush=True)
+    sys.exit(130)
+signal.signal(signal.SIGINT, stop)
+for i in range(1, 2000):
+    print(f"step {i}/2000  loss 3.0000  lr 1.00e-03  grad 1.000  1,000 tok/s", flush=True)
+    time.sleep(0.05)
+'''
+
+SIGNAL_DRIVER = r'''
+import importlib.util, sys
+from pathlib import Path
+root, child, marker, sid_out = sys.argv[1:5]
+sys.path.insert(0, root)
+spec = importlib.util.spec_from_file_location("run_moe", Path(root) / "scripts" / "remote" / "run_moe.py")
+rm = importlib.util.module_from_spec(spec); sys.modules["run_moe"] = rm; spec.loader.exec_module(rm)
+previous = rm.childproc.install_stop_signals(rm._echo, "[moe]")
+runner = rm.SubprocessChild(grace_s=20.0, kill_wait_s=5.0, poll_s=0.2)
+try:
+    runner([sys.executable, child, marker, sid_out], Path(marker).with_suffix(".log"),
+           lambda events: None)
+except KeyboardInterrupt:
+    print("[driver] stopped", flush=True)
+    sys.exit(130)
+sys.exit(0)
+'''
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and sessions")
+@pytest.mark.parametrize("sig_name", ["SIGTERM", "SIGHUP"])
+def test_sigterm_or_sighup_to_the_launcher_checkpoints_the_trainer(tmp_path, sig_name):
+    import signal
+
+    child, driver = tmp_path / "child.py", tmp_path / "driver.py"
+    child.write_text(SIGNAL_CHILD, encoding="utf-8")
+    driver.write_text(SIGNAL_DRIVER, encoding="utf-8")
+    marker, sid_out = tmp_path / "marker", tmp_path / "sid"
+    proc = subprocess.Popen([sys.executable, str(driver), str(ROOT), str(child), str(marker),
+                             str(sid_out)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    for line in proc.stdout:
+        if line.startswith("step 3/"):
+            proc.send_signal(getattr(signal, sig_name))
+            break
+    rest = proc.stdout.read()
+    assert proc.wait(timeout=60) == 130, rest
+    assert marker.read_text() == "interrupt checkpoint"       # the trainer checkpointed
+    assert "[driver] stopped" in rest
+    assert int(sid_out.read_text()) != os.getsid(0)           # in a session of its own
+
+
 # ---- sync.sh ---------------------------------------------------------------------------------
 
 def _bash() -> str | None:
@@ -570,10 +925,13 @@ BASH = _bash()
 needs_bash = pytest.mark.skipif(BASH is None, reason="needs bash (Git Bash on Windows)")
 
 
-def _sync(tmp_path, *args, tool="rsync"):
+def _sync(tmp_path, *args, tool="rsync", keep=None):
     # A relative LOCAL_DIR reads the same in Git Bash and elsewhere (cygpath keeps it).
     env = {**os.environ, "SYNC_TOOL": tool, "LOCAL_DIR": "local-copy/quipu-moe",
            "HOME": tmp_path.as_posix()}
+    env.pop("KEEP_LOCAL", None)
+    if keep is not None:
+        env["KEEP_LOCAL"] = keep
     return subprocess.run([BASH, "-s", "--", *args], input=SYNC.read_bytes().decode("utf-8"),
                           capture_output=True, text=True, encoding="utf-8", timeout=60,
                           env=env, cwd=tmp_path)
@@ -602,7 +960,8 @@ def test_sync_dry_run_prints_the_rsync_commands(tmp_path):
     remote = "root@1.2.3.4:/workspace/quipu"
     # The key is ~/.ssh/id_ed25519 (Git Bash spells HOME /c/...), no agent forwarding.
     ssh = r"ssh -p 40022 -i \S+/\.ssh/id_ed25519 -o IdentitiesOnly=yes -o ForwardAgent=no"
-    assert re.search(r'rsync -av --partial -e "' + ssh, out), out
+    assert re.search(r'rsync -av --partial-dir=\.rsync-partial -e "' + ssh
+                     + " -o BatchMode=yes", out), out
     assert f"{remote}/checkpoints/quipu-moe/latest.pt {local}/checkpoints/quipu-moe/latest.pt.incoming" in out
     assert f"{remote}/checkpoints/quipu-moe/step_NNNNNN.pt {local}/checkpoints/quipu-moe/" in out
     assert f"{remote}/checkpoints/quipu-moe/milestones/ {local}/checkpoints/quipu-moe/milestones/" in out
@@ -618,6 +977,8 @@ def test_sync_dry_run_falls_back_to_scp(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = proc.stdout
     assert "scp -P 22 -i" in out and "rsync" not in out
+    assert all("BatchMode=yes" in ln for ln in out.splitlines()
+               if ln.startswith(("scp ", "ssh ")))
     assert "root@host.example:/workspace/quipu/checkpoints/quipu-moe/step_NNNNNN.pt" in out
     assert "tar -C /workspace/quipu -cf - --exclude=inductor-cache" in out
     assert "every 3 h" in out                         # the default interval
@@ -628,3 +989,30 @@ def test_sync_usage_errors(tmp_path):
     assert _sync(tmp_path, "--dry-run", "onlyhost").returncode == 2
     assert _sync(tmp_path, "--dry-run", "host", "notaport").returncode == 2
     assert _sync(tmp_path, "--dry-run", "host", "22", "0").returncode == 2
+    assert _sync(tmp_path, "--prune-only").returncode == 2                  # needs KEEP_LOCAL
+    assert _sync(tmp_path, "--dry-run", "host", "22", keep="0").returncode == 2
+    assert _sync(tmp_path, "--dry-run", "host", "22", keep="two").returncode == 2
+
+
+@needs_bash
+def test_keep_local_prunes_old_copies_but_never_latest_or_milestones(tmp_path):
+    ckpt = tmp_path / "local-copy" / "quipu-moe" / "checkpoints" / "quipu-moe"
+    (ckpt / "milestones").mkdir(parents=True)
+    for step in (100, 200, 300, 400, 500):
+        (ckpt / f"step_{step:06d}.pt").write_bytes(b"x")
+        (ckpt / "milestones" / f"step_{step:06d}.pt").write_bytes(b"m")
+    (ckpt / "step_000600.pt.part").write_bytes(b"partial")
+    # latest.pt points at step 200 (a pointer that lags the newest copies, e.g. a
+    # restore): it must survive although it is not among the 2 newest.
+    (ckpt / "latest.pt").write_bytes(b"\x80\x02}q\x00X\x04\x00\x00\x00fileq\x01X\x0e\x00\x00\x00"
+                                     b"step_000200.ptq\x02s.")
+    proc = _sync(tmp_path, "--prune-only", keep="2")
+    assert proc.returncode == 0, proc.stderr
+    left = sorted(p.name for p in ckpt.iterdir() if p.is_file())
+    assert left == ["latest.pt", "step_000200.pt", "step_000400.pt", "step_000500.pt",
+                    "step_000600.pt.part"]
+    assert len(list((ckpt / "milestones").iterdir())) == 5          # untouched
+    # Unset KEEP_LOCAL (the default) keeps everything.
+    proc = _sync(tmp_path, "--dry-run", "1.2.3.4", "22")
+    assert proc.returncode == 0 and "rm -f" not in proc.stdout
+    assert len(list(ckpt.glob("step_*.pt"))) == 3

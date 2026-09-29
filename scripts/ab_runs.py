@@ -2,7 +2,7 @@
 
     python -m quipu.spend start --usd-per-hour 0.55      # once, when the box starts
     python scripts/ab_runs.py --config configs/quipu-moe-ab.toml --out results/ab \\
-        --budget-usd 4 --usd-per-hour 0.55 [--with-fp8] [--dry-run]
+        --budget-usd 3 --usd-per-hour 0.55 [--with-fp8] [--shared-noise] [--dry-run]
 
 What runs, in order (every run is `python -m quipu.train` with --override flags):
 1. LR sweeps at SWEEP_TOKENS (100M): AdamW lr in ADAMW_LRS, then Muon muon_lr in
@@ -19,7 +19,9 @@ What runs, in order (every run is `python -m quipu.train` with --override flags)
    on the laptop and expects <= 1.1x on the 5090, below the 1.2x keep rule.
 3. A seed re-run (seed + 1) of each pair's preliminary winner; noise = |val loss
    difference| between the two seeds. Identical re-runs (e.g. two pairs whose winner
-   is the pair-1 winner) are the same cached run, so they cost once.
+   is the pair-1 winner) are the same cached run, so they cost once. --shared-noise
+   (opt-in, default off) runs only pair 1's winner's seed re-run and uses its |val
+   loss difference| as the noise of every pair; summary.md says so.
 4. Decision rules (decide_pair). The simpler option is AdamW, no AttnRes, SwiGLU,
    bf16. The other option is kept only if its final val loss is lower by MORE than
    the noise, and: AttnRes costs <= 10% tokens/s; SiTU-GLU has no more loss spikes
@@ -63,9 +65,13 @@ Money (the box is billed per hour; the credit is not refundable):
   time; once one is seen, later stops wait max(--stop-grace-s, 3 x the longest save
   seen), and summary.md reports each run's longest save. The run is "stopped_budget": not
   cached, its checkpoint kept, so the next invocation (with more budget) resumes it.
-  The orchestrator then exits 4. The runs keep train.budget_usd 0 (the orchestrator
-  guards); train.budget_usd / usd_per_hour and the per-run bookkeeping keys
-  (RESERVED_OVERRIDES) are refused as --override.
+  The orchestrator then exits 4. Backstop: each attempt is launched with
+  train.budget_usd = the budget left then less the grace reserve and
+  train.usd_per_hour = the box rate, so a trainer the orchestrator left behind (it
+  died) checkpoints and exits 4 on its own (quipu.train's spend backstop; the runner
+  reads exit 4 as stopped_budget). train.budget_usd / usd_per_hour and the per-run
+  bookkeeping keys (RESERVED_OVERRIDES) are refused as --override. `spend stop`
+  refuses while the orchestrator is ticking the ledger (its ticks are tagged).
 - Stopping: Ctrl+C, SIGTERM and SIGHUP (POSIX; the first of these two raises, a
   repeat is ignored) all take the same path: the running child (in its own session,
   so a terminal hangup never reaches it) is sent the interrupt and given the grace
@@ -90,8 +96,9 @@ Money (the box is billed per hour; the credit is not refundable):
   summary reports each run's startup (to its first step line) and total overhead
   (wall - tokens / steady tokens/s) against the PRIOR_OVERHEAD_S prior.
 
---dry-run prints the run list (worst case, every seed re-run distinct), the token
-total and the estimated cost at --tokens-per-second, and trains nothing.
+--dry-run prints the run list (worst case, every seed re-run distinct; one with
+--shared-noise), the token total and the estimated cost at --tokens-per-second, and
+trains nothing.
 
 Exit codes: 0 done (whatever the decisions), 2 usage error, 4 stopped by the budget
 (summary and winners still written), 130 interrupted.
@@ -117,6 +124,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from quipu import childproc
 from quipu.config import Config, load_config, parse_overrides
 from quipu.fsio import write_text_atomic
 from quipu.spend import TICK_S, Ledger, LedgerError, Ticker
@@ -165,8 +173,9 @@ EXIT_BUDGET = 4
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 # The trainer's exit codes (quipu.train): 0 ok, 1 crash, 2 usage, 3 non-finite stop,
-# 130 interrupt; Windows reports a Ctrl+C'd child as STATUS_CONTROL_C_EXIT.
-TRAIN_USAGE, TRAIN_NONFINITE = 2, 3
+# 4 its budget backstop, 130 interrupt; Windows reports a Ctrl+C'd child as
+# STATUS_CONTROL_C_EXIT.
+TRAIN_USAGE, TRAIN_NONFINITE, TRAIN_BUDGET = 2, 3, 4
 TRAIN_INTERRUPT_CODES = frozenset({130, -1073741510, 3221225786})
 
 
@@ -340,9 +349,20 @@ def preliminary(pair: str, simple: RunResult, other: RunResult) -> tuple[str, st
 
 
 def decide_pair(pair: str, simple: RunResult | None, other: RunResult | None,
-                reseed: RunResult | None) -> Decision:
+                reseed: RunResult | None, *, shared: bool = False,
+                shared_noise: float | None = None) -> Decision:
     """The pair's decision. `reseed` is the seed re-run of the preliminary winner
-    (None if it was not run)."""
+    (None if it was not run). With shared=True (--shared-noise) the pair has no seed
+    re-run of its own: `shared_noise` (pair 1's, None if that is missing) is its noise."""
+    if shared:
+        d = _decide_pair(pair, simple, other, None, shared_noise, True)
+        return dataclasses.replace(d, reason=d.reason + " [shared noise: pair 1's seed re-run]")
+    return _decide_pair(pair, simple, other, reseed, None, False)
+
+
+def _decide_pair(pair: str, simple: RunResult | None, other: RunResult | None,
+                 reseed: RunResult | None, shared_noise: float | None,
+                 shared: bool) -> Decision:
     if not usable(simple):
         if simple is not None and simple.status == "diverged" and usable(other):
             return Decision(pair, "complex", "complex", None,
@@ -359,13 +379,17 @@ def decide_pair(pair: str, simple: RunResult | None, other: RunResult | None,
                         f"other arm missing ({state}); the simpler option is kept by default")
     prelim, why = preliminary(pair, simple, other)
     winner = simple if prelim == "simple" else other
-    noise = (abs(winner.final_val_loss - reseed.final_val_loss) if usable(reseed) else None)
+    if shared:
+        noise = shared_noise
+    else:
+        noise = (abs(winner.final_val_loss - reseed.final_val_loss) if usable(reseed) else None)
     if prelim == "simple":
         return Decision(pair, "simple", "simple", noise, why)
     if noise is None:
+        missing = ("the shared noise estimate (pair 1's seed re-run) is missing" if shared
+                   else "the winner's seed re-run is missing")
         return Decision(pair, "simple", "complex", None,
-                        f"{why}, but the winner's seed re-run is missing: noise unknown, "
-                        "the simpler option is kept")
+                        f"{why}, but {missing}: noise unknown, the simpler option is kept")
     if pair == "precision":
         worse = other.final_val_loss - simple.final_val_loss
         if worse <= noise:
@@ -475,6 +499,7 @@ class Orchestrator:
         skip_sweeps: bool = False,
         pairs: tuple[str, ...] = DEFAULT_PAIRS,
         seed_reruns: bool = True,
+        shared_noise: bool = False,
         sweep_tokens: int = SWEEP_TOKENS,
         arm_tokens: int = ARM_TOKENS,
         attnres_on: int = ATTNRES_ON,
@@ -496,6 +521,12 @@ class Orchestrator:
         self.pairs = tuple(p.name for p in PAIRS if p.name in pairs)
         self.skip_sweeps = skip_sweeps
         self.seed_reruns = seed_reruns
+        # --shared-noise: one seed re-run (pair 1's winner); its |val loss difference|
+        # is the noise of every pair. Off by default (the owner has not decided).
+        self.shared_noise = shared_noise and seed_reruns
+        self.noise_estimate: float | None = None      # the shared one, once measured
+        self.noise_source: str | None = None          # the run it came from
+        self.noise_measured = False
         self.sweep_tokens = sweep_tokens
         self.arm_tokens = arm_tokens
         self.attnres_on = attnres_on
@@ -510,6 +541,8 @@ class Orchestrator:
         self.config_sha = hashlib.sha256(self.config_path.read_bytes()).hexdigest()
         # The box ledger (never written until run() begins: a dry run changes nothing).
         self.ledger = ledger if ledger is not None else Ledger.load()
+        if self.ledger.tool is None:
+            self.ledger.tool = "ab_runs"         # `spend stop` refuses while this ticks
         self.usd_per_hour_arg = usd_per_hour
         self.spent_usd = spent_usd
         self.spent_key = spent_key
@@ -629,6 +662,19 @@ class Orchestrator:
                 flat["train.warmup_steps"] = str(max(1, steps // 10))
         return [f"{k}={v}" for k, v in flat.items()]
 
+    def backstop_overrides(self) -> list[str]:
+        """The trainer's own spend backstop for one attempt (quipu.train, exit 4): the
+        budget left now less the grace reserve, at the box rate, timed from the
+        trainer's start. The orchestrator's deadline stops the run first; this only
+        matters if the orchestrator died and left the trainer running. None without
+        a budget (a run then keeps the config's budget_usd 0)."""
+        rate = self.guard.usd_per_hour
+        if self.guard.budget_usd is None or not rate or rate <= 0:
+            return []
+        left = self.guard.budget_usd - self.guard.spent() - self.guard.reserve_usd()
+        return [f"train.budget_usd={round(max(left, 0.01), 4)!r}",
+                f"train.usd_per_hour={float(rate)!r}"]
+
     def context_for(self, spec: RunSpec, baseline_losses: list[float] | None) -> RunContext:
         key = self.key(spec)
         run_id = f"ab-{spec.name}-{key[:8]}"
@@ -717,7 +763,8 @@ class Orchestrator:
             self.echo(f"[ab] start {spec.name} ({spec.tokens:,} tokens, attempt {attempt}"
                       f"{resume}, est ${cost:.2f}, spent ${self.guard.spent():.2f})")
             t0 = self.clock()
-            result = dataclasses.replace(self.runner(spec, ctx))   # never mutate the runner's object
+            run_ctx = dataclasses.replace(ctx, overrides=ctx.overrides + self.backstop_overrides())
+            result = dataclasses.replace(self.runner(spec, run_ctx))   # never mutate the runner's object
             wall = self.clock() - t0
             result.attempts = attempt
             result.wall_s = wall
@@ -829,6 +876,20 @@ class Orchestrator:
         self._label(self.key(spec), f"seed re-run of {winner.name}")
         return result
 
+    def _set_shared_noise(self, winner: RunSpec | None, reseed: RunResult | None) -> None:
+        """--shared-noise: the first seed re-run (pair 1's winner) sets the noise every
+        pair uses; if it could not be measured, the noise stays unknown (a win of the
+        other option is then never kept)."""
+        self.noise_measured = True
+        base = self.results.get(self.key(winner)) if winner is not None else None
+        if usable(base) and usable(reseed):
+            self.noise_estimate = abs(base.final_val_loss - reseed.final_val_loss)
+            self.noise_source = f"{winner.name} vs its seed re-run"
+        else:
+            self.noise_estimate = None
+            self.noise_source = (f"{winner.name}'s seed re-run is missing" if winner is not None
+                                 else "pair 1 had no usable arms to re-run")
+
     def _pair(self, pair: Pair, simple: RunSpec, other: RunSpec) -> RunSpec:
         r_simple = self.results.get(self.key(simple))
         if simple.name not in {r["spec"].name for r in self.records}:
@@ -842,10 +903,21 @@ class Orchestrator:
                                  "note": "not run (baseline missing)"})
             self.results.setdefault(self.key(other), None)
         reseed = None
-        if usable(r_simple) and (usable(r_other) or (r_other and r_other.status == "diverged")):
+        shared = self.shared_noise and self.noise_measured
+        if (not shared and usable(r_simple)
+                and (usable(r_other) or (r_other and r_other.status == "diverged"))):
             prelim = "simple" if not usable(r_other) else preliminary(pair.name, r_simple, r_other)[0]
-            reseed = self._seed_rerun(simple if prelim == "simple" else other)
-        d = decide_pair(pair.name, r_simple, r_other, reseed)
+            winner = simple if prelim == "simple" else other
+            reseed = self._seed_rerun(winner)
+            if self.shared_noise:
+                self._set_shared_noise(winner, reseed)
+        if self.shared_noise and not self.noise_measured:
+            self._set_shared_noise(None, None)       # pair 1 could not measure it
+        if shared:
+            d = decide_pair(pair.name, r_simple, r_other, None, shared=True,
+                            shared_noise=self.noise_estimate)
+        else:
+            d = decide_pair(pair.name, r_simple, r_other, reseed)
         kept = simple if d.keep == "simple" else other
         note = ""
         if reseed is not None and d.prelim == "simple":
@@ -898,6 +970,12 @@ class Orchestrator:
         else:
             winner = RunSpec("p1-base", "pair", base, self.arm_tokens)
             self.execute(winner)
+            if self.shared_noise:
+                # No pair 1: the shared noise is the pair-1 baseline's own seed re-run.
+                if usable(self.results.get(self.key(winner))):
+                    self._set_shared_noise(winner, self._seed_rerun(winner))
+                else:
+                    self._set_shared_noise(None, None)
         self.final_settings = dict(winner.settings)
         for pair in PAIRS[1:]:
             if pair.name not in self.pairs:
@@ -939,7 +1017,11 @@ class Orchestrator:
                 runs.append(RunSpec(f"p{pair.number}-{pair.label}", "pair",
                                     {**winner, **self.other_option(pair, best_muon)},
                                     self.arm_tokens))
-        if self.seed_reruns:
+        if self.shared_noise:
+            runs.append(RunSpec(f"p1-winner-seed{seed}", "seed",
+                                {"<pair-1 winner settings>": "", "train.seed": seed},
+                                self.arm_tokens))
+        elif self.seed_reruns:
             for pair in PAIRS:
                 if pair.name in self.pairs:
                     runs.append(RunSpec(
@@ -1007,8 +1089,17 @@ class Orchestrator:
             f"- Box spend: ${g.spent():.2f} ({budget}, ${g.usd_per_hour:.2f}/h{at_start}; "
             f"ledger `{self.ledger.path}`)",
             f"- Pairs: {', '.join(self.pairs)}; seed re-runs "
-            f"{'on' if self.seed_reruns else 'off'}",
+            f"{'on' if self.seed_reruns else 'off'}"
+            + ("; **shared noise (--shared-noise)**" if self.shared_noise else ""),
         ]
+        if self.shared_noise:
+            est = ("unknown" if self.noise_estimate is None else f"{self.noise_estimate:.4f}")
+            lines.append(
+                "- **Noise estimate is shared**: only pair 1's winner was re-run with seed + 1, "
+                f"and its |final val loss difference| ({est}; {self.noise_source or 'not measured yet'}) "
+                "is the noise for every pair. Pairs 2+ had no seed re-run of their own, so their "
+                "noise is borrowed, not measured on their own arms (one seed pair: a rough "
+                "estimate). An unknown noise keeps the simpler option.")
         if self.stopped:
             lines.append(f"- **Stopped early ({self.stopped})**: runs after the refused or "
                          "stopped one were not started; missing arms keep the simpler option.")
@@ -1387,6 +1478,10 @@ class SubprocessRunner:
             last = steps[-1].get("step") if steps else 0
             status, reason = "stopped_budget", (f"the budget was reached mid-run; "
                                                 f"interrupted after step {last}/{ctx.steps}")
+        elif code == TRAIN_BUDGET and not finished:
+            last = steps[-1].get("step") if steps else 0
+            status, reason = "stopped_budget", (f"the trainer's budget backstop stopped it "
+                                                f"after step {last}/{ctx.steps} (exit 4)")
         elif diverged:
             status, reason = "diverged", diverged
         elif finished:
@@ -1418,9 +1513,7 @@ def _popen_kwargs(posix: bool = os.name != "nt") -> dict[str, Any]:
     """A child of its own: a new session on POSIX (a terminal hangup or the
     terminal's Ctrl+C never reaches it; the orchestrator forwards the interrupt),
     a new process group on Windows (CTRL_BREAK reaches it alone)."""
-    if posix:
-        return {"start_new_session": True}
-    return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+    return childproc.popen_kwargs(posix)
 
 
 def _baseline_ref(losses: list[float], step: int) -> float | None:
@@ -1431,7 +1524,7 @@ def _baseline_ref(losses: list[float], step: int) -> float | None:
 
 # ---- stop signals ------------------------------------------------------------------------------
 
-STOP_SIGNALS = ("SIGTERM", "SIGHUP")
+STOP_SIGNALS = childproc.STOP_SIGNALS
 
 
 def _stop_signal_handler(echo: Callable[[str], None] = _echo) -> Callable[[int, Any], None]:
@@ -1440,34 +1533,13 @@ def _stop_signal_handler(echo: Callable[[str], None] = _echo) -> Callable[[int, 
     exit 130). Only the first one raises: a repeat (a hangup followed by a
     supervisor's SIGTERM) must not cut the child's checkpoint short. Ctrl+C still
     escalates, as before."""
-    fired = False
-
-    def stop(signum: int, frame: Any) -> None:
-        nonlocal fired
-        if fired:
-            echo(f"[ab] signal {signum} again; still stopping (waiting for the running "
-                 "child's checkpoint; Ctrl+C escalates)")
-            return
-        fired = True
-        echo(f"[ab] signal {signum}: stopping like Ctrl+C (the running child checkpoints "
-             "first)")
-        raise KeyboardInterrupt
-
-    return stop
+    return childproc.stop_signal_handler(echo, "[ab]")
 
 
 def install_stop_signals(echo: Callable[[str], None] = _echo) -> dict[int, Any]:
     """POSIX, main thread only: SIGTERM and SIGHUP raise KeyboardInterrupt (once).
     Returns the previous handlers."""
-    if os.name == "nt" or threading.current_thread() is not threading.main_thread():
-        return {}
-    handler = _stop_signal_handler(echo)
-    previous: dict[int, Any] = {}
-    for name in STOP_SIGNALS:
-        sig = getattr(signal, name, None)
-        if sig is not None:
-            previous[sig] = signal.signal(sig, handler)
-    return previous
+    return childproc.install_stop_signals(echo, "[ab]")
 
 
 def run_until_stopped(o: "Orchestrator") -> int:
@@ -1507,6 +1579,9 @@ def _print_dry_run(o: Orchestrator, tps: float) -> None:
         print(f"  {i:>2}  {r.phase:<6} {r.name:<24} {r.tokens:>13,}  {flags}")
     print(f"Total: {len(runs)} runs (worst case; seed re-runs shared with an earlier one are "
           f"cached, so as few as {fewest}), {total:,} tokens")
+    if o.shared_noise:
+        print("Noise: --shared-noise: one seed re-run (pair 1's winner); its |val loss "
+              "difference| is the noise of every pair")
     print(f"Estimated time and cost at {tps:,.0f} tokens/s and ${o.guard.usd_per_hour:.2f}/h "
           f"(+{o.guard.overhead_s:.0f} s overhead per run): {hours:.2f} h, ${cost:.2f}")
     spent = o.projected_spent()
@@ -1580,6 +1655,10 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"comma list from {','.join(PAIR_BY_NAME)}")
     p.add_argument("--skip-sweeps", action="store_true", help="use the config's lr and muon_lr")
     p.add_argument("--no-seed-reruns", action="store_true")
+    p.add_argument("--shared-noise", action="store_true",
+                   help="only pair 1's winner gets a seed re-run; its |val loss difference| "
+                        "is the noise of every pair (fewer runs; off by default, the owner "
+                        "has not decided)")
     p.add_argument("--sweep-tokens", type=int, default=SWEEP_TOKENS)
     p.add_argument("--arm-tokens", type=int, default=ARM_TOKENS)
     p.add_argument("--attnres-blocks", type=int, default=ATTNRES_ON)
@@ -1609,7 +1688,8 @@ def main(argv: list[str] | None = None) -> int:
             spent_usd=args.spent_usd, spent_key=args.spent_key, tick_every=TICK_S,
             with_fp8=args.with_fp8, skip_sweeps=args.skip_sweeps,
             pairs=tuple(x.strip() for x in args.pairs.split(",") if x.strip()),
-            seed_reruns=not args.no_seed_reruns, sweep_tokens=args.sweep_tokens,
+            seed_reruns=not args.no_seed_reruns, shared_noise=args.shared_noise,
+            sweep_tokens=args.sweep_tokens,
             arm_tokens=args.arm_tokens, attnres_on=args.attnres_blocks, extra_overrides=extra,
             retry_failed=args.retry_failed, keep_checkpoints=args.keep_checkpoints,
         )
