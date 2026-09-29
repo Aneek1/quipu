@@ -345,6 +345,10 @@ def test_moe_configs_share_the_code_weights_and_pinned_revisions():
         assert d.code_language_weights == full.code_language_weights, path
         assert (d.code_revision, d.text_revision, d.fineweb2_revision) == (
             full.code_revision, full.text_revision, full.fineweb2_revision), path
+        assert d.lid_revision == full.lid_revision, path
+    # The LID model's commit, pinned so every build filters with the same model.
+    assert (full.lid_model, full.lid_revision) == (
+        "AneekC/lid-specialists-9plus1", "117966eb565a5e3c2ee1f1ce7b56848726b56982")
 
 
 def test_dataset_revisions_must_be_strings():

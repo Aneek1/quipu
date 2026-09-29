@@ -31,9 +31,11 @@ bash /workspace/quipu/scripts/remote/setup.sh --cpu-only --branch pipeline-114m
 `--cpu-only` skips every GPU, driver, CUDA and Node step, checks that fastText (the
 LID filter) imports, and runs the shard builder's tests. Safe to re-run.
 
-The trained tokenizer is not in git. From the laptop:
+The trained tokenizer is not in git. Make its directory on the box, then copy it from
+the laptop:
 
 ```bash
+ssh -p PORT root@HOST mkdir -p /workspace/quipu/artifacts/tokenizer
 scp -P PORT artifacts/tokenizer/tokenizer.json root@HOST:/workspace/quipu/artifacts/tokenizer/
 ```
 
@@ -56,6 +58,14 @@ read -rs HF_TOKEN && export HF_TOKEN     # paste, Enter (nothing is echoed)
 
 Everything started from this shell (including `nohup` below) inherits it. After a
 reconnect, set it again before resuming.
+
+In the same shell, turn off huggingface_hub's xet chunk cache: the build reads each
+file once, so the cache would only fill the disk (nothing trims it as files are
+deleted). Set it again after a reconnect, as the token:
+
+```bash
+export HF_XET_CHUNK_CACHE_SIZE_BYTES=0
+```
 
 ## 4. Preflight (minutes, metadata only)
 
@@ -91,20 +101,28 @@ files are downloaded ahead into `data/shards-moe/_work/dl`, each deleted once re
 What it does, in order: loads the tokenizer (its vocabulary must be 49,152) and the
 LID model (so a broken install fails in seconds), the English val split, code (a
 checkpoint after every code file; from the 20th file on it projects the code mix at
-the file cap and stops with an explanation if it cannot be met; the code shares are
-checked again the moment code is collected, before any text is read), English and
-the nine other languages (a checkpoint after each), then train, code_val, val_lang
-and `manifest.json`. On success `_work` is deleted.
+the file cap and stops with an explanation if the projection misses at 5 file ends in
+a row, with 1 pp more room before file 60; the code shares are checked again the
+moment code is collected, before any text is read), English and the nine other
+languages (a checkpoint after every text file), then train, code_val, val_lang and
+`manifest.json`. On success `_work` is deleted. A download or read error that cannot
+succeed on retry (404, no access, a full disk, a corrupt file) stops the build at
+once (exit 1); network blips, 429 and 5xx are retried with backoff (12 attempts,
+about 30 minutes).
 
 **If the box is preempted or the build dies:** start the same command again. It reads
 `data/shards-moe/_work/state.json`, truncates the collected files back to the last
-checkpoint and carries on (at most one code file or one text language is redone).
-The result is byte-identical to an uninterrupted build. Exit codes:
+checkpoint, deletes partial downloads and carries on (at most one code file or one
+text file is redone). The result is byte-identical to an uninterrupted build. Running
+it again after it has finished does nothing ("already built (use --fresh to
+rebuild)", exit 0): a finished build is never rebuilt, or its manifest deleted, by
+accident. Exit codes:
 
 | exit | meaning | what to do |
 |---|---|---|
-| 0 | done | copy the shards (below) |
-| 2 | share error: the mix is off target (`collect_report.json` says why) | decide the weights (or `--train-tokens`), then rerun with `--from-work`: it re-allocates from what was collected, without downloading it again |
+| 0 | done (or already built) | copy the shards (below) |
+| 1 | an unexpected error, including a download error that cannot succeed on retry (the last lines of `build.log` name the file and the error) | fix the cause (token, disk space, revision), then rerun the same command: it resumes |
+| 2 | share error: the mix is off target (`collect_report.json` says why) | after code or text collection: decide the weights (or `--train-tokens`), then rerun with `--from-work`: it re-allocates from what was collected, without downloading it again. From the projection during code collection, the message gives two ways on: `--fresh` with changed weights (the code files read so far are downloaded again), or, if the projection is wrong, the same command with a larger `--projection-min-files` (resumes where it stopped) |
 | 4 | the saved build cannot be resumed with these settings (the message lists the differences) | rerun with the original settings, or `--fresh` to start over (everything is downloaded again) |
 | 5 | a tokenising worker died (out of memory?) | rerun the same command (fewer `--workers` if it was memory) |
 
@@ -122,22 +140,46 @@ find . -type f ! -path './_work/*' ! -name SHA256SUMS -print0 | sort -z \
 wc -l SHA256SUMS; du -sh .
 ```
 
-Then copy the directory, either way:
+Then copy the directory, either way. Never forward the laptop's SSH agent (`ssh -A`)
+to a rented box: anyone with root there could use it to log in wherever your keys
+open.
 
-- **Box to box with SSH agent forwarding** (fastest; the data never passes through the
-  laptop). The laptop's agent must hold the key the GPU box accepts (`ssh-add`). Log
-  in to the CPU box with `-A`, and log out again when the copy is done:
+- **Box to box with a throwaway key** (fastest; the data never passes through the
+  laptop). On the CPU box, make a key that exists only for this copy:
 
   ```bash
-  ssh -A -p CPU_PORT root@CPU_HOST
-  apt-get install -y rsync    # (on both boxes; resumable copy)
-  rsync -a --partial --info=progress2 -e "ssh -p GPU_PORT" \
+  ssh-keygen -t ed25519 -N "" -C shards-copy -f /root/.ssh/shards_copy
+  cat /root/.ssh/shards_copy.pub      # one line: copy it
+  ```
+
+  On the GPU box (your own SSH session from the laptop), allow that key:
+
+  ```bash
+  echo 'PASTE THE ONE LINE HERE' >> /root/.ssh/authorized_keys
+  mkdir -p /workspace/quipu/data
+  ```
+
+  On the CPU box, copy (rsync resumes after a dropped connection; install it on both
+  boxes with `apt-get install -y rsync`):
+
+  ```bash
+  rsync -a --partial --info=progress2 \
+      -e "ssh -i /root/.ssh/shards_copy -o IdentitiesOnly=yes -p GPU_PORT" \
       /workspace/quipu/data/shards-moe/ root@GPU_HOST:/workspace/quipu/data/shards-moe/
   ```
 
-  (without rsync: `scp -P GPU_PORT -r /workspace/quipu/data/shards-moe root@GPU_HOST:/workspace/quipu/data/`)
+  (without rsync: `scp -i /root/.ssh/shards_copy -P GPU_PORT -r /workspace/quipu/data/shards-moe root@GPU_HOST:/workspace/quipu/data/`)
 
-- **Through the laptop** (no agent forwarding; limited by the laptop's connection):
+  When the copy is done, remove the key from both boxes. On the GPU box:
+
+  ```bash
+  sed -i '/ shards-copy$/d' /root/.ssh/authorized_keys
+  grep -c shards-copy /root/.ssh/authorized_keys    # 0
+  ```
+
+  and on the CPU box: `rm -f /root/.ssh/shards_copy /root/.ssh/shards_copy.pub`.
+
+- **Through the laptop** (no key on either box; limited by the laptop's connection):
 
   ```bash
   scp -3 -r scp://root@CPU_HOST:CPU_PORT//workspace/quipu/data/shards-moe \
@@ -154,7 +196,12 @@ root = pathlib.Path("data/shards-moe"); m = json.loads((root / "manifest.json").
 for split in ("val", "train", "code_val"):
     for s in m["splits"][split]["shards"]:
         assert (root / split / s["file"]).stat().st_size == 2 * s["tokens"], (split, s)
-print("shard sizes match the manifest; train", m["splits"]["train"]["tokens"], "tokens")
+for bucket, v in m["splits"]["val_lang"].items():
+    for s in v["shards"]:
+        assert (root / "val_lang" / bucket / s["file"]).stat().st_size == 2 * s["tokens"], (
+            bucket, s)
+print("shard sizes match the manifest; train", m["splits"]["train"]["tokens"], "tokens;",
+      len(m["splits"]["val_lang"]), "val_lang buckets")
 PY
 ```
 

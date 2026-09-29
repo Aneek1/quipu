@@ -228,6 +228,19 @@ class BucketStore:
         return {b: [self.tokens[b], self._docs[b]] for b in sorted(self._docs)
                 if self._docs[b]}
 
+    @staticmethod
+    def verify(directory: Path, snapshot: dict[str, list[int]]) -> None:
+        """Raise ResumeError when a bucket file in `directory` is shorter than
+        `snapshot` says (restore would fail on it); changes nothing on disk."""
+        for bucket, (tokens, documents) in snapshot.items():
+            stem = bucket_stem(bucket)
+            data, ends = Path(directory) / f"{stem}.bin", Path(directory) / f"{stem}.ends"
+            have = (data.stat().st_size if data.exists() else -1,
+                    ends.stat().st_size if ends.exists() else -1)
+            if have[0] < 2 * tokens or have[1] < 8 * documents:
+                raise ResumeError(f"{directory}: bucket {bucket!r} has {have} bytes on disk, "
+                                  f"less than its checkpoint ({2 * tokens}, {8 * documents})")
+
     def restore(self, snapshot: dict[str, list[int]]) -> None:
         """Back to `snapshot` (see the class docstring). Raises ResumeError when a file
         is shorter than the snapshot says (lost or damaged)."""

@@ -119,6 +119,21 @@ def from_file(rows):
     return lambda start=0: iter([r for r in rows if r.get("file", 0) >= start])
 
 
+def text_source(rows):
+    """A text_train source over a list: rows from its start_file-th file on (files in
+    the order the rows give them; rows without "file" are one source, start 0 only)."""
+    def src(start=0):
+        if not start:
+            return iter(rows)
+        files = []
+        for r in rows:
+            if r["file"] not in files:
+                files.append(r["file"])
+        keep = set(files[start:])
+        return iter([r for r in rows if r["file"] in keep])
+    return src
+
+
 def world(*, lid=False, code_n=12_000, code_freq=CODE_FREQ, text_n=None, seed=0,
           code_val_extra=()):
     tag = std_tag if lid else (lambda lang: None)
@@ -134,7 +149,7 @@ def world(*, lid=False, code_n=12_000, code_freq=CODE_FREQ, text_n=None, seed=0,
     return bs.MixSources(
         code_train=from_file(code_train),
         code_val=lambda: iter(code_val),
-        text_train={k: (lambda v=v: iter(v)) for k, v in train.items()},
+        text_train={k: text_source(v) for k, v in train.items()},
         text_val={k: (lambda v=v: iter(v)) for k, v in val.items()})
 
 
@@ -620,7 +635,7 @@ def test_real_tokenizer_build_round_trips_multilingual_documents(tmp_path):
              "path": f"m{i}.py"} for i in range(9000) for lang in [list(CODE_W)[i % 14]]]
     src = bs.MixSources(
         code_train=from_file(code[:8000]), code_val=lambda: iter(code[8000:]),
-        text_train={x: (lambda x=x: iter(rows(x, 800))) for x in TEXT_W},
+        text_train={x: text_source(rows(x, 800)) for x in TEXT_W},
         text_val={x: (lambda x=x: iter(rows(x, 100, 10**6))) for x in TEXT_W})
     s = sm.DocSetup(tokenizer=factory, max_doc_tokens=2_000)
     m = bs.build_mix(tmp_path, spec(train_tokens=20_000, val_tokens=500, code_val_tokens=500,
@@ -769,9 +784,10 @@ def crash_rows_after(source, n):
     """A text source that dies (once) after n rows; counts its calls."""
     log = {"calls": 0, "armed": True}
 
-    def src():
+    def src(*a):
         log["calls"] += 1
-        for i, r in enumerate(source()):
+        log.setdefault("starts", []).append(a[0] if a else 0)
+        for i, r in enumerate(source(*a)):
             if log["armed"] and i == n:
                 log["armed"] = False
                 raise Crash(f"killed after {n} rows")
@@ -932,8 +948,11 @@ def test_projection_stops_a_hopeless_code_collection_early(tmp_path):
     with pytest.raises(sm.ShareError, match=r"(?s)projected.*Python") as exc:
         bs.build_mix(tmp_path, spec(train_tokens=400_000, window=300, stall_windows=5,
                                     code_files=40, projection_min_files=4), src, setup())
-    assert "file 4 of 40" in str(exc.value)
-    assert max(read) <= 5  # stopped after about 4 of 40 files, not at the cap
+    # Off target from file 4 on; the stop needs 5 file ends in a row: 4, 5, 6, 7, 8.
+    assert "file 8 of 40" in str(exc.value)
+    assert max(read) <= 9  # stopped after about 8 of 40 files, not at the cap
+    msg = str(exc.value)
+    assert "--fresh" in msg and "--projection-min-files" in msg and "8 files" in msg
 
 
 def test_projection_is_quiet_when_the_files_suffice(reference_build):
@@ -1105,7 +1124,7 @@ def test_heavy_lid_loss_in_a_languages_first_file_is_a_warning(tmp_path, capsys)
                      "zsm_Latn:0.95")
     for i, r in enumerate(rows):
         r["file"] = f"zsm/{i // 20}.parquet"
-    src.text_train["zsm_Latn"] = lambda: iter(rows)
+    src.text_train["zsm_Latn"] = text_source(rows)
     m = bs.build_mix(tmp_path, spec(), src, setup(lid=True))
     warn = m["text"]["by_language"]["zsm_Latn"]["lid_warning"]
     assert "zsm_Latn" in warn and "50%" in warn
@@ -1181,3 +1200,278 @@ def fake_hub(monkeypatch, lid_path=None):
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
     monkeypatch.syspath_prepend(str(ROOT / "scripts"))
     return calls
+
+
+# ------------------------------------------------------------------ re-review fixes (M7)
+
+def _http_error(cls, status):
+    import httpx
+    from huggingface_hub import errors
+
+    req = httpx.Request("GET", "https://huggingface.co/datasets/x")
+    return getattr(errors, cls)(f"{status} error", response=httpx.Response(status, request=req))
+
+
+def _classifier_cases():
+    import errno
+
+    import httpx
+    import pyarrow as pa
+    from huggingface_hub import errors
+
+    req = httpx.Request("GET", "https://huggingface.co/x")
+    return [
+        ("RepositoryNotFoundError", lambda: _http_error("RepositoryNotFoundError", 401), True),
+        ("RevisionNotFoundError", lambda: _http_error("RevisionNotFoundError", 404), True),
+        ("RemoteEntryNotFoundError", lambda: _http_error("RemoteEntryNotFoundError", 404), True),
+        ("EntryNotFoundError", lambda: errors.EntryNotFoundError("no such file"), True),
+        ("GatedRepoError", lambda: _http_error("GatedRepoError", 403), True),
+        ("HfHubHTTPError 401", lambda: _http_error("HfHubHTTPError", 401), True),
+        ("HfHubHTTPError 403", lambda: _http_error("HfHubHTTPError", 403), True),
+        ("HfHubHTTPError 404", lambda: _http_error("HfHubHTTPError", 404), True),
+        ("FileNotFoundError", lambda: FileNotFoundError("gone"), True),
+        ("PermissionError", lambda: PermissionError("denied"), True),
+        ("ENOSPC", lambda: OSError(errno.ENOSPC, "No space left on device"), True),
+        ("ArrowInvalid", lambda: pa.lib.ArrowInvalid("Parquet magic bytes not found"), True),
+        ("HfHubHTTPError 429", lambda: _http_error("HfHubHTTPError", 429), False),
+        ("HfHubHTTPError 500", lambda: _http_error("HfHubHTTPError", 500), False),
+        ("HfHubHTTPError 503", lambda: _http_error("HfHubHTTPError", 503), False),
+        ("TimeoutError", lambda: TimeoutError("read timed out"), False),
+        ("ConnectionError", lambda: ConnectionResetError("reset by peer"), False),
+        ("httpx.ConnectTimeout", lambda: httpx.ConnectTimeout("timeout", request=req), False),
+        ("httpx.ReadError", lambda: httpx.ReadError("read", request=req), False),
+        ("OSError blip", lambda: OSError("network blip"), False),
+        # hf_hub_download's "no connection and nothing cached": a connection error.
+        ("LocalEntryNotFoundError", lambda: errors.LocalEntryNotFoundError("offline"), False),
+        ("TransientError", lambda: bs.TransientError("truncated download"), False),
+    ]
+
+
+@pytest.mark.parametrize("name, make, permanent", _classifier_cases(),
+                         ids=[c[0] for c in _classifier_cases()])
+def test_download_errors_are_classified_permanent_or_transient(name, make, permanent):
+    assert bs.is_permanent(make()) is permanent, name
+
+
+def test_a_404_download_fails_at_once_without_sleeping():
+    slept, calls = [], []
+
+    def fetch(i):
+        calls.append(i)
+        raise _http_error("HfHubHTTPError", 404)
+    t0 = time.monotonic()
+    it = bs.fetch_ahead([0], fetch, 1, sleep=slept.append)
+    with pytest.raises(RuntimeError, match="cannot succeed"):
+        next(it)
+    assert calls == [0] and slept == []
+    assert time.monotonic() - t0 < 1
+
+
+class _FailingFS:
+    def __init__(self, exc, then=None):
+        self.exc, self.then, self.opens = exc, then, 0
+
+    def open(self, path, mode="rb", **kw):
+        self.opens += 1
+        if self.then is not None and self.opens > 1:
+            return open(self.then, mode)
+        raise self.exc
+
+
+def test_text_reader_fails_at_once_on_a_missing_file_and_makes_12_attempts_on_a_blip():
+    slept = []
+    fs = _FailingFS(FileNotFoundError("gone"))
+    with pytest.raises(FileNotFoundError):
+        list(bs.iter_text_files(fs, ["x.parquet"], sleep=slept.append))
+    assert fs.opens == 1 and slept == []
+    fs = _FailingFS(OSError("network blip"))
+    with pytest.raises(OSError, match="blip"):
+        list(bs.iter_text_files(fs, ["x.parquet"], sleep=slept.append))
+    assert fs.opens == bs.DOWNLOAD_ATTEMPTS == 12 and len(slept) == 11
+
+
+def test_preflight_read_fails_at_once_on_403_and_retries_a_timeout(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.Table.from_pylist([{"language": "Python", "license": "mit", "size": 100,
+                                   "path": "a.py"}])
+    pq.write_table(table, tmp_path / "f.parquet")
+    slept = []
+    fs = _FailingFS(_http_error("HfHubHTTPError", 403))
+    with pytest.raises(Exception, match="403"):
+        bs.read_code_file_counts(fs, "x", ["Python"], ["mit"], 1e6, sleep=slept.append)
+    assert fs.opens == 1 and slept == []
+    fs = _FailingFS(TimeoutError("slow"), then=tmp_path / "f.parquet")
+    got = bs.read_code_file_counts(fs, "x", ["Python"], ["mit"], 1e6, sleep=slept.append)
+    assert got == {"Python": 100.0} and fs.opens == 2 and slept == [5]
+
+
+def test_a_truncated_code_download_is_transient_and_deleted(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    def download(repo, filename, **kw):
+        p = Path(kw["local_dir"]) / filename
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"PAR1 truncated")
+        return str(p)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    fetch = bs.hf_code_fetcher("r", "0" * 40, 880, tmp_path)
+    with pytest.raises(bs.TransientError):
+        fetch(3)
+    assert not list(tmp_path.rglob("*.parquet"))
+
+
+def test_download_threads_are_daemons_so_a_failed_build_exits(tmp_path):
+    release = threading.Event()
+
+    def fetch(i):
+        if i == 0:
+            raise _http_error("HfHubHTTPError", 404)
+        release.wait(10)  # a download that hangs
+        p = tmp_path / f"{i}.parquet"
+        p.write_bytes(b"x")
+        return p
+    it = bs.fetch_ahead([0, 1, 2], fetch, 3, sleep=lambda s: None)
+    with pytest.raises(RuntimeError):
+        next(it)
+    it.close()
+    workers = [t for t in threading.enumerate() if t.name.startswith("download")]
+    assert workers and all(t.daemon for t in workers)
+    release.set()
+    for t in workers:
+        t.join(5)
+    assert not list(tmp_path.glob("*.parquet"))  # finished late: deleted
+
+
+def _no_sources(src):
+    def refuse(*a):
+        raise AssertionError("a finished build must not read any source")
+    return src._replace(code_train=refuse, code_val=refuse,
+                        text_train={x: refuse for x in src.text_train},
+                        text_val={x: refuse for x in src.text_val})
+
+
+def test_rerunning_a_finished_build_is_a_no_op(tmp_path, reference_build, capsys):
+    import shutil
+
+    ref_root, ref = reference_build
+    root = tmp_path / "done"
+    shutil.copytree(ref_root, root)
+    before = (root / "manifest.json").read_bytes()
+    capsys.readouterr()
+    m = bs.build_mix(root, spec(**RESUME_SPEC), _no_sources(world(lid=True)), setup(lid=True))
+    assert m == ref
+    assert (root / "manifest.json").read_bytes() == before
+    assert "already built" in capsys.readouterr().out
+    with pytest.raises(sm.ResumeError, match="--fresh"):
+        bs.build_mix(root, spec(**RESUME_SPEC), _no_sources(world(lid=True)), setup(lid=True),
+                     from_work=True)
+    assert (root / "manifest.json").read_bytes() == before
+    same_output(ref_root, root)
+
+
+def test_a_crash_while_deleting_work_leaves_a_finished_build(tmp_path, monkeypatch,
+                                                             reference_build):
+    import shutil
+
+    ref_root, _ = reference_build
+    real = shutil.rmtree
+
+    def crashing_rmtree(path, *a, **kw):
+        if Path(path).name == bs.MIX_WORK:
+            for p in (Path(path) / "code").glob("*.bin"):
+                p.unlink()
+            raise Crash("killed while deleting _work")
+        return real(path, *a, **kw)
+    monkeypatch.setattr(shutil, "rmtree", crashing_rmtree)
+    with pytest.raises(Crash):
+        bs.build_mix(tmp_path, spec(**RESUME_SPEC), world(lid=True), setup(lid=True))
+    monkeypatch.setattr(shutil, "rmtree", real)
+    before = (tmp_path / "manifest.json").read_bytes()
+    bs.build_mix(tmp_path, spec(**RESUME_SPEC), _no_sources(world(lid=True)), setup(lid=True))
+    assert (tmp_path / "manifest.json").read_bytes() == before
+    same_output(ref_root, tmp_path)
+
+
+def test_damaged_work_next_to_a_manifest_is_an_error_that_keeps_the_manifest(tmp_path):
+    bs.build_mix(tmp_path, spec(keep_work=True, **RESUME_SPEC), world(lid=True),
+                 setup(lid=True))
+    before = (tmp_path / "manifest.json").read_bytes()
+    # A finished build kept with --keep-work is a no-op to rerun.
+    bs.build_mix(tmp_path, spec(keep_work=True, **RESUME_SPEC), _no_sources(world(lid=True)),
+                 setup(lid=True))
+    # state.json there but not marked finished (a crash before the mark), buckets gone.
+    st = _state(tmp_path)
+    st.pop("finished", None)
+    (tmp_path / bs.MIX_WORK / bs.STATE).write_text(json.dumps(st), encoding="utf-8")
+    for p in (tmp_path / bs.MIX_WORK / "code").glob("*.bin"):
+        p.unlink()
+    with pytest.raises(sm.ResumeError, match="manifest"):
+        bs.build_mix(tmp_path, spec(**RESUME_SPEC), _no_sources(world(lid=True)),
+                     setup(lid=True))
+    assert (tmp_path / "manifest.json").read_bytes() == before
+
+
+def test_a_resumed_build_sweeps_partial_downloads(tmp_path):
+    src = world(lid=True)
+    code, _ = crash_code_at(src.code_train, at_file=3)
+    s = spec(keep_work=True, **RESUME_SPEC)
+    with pytest.raises(Crash):
+        bs.build_mix(tmp_path, s, src._replace(code_train=code), setup(lid=True))
+    part = tmp_path / bs.MIX_WORK / "dl" / ".cache" / "huggingface" / "download" / "data"
+    part.mkdir(parents=True)
+    (part / "train-00003-of-00880.parquet.abc.incomplete").write_bytes(b"x" * 100)
+    bs.build_mix(tmp_path, s, src, setup(lid=True))
+    assert not list((tmp_path / bs.MIX_WORK).rglob("*.incomplete"))
+
+
+def test_projection_margin_is_wider_before_file_60():
+    assert bs.projection_max_off(20) == pytest.approx(bs.SHARE_CHECK_MAX_OFF + 0.01)
+    assert bs.projection_max_off(59) == pytest.approx(bs.SHARE_CHECK_MAX_OFF + 0.01)
+    assert bs.projection_max_off(60) == pytest.approx(bs.SHARE_CHECK_MAX_OFF)
+    assert bs.PROJECTION_STREAK == 5
+
+
+def test_noisy_early_projection_does_not_stop_the_build(tmp_path, monkeypatch):
+    """Python is missing from the first files, so the first projections are off
+    target; it is common later. A single bad projection must not stop the build."""
+    rows = code_rows(12_000)
+    for r in rows:
+        if r["file"] < 3 and r["language"] == "Python":
+            r["language"] = "Java"
+    src = world()._replace(code_train=from_file(rows))
+    # stall_windows high enough that Python's absence is not a stall (7.5 windows).
+    s = spec(code_files=24, projection_min_files=2, stall_windows=20)
+    m = bs.build_mix(tmp_path / "a", s, src, setup())
+    assert m["share_check"]["violations"] == []
+    monkeypatch.setattr(bs, "PROJECTION_STREAK", 1)  # the old rule: stop at the first
+    monkeypatch.setattr(bs, "PROJECTION_EARLY_MARGIN", 0.0)
+    with pytest.raises(sm.ShareError, match="projected"):
+        bs.build_mix(tmp_path / "b", s, src, setup())
+
+
+def eng_files_world():
+    src = world(lid=True)
+    rows = text_rows("eng_Latn", 1200, 0, std_tag("eng_Latn"))
+    for i, r in enumerate(rows):
+        r["file"] = f"eng/{i // 40:03d}.parquet"
+    src.text_train["eng_Latn"] = text_source(rows)
+    return src
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_a_build_killed_inside_english_resumes_from_its_next_file(tmp_path, workers):
+    s = spec(workers=workers, **RESUME_SPEC)
+    ref = bs.build_mix(tmp_path / "ref", s, eng_files_world(), setup(lid=True))
+    src = eng_files_world()
+    eng, log = crash_rows_after(src.text_train["eng_Latn"], 300)
+    src.text_train["eng_Latn"] = eng
+    with pytest.raises(Crash):
+        bs.build_mix(tmp_path / "b", s, src, setup(lid=True))
+    partial = _state(tmp_path / "b")["phases"]["text"]["partial"]
+    assert partial["lang"] == "eng_Latn" and partial["files"] >= 2
+    m = bs.build_mix(tmp_path / "b", s, src, setup(lid=True))
+    assert log["starts"] == [0, partial["files"]]
+    same_output(tmp_path / "ref", tmp_path / "b")
+    assert _strip(m) == _strip(ref)

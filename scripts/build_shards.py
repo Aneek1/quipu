@@ -43,6 +43,7 @@ Run: uv run python scripts/build_shards.py --config configs/quipu-moe.toml \
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -666,8 +667,10 @@ def build_all(root: Path, stream: Iterable[dict], *, val_tokens: int, train_toke
 # Failing early (the box bills by the hour): --preflight reads only the code files'
 # language/licence/size/path columns and says whether the files can give the code
 # mix at all; during the build the code mix is projected at every code file from
-# the 20th (what each language holds plus its rate so far, at the file cap) and the
-# code shares are checked the moment code collection ends, before any text is read.
+# the 20th (what each language holds plus its rate so far, at the file cap; the build
+# stops when it misses at PROJECTION_STREAK file ends in a row) and the code shares
+# are checked the moment code collection ends, before any text is read. A download
+# or read error that no retry can fix (is_permanent) fails at once.
 #
 # Resume: <shard_dir>/_work/state.json (written atomically) records a fingerprint of
 # everything that shapes the collected data (tokenizer and LID hashes, the LID
@@ -675,11 +678,15 @@ def build_all(root: Path, stream: Iterable[dict], *, val_tokens: int, train_toke
 # weights) and a checkpoint per phase: the English val (done), code (after every
 # code file, in decision order: bucket files fsynced and their lengths, the
 # collector, the stats, the hash count and the next file) and text (after every
-# language). A rerun of the same command truncates the bucket files back to the
-# checkpoint and carries on from there, so a preempted box loses at most one code
-# file or one text language, and the shards are byte-identical to an uninterrupted
+# file of every language, and when a language is done). A rerun of the same command
+# checks the saved files, deletes partial downloads, truncates the bucket files back
+# to the checkpoint and carries on from there, so a preempted box loses at most one
+# code file or one text file, and the shards are byte-identical to an uninterrupted
 # build. A different fingerprint is refused (--fresh starts over); --from-work
 # accepts changed weights / token target and re-allocates from what was collected.
+# The old manifest.json is deleted only once the saved build has been accepted. A
+# finished build (manifest.json and no state.json; the cleanup deletes state.json
+# before the rest of _work) is left alone: rerunning it prints "already built".
 #
 # Held out, as for the tokenizer and its gate: val = the last sample-10BT file
 # (English, the trainer's loss); val_lang/<bucket> = FineWeb-2's test split; code_val
@@ -695,8 +702,15 @@ PREFLIGHT_REPORT = "preflight.json"
 SHARE_CHECK_MIN_WEIGHT = 0.05
 SHARE_CHECK_MAX_OFF = 0.02
 PROJECTION_MIN_FILES = 20
+# The projection is noisy over the first files (a language can be clustered), so it
+# stops the build only when it has missed on PROJECTION_STREAK file ends in a row, and
+# before file PROJECTION_EARLY_FILES it allows PROJECTION_EARLY_MARGIN more than the
+# final check's SHARE_CHECK_MAX_OFF.
+PROJECTION_STREAK = 5
+PROJECTION_EARLY_FILES = 60
+PROJECTION_EARLY_MARGIN = 0.01
 LID_WARN_DROP = 0.40         # warn when LID drops more than this of a language's first file
-DOWNLOAD_ATTEMPTS = 12
+DOWNLOAD_ATTEMPTS = 12       # attempts in all (the first + 11 retries)
 BACKOFF_CAP_S = 300
 DOWNLOAD_WORKERS = 6
 
@@ -704,6 +718,82 @@ DOWNLOAD_WORKERS = 6
 def retry_wait(attempt: int) -> float:
     """Seconds to wait after failed attempt `attempt` (1-based): 5, 10, 20, ... <= 300."""
     return min(BACKOFF_CAP_S, 5 * 2 ** (attempt - 1))
+
+
+def projection_max_off(files_read: int) -> float:
+    """How far off (share of code) a projected language may be after files_read files."""
+    early = PROJECTION_EARLY_MARGIN if files_read < PROJECTION_EARLY_FILES else 0.0
+    return SHARE_CHECK_MAX_OFF + early
+
+
+class TransientError(RuntimeError):
+    """A read or download failure that a retry can fix (e.g. a truncated download)."""
+
+
+def is_permanent(exc: BaseException) -> bool:
+    """True when retrying the download or read that raised `exc` cannot help, so it
+    fails at once instead of backing off for ~30 minutes: the repo, revision or file
+    does not exist or is not ours to read (Hub 401/403/404 and their named errors), a
+    local file is missing, unreadable or corrupt (FileNotFoundError, PermissionError,
+    pyarrow ArrowInvalid), the disk is full (ENOSPC), or a programming error.
+
+    Retried (False): timeouts, connection errors, HTTP 408/429/5xx, TransientError,
+    huggingface_hub's LocalEntryNotFoundError (what hf_hub_download raises when the
+    connection fails and nothing is cached), other OSErrors (the network stack's
+    failures are OSErrors) and anything unrecognised: an unattended build would rather
+    back off than stop on an error it cannot name.
+    """
+    if isinstance(exc, TransientError):
+        return False
+    try:
+        from huggingface_hub import errors as hub
+    except ImportError:  # pragma: no cover - huggingface_hub is a dependency
+        hub = None
+    if hub is not None:
+        if isinstance(exc, hub.LocalEntryNotFoundError):
+            return False
+        if isinstance(exc, (hub.RepositoryNotFoundError, hub.RevisionNotFoundError,
+                            hub.EntryNotFoundError, hub.GatedRepoError)):
+            return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):  # HfHubHTTPError, httpx / requests HTTP status errors
+        return not (status in (408, 429) or status >= 500)
+    if isinstance(exc, (FileNotFoundError, PermissionError, IsADirectoryError,
+                        NotADirectoryError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC))
+    # pyarrow.ArrowInvalid is a ValueError: a corrupt or unreadable parquet file.
+    return isinstance(exc, (ValueError, TypeError, KeyError, AttributeError, AssertionError,
+                            NotImplementedError, ImportError, MemoryError))
+
+
+def backoff(exc: BaseException, attempt: int, attempts: int, what: str,
+            sleep: Callable[[float], None] = time.sleep) -> bool:
+    """After failed attempt `attempt` (1-based) of `attempts`: False when the caller
+    should give up and raise (a permanent error, or the last attempt); otherwise
+    prints the error, waits retry_wait(attempt) and returns True."""
+    if is_permanent(exc):
+        print(f"\n{what} failed and cannot succeed on retry: {exc!r}", file=sys.stderr,
+              flush=True)
+        return False
+    if attempt >= attempts:
+        return False
+    wait = retry_wait(attempt)
+    print(f"\n{what} failed: {exc!r}; retry {attempt}/{attempts - 1} in {wait}s",
+          file=sys.stderr, flush=True)
+    sleep(wait)
+    return True
+
+
+def sweep_incomplete(directory: Path) -> int:
+    """Delete the partial downloads (*.incomplete, huggingface_hub's temp files) a
+    killed build left under `directory`; returns how many."""
+    n = 0
+    for p in sorted(Path(directory).rglob("*.incomplete")) if Path(directory).exists() else ():
+        p.unlink(missing_ok=True)
+        n += 1
+    return n
 
 
 class MixSpec(NamedTuple):
@@ -743,13 +833,15 @@ class MixSources(NamedTuple):
     to the next row it yields, as row[FILTERED] = {"rows_scanned": n, ...}, and ends
     every file with a marker row {FILE_END: index, FILTERED: {...}} (what the file's
     last row groups dropped); without markers, a change of "file" ends a file.
-    code_val(): the held-out code rows. text_train / text_val: language -> rows
-    {"text"[, "file"]}. Every *_val source must yield held-out rows only, never rows
-    its train source can reach.
+    code_val(): the held-out code rows. text_train: language -> rows(start_file)
+    {"text"[, "file"]}, the language's rows from its start_file-th source file on (a
+    resumed build passes the files it has read; a source without "file" is only ever
+    called with 0). text_val: language -> rows(). Every *_val source must yield
+    held-out rows only, never rows its train source can reach.
     """
     code_train: Callable[[int], Iterable[dict]]
     code_val: Callable[[], Iterable[dict]]
-    text_train: dict[str, Callable[[], Iterable[dict]]]
+    text_train: dict[str, Callable[[int], Iterable[dict]]]
     text_val: dict[str, Callable[[], Iterable[dict]]]
 
 
@@ -912,6 +1004,15 @@ class LidWatch:
         self.language, self.stats = language, stats
         self.checked = False
         self.warning: str | None = None
+
+    def state(self) -> dict[str, Any]:
+        return {"checked": self.checked, "warning": self.warning}
+
+    @classmethod
+    def from_state(cls, language: str, stats: Counter, state: dict[str, Any]) -> "LidWatch":
+        watch = cls(language, stats)
+        watch.checked, watch.warning = bool(state["checked"]), state["warning"]
+        return watch
 
     def on_mark(self, meta: dict) -> None:
         if not self.checked:
@@ -1082,6 +1183,29 @@ class HashLog:
         self._f.close()
 
 
+def _verify_work(work: Path, state: BuildState, manifest: Path) -> None:
+    """Check, before anything is truncated or deleted, that every checkpointed file
+    in `work` is still there and long enough; a damaged _work is a ResumeError that
+    leaves the shards and any manifest.json untouched."""
+    try:
+        for name in ("val", "code", "text"):
+            ph = state.phase(name)
+            if ph and ph.get("store"):
+                sm.BucketStore.verify(work / name, ph["store"])
+        code = state.phase("code")
+        if code and code.get("hashes"):
+            path = work / HASHES
+            size = path.stat().st_size if path.exists() else -1
+            if size < 8 * code["hashes"]:
+                raise sm.ResumeError(f"{path} holds {size} bytes, less than its "
+                                     f"checkpoint's {code['hashes']} hashes")
+    except sm.ResumeError as exc:
+        kept = (f"; {manifest} and the shards are untouched: if that build had finished, "
+                f"delete {work} and use them" if manifest.exists() else "")
+        raise sm.ResumeError(f"the saved build in {work} is damaged ({exc}){kept}; "
+                             "otherwise rerun with --fresh") from exc
+
+
 # ------------------------------------------------------------------ build phases
 
 def _val_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Path,
@@ -1132,32 +1256,55 @@ def _code_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Pat
         stats, start = Counter(), 0
         log = HashLog(work / HASHES, 0)
 
+    # File ends in a row at which the projection missed (saved with each checkpoint,
+    # so a resumed build stops exactly where an uninterrupted one would).
+    streak = int(ph.get("projection_streak", 0)) if ph else 0
+
     def checkpoint(next_file: int | None, done: bool) -> None:
         snap = store.snapshot()
         log.sync()
         state.set_phase("code", {"done": done, "next_file": next_file, "store": snap,
                                  "collector": col.snapshot(), "stats": stats,
-                                 "hashes": log.count})
+                                 "hashes": log.count, "projection_streak": streak})
 
     def project(files_read: int) -> None:
+        """Stop the build when the code mix projected at the file cap has missed its
+        target (by more than projection_max_off) at PROJECTION_STREAK file ends in a
+        row. The projection only decides whether the build stops, never which
+        documents are collected, so --projection-min-files is not in the resume
+        fingerprint: a stopped build can be resumed with a later (or no) projection."""
+        nonlocal streak
         files = spec.code_files
         if files is None or files_read < spec.projection_min_files or files_read >= files:
             return
         violations, avail = sm.projection_violations(
             col, files_read, files, min_weight=SHARE_CHECK_MIN_WEIGHT,
-            max_off=SHARE_CHECK_MAX_OFF)
+            max_off=projection_max_off(files_read))
         if not violations:
+            streak = 0
+            return
+        streak += 1
+        if streak < PROJECTION_STREAK:
             return
         write_manifest(report, {"stage": f"code projection after file {files_read} of {files}",
                                 "violations": violations,
                                 "projected_available_tokens": avail,
+                                "missed_file_ends_in_a_row": streak,
                                 "collection": col.summary(), "stats": _plain(stats)})
         raise sm.ShareError(
-            f"code: after file {files_read} of {files}, the projected mix at the file cap "
-            f"misses its target, so the build stops now rather than read {files - files_read} "
-            "more files:\n  " + "\n  ".join(violations)
-            + f"\n(projected: what each language holds plus its rate so far; see {report}. "
-              "Lower that language's weight, or run --preflight.)")
+            f"code: after file {files_read} of {files}, the mix projected at the file cap "
+            f"has missed its target at {streak} file ends in a row, so the build stops now "
+            f"rather than read {files - files_read} more files:\n  " + "\n  ".join(violations)
+            + f"\n(projected: what each language holds plus its rate so far; see {report}.) "
+              "Two ways on:\n"
+              "  - the mix cannot be met: change the weights in the config and rerun with "
+              f"--fresh (the code read so far, about {files_read} files, is downloaded "
+              "again: changed weights cannot resume a code collection); --preflight shows "
+              "what the files hold;\n"
+              "  - the projection is wrong (a language clustered in later files): rerun the "
+              f"same command with --projection-min-files N, N > {files_read} (N >= {files} "
+              f"turns it off); the build resumes after file {files_read}, and the share "
+              "check after code collection still applies.")
 
     def on_mark(meta: dict) -> None:
         files_read = int(meta["file_done"]) + 1
@@ -1180,9 +1327,12 @@ def _text_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Pat
                 others: dict[str, float], order: list[str]
                 ) -> tuple[dict[str, tuple[sm.Collector, Counter]], dict[str, str],
                            sm.BucketStore]:
-    """English, then the other languages in order; each checkpointed when done. An
-    unfinished language is redone from its start after truncating its buckets."""
+    """English, then the other languages in order; each checkpointed at every end of
+    one of its source files (ph["partial"]: the files read, the collector, the stats,
+    the LID warning state) and when done. A resumed language restarts at the file
+    after its checkpoint, so a crash loses at most one text file."""
     ph = state.phase("text") or {"done": [], "store": {}, "langs": {}}
+    ph.setdefault("partial", None)
     store = sm.BucketStore(work / "text", fresh=False)
     store.restore(ph["store"])
     cols: dict[str, tuple[sm.Collector, Counter]] = {}
@@ -1203,11 +1353,34 @@ def _text_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Pat
             held = {x: float(sum(cols[x][0].taken.values())) for x in order if x in cols}
             now, _ = sm.allocate(group_total, others, held)
             total, slack = now[lang], spec.slack
-        stats: Counter = Counter()
-        watch = LidWatch(lang, stats) if lid else None
-        col, _ = _collect_text(runner, sources.text_train[lang](), lang, total, store, spec,
-                               lid=lid, slack=slack, stats=stats,
-                               on_mark=watch.on_mark if watch else None)
+        partial = ph["partial"] if (ph["partial"] or {}).get("lang") == lang else None
+        if partial is not None:
+            col = sm.Collector.from_snapshot(partial["collector"], store)
+            stats: Counter = Counter(partial["stats"])
+            files = int(partial["files"])
+            watch = LidWatch.from_state(lang, stats, partial["lid"]) if lid else None
+            print(f"{lang}: resuming at its file {files} "
+                  f"({sum(col.taken.values()):,} tokens held)", flush=True)
+        else:
+            col = sm.Collector(text_buckets(lang, lid), total, slack=slack, window=spec.window,
+                               stall_windows=spec.stall_windows, stall_gain=spec.stall_gain,
+                               store=store)
+            stats, files = Counter(), 0
+            watch = LidWatch(lang, stats) if lid else None
+
+        def on_mark(meta: dict, lang: str = lang, col: sm.Collector = col,
+                    stats: Counter = stats, watch: LidWatch | None = watch) -> None:
+            nonlocal files
+            if watch is not None:
+                watch.on_mark(meta)
+            files += 1
+            ph["partial"] = {"lang": lang, "files": files, "collector": col.snapshot(),
+                             "stats": stats, "lid": watch.state() if watch else None}
+            ph["store"] = store.snapshot()
+            state.set_phase("text", ph)
+
+        runner.collect(text_offers(sources.text_train[lang](files), lang), col, stats,
+                       on_mark=on_mark)
         warning = watch.finish() if watch else None
         if warning:
             warnings[lang] = warning
@@ -1215,6 +1388,7 @@ def _text_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Pat
         ph["langs"][lang] = {"collector": col.snapshot(), "stats": stats,
                              "lid_warning": warning}
         ph["done"].append(lang)
+        ph["partial"] = None
         ph["store"] = store.snapshot()
         state.set_phase("text", ph)
         print(f"{lang}: {sum(col.taken.values()):,} tokens (target {total:,.0f})", flush=True)
@@ -1236,11 +1410,20 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    (root / MANIFEST).unlink(missing_ok=True)
-    (root / COLLECT_REPORT).unlink(missing_ok=True)
     provenance = provenance or {}
     started, t0 = _now(), time.monotonic()
     work = root / MIX_WORK
+    manifest_path = root / MANIFEST
+    if manifest_path.exists() and not fresh and not (work / STATE).exists():
+        # A finished build (its cleanup deletes state.json before anything else, so a
+        # crash part way through it lands here too). Never rebuild it by accident.
+        if from_work:
+            raise sm.ResumeError(f"{root} is a finished build and its _work is gone, so "
+                                 "--from-work has nothing to re-allocate from; rerun with "
+                                 "--fresh to build it again (everything is read again)")
+        shutil.rmtree(work, ignore_errors=True)  # what a crashed cleanup left
+        print(f"{root} is already built (use --fresh to rebuild)", flush=True)
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
     lid = setup.lid is not None
     cw = dict(spec.code_weights)
     tw = dict(spec.text_weights) or {sm.ENGLISH: 1.0}
@@ -1260,6 +1443,23 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
     caps = {"HTML": spec.html_cap}
     state = BuildState(work, mix_fingerprint(spec, setup, provenance), fresh=fresh,
                        from_work=from_work)
+    if (state.data.get("finished") and not state.mix_changed and not from_work
+            and manifest_path.exists()):
+        print(f"{root} is already built (its _work was kept; use --fresh to rebuild)",
+              flush=True)
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    if state.resumed:
+        _verify_work(work, state, manifest_path)
+        swept = sweep_incomplete(work / "dl")
+        if swept:
+            print(f"deleted {swept} partial download(s) left in {work / 'dl'}", flush=True)
+    # Only now, with the saved build accepted and intact, may the old manifest go: it
+    # must not survive to describe the shards about to be rewritten.
+    manifest_path.unlink(missing_ok=True)
+    (root / COLLECT_REPORT).unlink(missing_ok=True)
+    if state.data.get("finished"):
+        state.data["finished"] = False
+        state.save()
     resume: dict[str, Any] = {"resumed": state.resumed, "from_work": from_work,
                               "mix_changed": state.mix_changed, "code_from_file": None}
     if state.resumed:
@@ -1518,7 +1718,13 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
     if final_violations:  # keep _work: --from-work can re-allocate without downloading
         raise sm.ShareError("train was written but its mix is off target:\n  "
                             + "\n  ".join(final_violations))
-    if not spec.keep_work:
+    if spec.keep_work:
+        state.data["finished"] = True  # a rerun is then a no-op, as without _work
+        state.save()
+    else:
+        # state.json first: a crash while _work is being deleted then leaves a
+        # finished build (manifest, no state), never a half-deleted resumable one.
+        state.path.unlink(missing_ok=True)
         shutil.rmtree(work, ignore_errors=True)
     return manifest
 
@@ -1580,19 +1786,15 @@ def iter_code_row_groups(fs: Any, repo: str, revision: str, files: range, total:
                         attempt = 0
             except Exception as exc:
                 attempt += 1
-                if attempt > retries:
+                if not backoff(exc, attempt, retries, f"read ({path}, row group {rg})"):
                     raise
-                wait = retry_wait(attempt)
-                print(f"\nread failed ({path}, row group {rg}): {exc!r}; "
-                      f"retry {attempt}/{retries} in {wait}s", file=sys.stderr, flush=True)
-                time.sleep(wait)
 
 
-def iter_text_files(fs: Any, paths: Iterable[str], retries: int = DOWNLOAD_ATTEMPTS,
+def iter_text_files(fs: Any, paths: Iterable[str], attempts: int = DOWNLOAD_ATTEMPTS,
                     sleep: Callable[[float], None] = time.sleep) -> Iterator[dict]:
     """{"text", "file"} rows of each parquet file's "text" column, one row group at a
     time; a failed read is retried from the same (file, row group) with capped
-    backoff (as train_tokenizer.iter_parquet_text, which waits uncapped)."""
+    backoff, `attempts` in all, unless the error is permanent (is_permanent)."""
     import pyarrow.parquet as pq
 
     for path in paths:
@@ -1610,12 +1812,9 @@ def iter_text_files(fs: Any, paths: Iterable[str], retries: int = DOWNLOAD_ATTEM
                             yield {"text": t, "file": path}
             except Exception as exc:
                 attempt += 1
-                if attempt > retries:
+                if not backoff(exc, attempt, attempts, f"read ({path}, row group {rg})",
+                               sleep):
                     raise
-                wait = retry_wait(attempt)
-                print(f"\nread failed ({path}, row group {rg}): {exc!r}; "
-                      f"retry {attempt}/{retries} in {wait}s", file=sys.stderr, flush=True)
-                sleep(wait)
 
 
 def fetch_ahead(indices: Iterable[int], fetch: Callable[[int], Any], ahead: int, *,
@@ -1624,41 +1823,60 @@ def fetch_ahead(indices: Iterable[int], fetch: Callable[[int], Any], ahead: int,
     """(index, local path) for each index, IN ORDER, downloading `ahead` files in
     parallel threads. Each file is deleted as soon as the consumer asks for the next
     one (or stops), so at most ahead + 1 files are on disk. A failed fetch is retried
-    (attempts in all, waits 5, 10, 20, ... capped at 300 s) and then raises. Closing
-    the generator cancels what has not started and deletes what finishes later."""
-    from concurrent.futures import ThreadPoolExecutor
+    (attempts in all, waits 5, 10, 20, ... capped at 300 s) and then raises; a
+    permanent error (is_permanent: a 404, a full disk, ...) raises at once. Closing
+    the generator stops further retries and deletes what finishes later. The download
+    threads are daemons, so a download still hanging when the build fails never keeps
+    the process alive."""
     from collections import deque
+    from concurrent.futures import Future
 
     if ahead < 1:
         raise ValueError("ahead must be at least 1")
     todo = list(indices)
+    stop = threading.Event()
 
     def fetch_retry(i: int) -> Path:
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        while True:
             try:
                 return Path(fetch(i))
             except Exception as exc:
-                if attempt == attempts:
-                    raise RuntimeError(f"download of code file {i} failed after {attempts} "
-                                       f"attempts: {exc!r}") from exc
-                wait = retry_wait(attempt)
-                print(f"\ndownload failed (file {i}): {exc!r}; retry {attempt}/"
-                      f"{attempts - 1} in {wait}s", file=sys.stderr, flush=True)
-                sleep(wait)
-        raise AssertionError("unreachable")
+                attempt += 1
+                if stop.is_set() or not backoff(exc, attempt, attempts,
+                                                f"download (file {i})", sleep):
+                    why = ("cannot succeed on retry" if is_permanent(exc)
+                           else f"after {attempt} attempts")
+                    raise RuntimeError(f"download of code file {i} failed {why}: "
+                                       f"{exc!r}") from exc
+            if stop.is_set():
+                raise RuntimeError(f"download of code file {i} abandoned")
 
-    def discard(fut: Any) -> None:
-        if not fut.cancelled() and fut.exception() is None:
+    def start(i: int) -> Future:
+        fut: Future = Future()
+        fut.set_running_or_notify_cancel()
+
+        def run() -> None:
+            try:
+                fut.set_result(fetch_retry(i))
+            except BaseException as exc:  # handed to the consumer
+                fut.set_exception(exc)
+        threading.Thread(target=run, daemon=True, name=f"download-{i}").start()
+        return fut
+
+    def discard(fut: Future) -> None:
+        if fut.exception() is None:
             Path(fut.result()).unlink(missing_ok=True)
 
-    pool = ThreadPoolExecutor(ahead, thread_name_prefix="download")
+    # One daemon thread per file in flight: at most `ahead` at once, as a pool of
+    # `ahead` threads would run them, but none can block interpreter exit.
     pending: deque = deque()
     pos = 0
 
     def submit() -> None:
         nonlocal pos
         if pos < len(todo):
-            pending.append((todo[pos], pool.submit(fetch_retry, todo[pos])))
+            pending.append((todo[pos], start(todo[pos])))
             pos += 1
 
     try:
@@ -1673,10 +1891,9 @@ def fetch_ahead(indices: Iterable[int], fetch: Callable[[int], Any], ahead: int,
             finally:
                 path.unlink(missing_ok=True)
     finally:
+        stop.set()
         for _, fut in pending:
-            fut.cancel()
             fut.add_done_callback(discard)
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def hf_code_fetcher(repo: str, revision: str, total: int, dl_dir: Path
@@ -1691,9 +1908,12 @@ def hf_code_fetcher(repo: str, revision: str, total: int, dl_dir: Path
                                     revision=revision, local_dir=dl_dir))
         try:
             pq.read_metadata(path)
-        except Exception:
+        except Exception as exc:
+            # A corrupt local parquet is permanent by is_permanent's rule, but one
+            # just downloaded is most likely truncated: download it again.
             path.unlink(missing_ok=True)
-            raise
+            raise TransientError(f"{path.name} failed its parquet check after download "
+                                 f"(truncated?): {exc!r}") from exc
         return path
     return fetch
 
@@ -1836,6 +2056,26 @@ def code_file_counts(table: Any, languages: Iterable[str], licenses: Iterable[st
     return {k: float(v) for k, v in out.items()}
 
 
+def read_code_file_counts(fs: Any, path: str, languages: Iterable[str],
+                          licenses: Iterable[str], max_bytes: float, *,
+                          attempts: int = DOWNLOAD_ATTEMPTS,
+                          sleep: Callable[[float], None] = time.sleep) -> dict[str, float]:
+    """code_file_counts of one code file, read (metadata columns only) from `fs`;
+    retried like every other read (backoff), a permanent error raised at once."""
+    import pyarrow.parquet as pq
+
+    attempt = 0
+    while True:
+        try:
+            with fs.open(path, "rb", block_size=1 << 20) as f:
+                table = pq.ParquetFile(f).read(columns=["language", "license", "size", "path"])
+            return code_file_counts(table, languages, licenses, max_bytes)
+        except Exception as exc:
+            attempt += 1
+            if not backoff(exc, attempt, attempts, f"preflight read ({path})", sleep):
+                raise
+
+
 def preflight(read_counts: Callable[[int], dict[str, float]], files: Iterable[int],
               weights: dict[str, float], code_tokens: float, *, caps: dict[str, float],
               chars_per_token: float = sm.DEFAULT_CHARS_PER_TOKEN,
@@ -1902,22 +2142,9 @@ def run_preflight(cfg: Any, args: argparse.Namespace) -> int:
     langs, lics = tuple(d.code_language_weights), d.code_licenses
 
     def read(index: int) -> dict[str, float]:
-        import pyarrow.parquet as pq
-
-        path = code_file_path(d.code_dataset, rev, index, d.code_files_total)
-        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
-            try:
-                with fs.open(path, "rb", block_size=1 << 20) as f:
-                    table = pq.ParquetFile(f).read(columns=["language", "license", "size",
-                                                            "path"])
-                return code_file_counts(table, langs, lics, max_bytes)
-            except Exception as exc:
-                if attempt == DOWNLOAD_ATTEMPTS:
-                    raise
-                print(f"\npreflight read failed ({path}): {exc!r}; retry in "
-                      f"{retry_wait(attempt)}s", file=sys.stderr, flush=True)
-                time.sleep(retry_wait(attempt))
-        raise AssertionError("unreachable")
+        return read_code_file_counts(
+            fs, code_file_path(d.code_dataset, rev, index, d.code_files_total), langs, lics,
+            max_bytes)
 
     header = (f"preflight: {d.code_dataset}@{rev[:10]}, code train files 0..{n - 1} "
               f"({sum(file_bytes) / 1e9:,.0f} GB in all), code target {C:,.0f} tokens "
@@ -2006,8 +2233,10 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
     code_val = mix_code_rows(fetch, range(d.code_heldout_first_file, d.code_files_total),
                              langs, lics, ahead=2)
 
-    def text_source(paths: list[str]) -> Callable[[], Iterator[dict]]:
-        return lambda: flatten(prefetch(batched(iter_text_files(fs, paths), 1000), depth=8))
+    def text_source(paths: list[str]) -> Callable[..., Iterator[dict]]:
+        # start: files of this language already read (a resumed build skips them).
+        return lambda start=0: flatten(prefetch(batched(iter_text_files(fs, paths[start:]),
+                                                        1000), depth=8))
 
     text_rev = _pinned(d.text_revision, lambda: api.dataset_info(tt.TEXT_DATASET).sha,
                        "text_revision")
@@ -2092,7 +2321,9 @@ def build_parser() -> argparse.ArgumentParser:
     v2.add_argument("--stall-gain", type=float, default=sm.DEFAULT_STALL_GAIN)
     v2.add_argument("--batch-docs", type=int, default=256)
     v2.add_argument("--projection-min-files", type=int, default=PROJECTION_MIN_FILES,
-                    help="project the code mix at every code file from this one on")
+                    help="project the code mix at every code file from this one on (not in "
+                         "the resume fingerprint: it never changes what is collected, so a "
+                         "build stopped by the projection resumes with a larger value)")
     v2.add_argument("--keep-work", action="store_true",
                     help="keep <shard_dir>/_work (the collected buckets) after the build")
     v2.add_argument("--fresh", action="store_true",
