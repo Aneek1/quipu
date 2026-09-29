@@ -113,6 +113,7 @@ muon_lr       = 0.02
 muon_momentum = 0.95
 muon_ns_steps = 5
 muon_per_head = true
+muon_weight_decay = 0.01   # Muon groups only; AdamW keeps weight_decay (see TrainConfig)
 compile       = true
 budget_usd    = 0.0           # the A/B orchestrator guards spend, not each run
 usd_per_hour  = 0.55          # spec 8 estimate, as in quipu-moe.toml

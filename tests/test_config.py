@@ -270,8 +270,8 @@ def test_quipu_114m_gets_the_dense_gpt2_adamw_defaults():
     assert d.code_language_weights == {} and d.text_language_weights == {}
     assert (d.lid_model, d.lid_revision) == ("AneekC/lid-specialists-9plus1", "")
     assert (t.optimizer, t.muon_lr, t.muon_momentum, t.muon_ns_steps, t.muon_per_head,
-            t.compile, t.budget_usd, t.usd_per_hour) == (
-        "adamw", 0.02, 0.95, 5, True, False, 0.0, 0.0)
+            t.muon_weight_decay, t.compile, t.budget_usd, t.usd_per_hour) == (
+        "adamw", 0.02, 0.95, 5, True, 0.01, False, 0.0, 0.0)
     # The shipped numbers themselves are untouched.
     assert (m.vocab_size, m.ffn_hidden, m.context) == (50257, 2048, 1024)
     assert (t.steps, t.grad_accum) == (5722, 128)
@@ -304,6 +304,12 @@ def test_quipu_moe_config_matches_the_spec():
         assert (1 - d.code_share) * text[lang] == pytest.approx(0.12 / 9)
     assert (t.total_tokens, t.batch_tokens, t.budget_usd) == (10_200_000_000, 524_288, 20.0)
     assert t.usd_per_hour > 0
+
+
+def test_moe_configs_give_muon_its_own_weight_decay():
+    for path in (MOE, MOE_AB, MOE_SMOKE):
+        t = load_config(path).train
+        assert (t.muon_weight_decay, t.weight_decay) == (0.01, 0.1), path
 
 
 def test_quipu_moe_ab_is_the_full_config_at_8_layers_and_200m_tokens():
@@ -400,6 +406,10 @@ def test_dense_refuses_situ_glu():
         ({"muon_momentum": -0.1}, "muon_momentum"),
         ({"muon_ns_steps": 0}, "muon_ns_steps"),
         ({"muon_per_head": 1}, "muon_per_head"),
+        ({"muon_weight_decay": -0.01}, "muon_weight_decay"),
+        ({"muon_weight_decay": "0.01"}, "muon_weight_decay"),
+        ({"muon_weight_decay": float("nan")}, "muon_weight_decay"),
+        ({"muon_weight_decay": True}, "muon_weight_decay"),
         ({"compile": "yes"}, "compile"),
         ({"budget_usd": -1.0}, "budget_usd"),
         ({"usd_per_hour": -0.5}, "usd_per_hour"),

@@ -21,8 +21,13 @@ sparse and row-wise, not a matrix transform, and the fp32 router is a tiny 2-D
 classifier whose scale matters to the Top-k decision. Neither suits Muon's
 fixed-spectral-norm steps.
 
+Muon groups decay with cfg.muon_weight_decay, not cfg.weight_decay (see the
+TrainConfig comment: lr * wd is the per-step shrink, and muon_lr is ~33x lr).
+
 Every group carries base_lr (cfg.lr for AdamW, cfg.muon_lr for Muon): the LR schedule
 sets group["lr"] = group["base_lr"] * factor on every group of every optimizer.
+Optimizer.load_state_dict brings back the saved base_lr and weight_decay, so on
+resume call apply_config_lrs(optimizers, cfg) after loading to make the config win.
 The Quantile Balancing bias is a buffer, so no optimizer ever sees it. A parameter
 the rules do not place is an error, not a silent default.
 """
@@ -53,8 +58,8 @@ def _no_decay_ids(model: nn.Module) -> set[int]:
 def _adamw(decay: list[nn.Parameter], no_decay: list[nn.Parameter],
            cfg: TrainConfig) -> torch.optim.AdamW | None:
     groups = [
-        {"params": params, "weight_decay": wd, "base_lr": cfg.lr}
-        for params, wd in ((decay, cfg.weight_decay), (no_decay, 0.0))
+        {"params": params, "weight_decay": wd, "base_lr": cfg.lr, "decay": is_decay}
+        for params, wd, is_decay in ((decay, cfg.weight_decay, True), (no_decay, 0.0, False))
         if params
     ]
     if not groups:
@@ -111,7 +116,7 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
                              f"(shape {tuple(p.shape)})")
 
     muon_common = {"lr": cfg.muon_lr, "base_lr": cfg.muon_lr, "momentum": cfg.muon_momentum,
-                   "weight_decay": cfg.weight_decay, "ns_steps": cfg.muon_ns_steps,
+                   "weight_decay": cfg.muon_weight_decay, "ns_steps": cfg.muon_ns_steps,
                    "nesterov": True}
     muon_groups = [
         {"params": ps, "head_dim": hd, "in_out": False, **muon_common}
@@ -131,3 +136,24 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
     if adam is not None:
         opts.append(adam)
     return opts
+
+
+def apply_config_lrs(optimizers: list[torch.optim.Optimizer], cfg: TrainConfig) -> None:
+    """Re-set base_lr and weight_decay on every group from cfg, for use right after
+    load_state_dict (which restores the checkpoint's values). Muon groups get
+    cfg.muon_lr / cfg.muon_weight_decay; AdamW groups cfg.lr, and cfg.weight_decay
+    for the decay group (tagged group["decay"] at build) while the no-decay group
+    stays at 0. group["lr"] is left alone: the LR schedule derives it from base_lr
+    before the next step."""
+    for opt in optimizers:
+        is_muon = isinstance(opt, Muon)
+        for group in opt.param_groups:
+            if is_muon:
+                group["base_lr"] = cfg.muon_lr
+                group["weight_decay"] = cfg.muon_weight_decay
+            else:
+                if "decay" not in group:
+                    raise ValueError("AdamW group has no 'decay' tag; was it built by "
+                                     "build_optimizers?")
+                group["base_lr"] = cfg.lr
+                group["weight_decay"] = cfg.weight_decay if group["decay"] else 0.0

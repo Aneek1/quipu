@@ -100,6 +100,7 @@ muon_lr       = 0.02
 muon_momentum = 0.95
 muon_ns_steps = 5
 muon_per_head = true
+muon_weight_decay = 0.01   # Muon groups only; AdamW keeps weight_decay (see TrainConfig)
 compile       = false
 budget_usd    = 0.0           # no spend guard on the laptop
 usd_per_hour  = 0.0

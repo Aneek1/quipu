@@ -13,7 +13,10 @@ Pieces:
   on X = g / ||g||_F. The coefficients trade exactness for speed: singular values
   land near 1 (roughly [0.7, 1.2]), not exactly on it, which is all Muon needs.
   Wide orientation is used (a tall matrix is transposed and back), so A is the
-  smaller Gram matrix. bf16 input is iterated in bf16; everything else in fp32.
+  smaller Gram matrix. On CUDA the iteration runs in bf16 whatever the input
+  dtype (training grads are fp32; Keller's reference does G.bfloat16() too), to
+  within a few percent of fp32; on CPU it runs in fp32 unless the input is bf16.
+  The result is cast back to the input's dtype.
 - orthogonalize(update, ...): newton_schulz plus the shape scale
   max(1, fan_out / fan_in) ** 0.5, so a tall matrix's rows get RMS comparable to a
   square one's. Two variants:
@@ -42,13 +45,17 @@ NS_EPS = 1e-7
 
 def newton_schulz(g: Tensor, steps: int = 5) -> Tensor:
     """Approximately orthogonalise g (2-D, or a batch of matrices as 3-D [n, r, c],
-    each done on its own). Returns g's shape and dtype. A zero matrix stays zero."""
+    each done on its own). Returns g's shape and dtype. A zero matrix stays zero.
+    Iterates in bf16 on CUDA, fp32 on CPU (bf16 if g is bf16)."""
     if g.ndim not in (2, 3):
         raise ValueError(f"newton_schulz needs a 2-D or 3-D tensor, got shape {tuple(g.shape)}")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError(f"steps must be a positive int, got {steps!r}")
     a, b, c = NS_COEFFS
-    work = torch.bfloat16 if g.dtype == torch.bfloat16 else torch.float32
+    # bf16 on CUDA (as Keller's reference, G.bfloat16()): tensor-core matmuls, and
+    # the iteration only needs singular values in a loose band. fp32 on CPU, where
+    # bf16 matmul is slow, unless the input is already bf16.
+    work = torch.bfloat16 if (g.is_cuda or g.dtype == torch.bfloat16) else torch.float32
     x = g.to(work)
     tall = x.size(-2) > x.size(-1)
     if tall:

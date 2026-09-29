@@ -134,6 +134,16 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
     muon_per_head: bool = True
+    # Decoupled weight decay for the Muon groups only (AdamW keeps weight_decay).
+    # The per-step shrink is lr * wd: AdamW at lr 6e-4, wd 0.1 shrinks by 6e-5 a
+    # step, while Muon at muon_lr 0.02 with that same 0.1 would shrink by 2e-3,
+    # 33x as much, and the Muon-vs-AdamW A/B would partly measure decay strength.
+    # 0.01 gives 2e-4 a step, ~3x AdamW's rather than 33x: not matched exactly,
+    # only the same order of magnitude; nothing here was tuned. For reference,
+    # Keller Jordan's Muon (Keller-scale lr ~0.02) shipped with no weight decay;
+    # Moonlight's wd 0.1 goes with an update rescaled to AdamW's RMS, i.e. a much
+    # smaller effective lr, so its 0.1 does not carry over to this lr.
+    muon_weight_decay: float = 0.01
     compile: bool = False                # torch.compile the model
     # Spend guard (spec section 6.4): stop cleanly once elapsed hours x usd_per_hour
     # reaches budget_usd. budget_usd 0 = no guard.
@@ -350,6 +360,7 @@ def _check_train_extras(train: TrainConfig) -> None:
     if not (_is_number(train.muon_momentum) and 0 <= train.muon_momentum < 1):
         raise ValueError(f"muon_momentum must be in [0, 1), got {train.muon_momentum!r}")
     _check_bool("muon_per_head", train.muon_per_head)
+    _check_positive("muon_weight_decay", train.muon_weight_decay, allow_zero=True)
     _check_bool("compile", train.compile)
     _check_positive("budget_usd", train.budget_usd, allow_zero=True)
     _check_positive("usd_per_hour", train.usd_per_hour, allow_zero=True)
