@@ -31,10 +31,14 @@ Data v2 (quipu-moe; any config with code_language_weights) is a different build,
 build_mix below: the config's tokenizer, per-language code weights, English plus nine
 FineWeb-2 languages, --workers tokenising processes, the stepbuild leakage guard and,
 with --lid-filter, the owner's language-ID model. See the "data v2" section and
-quipu/shard_mix.py.
+quipu/shard_mix.py. Unlike the build above, it resumes after a crash or preemption
+(rerun the same command) and fails early; scripts/remote/build_shards_box.md is the
+runbook for building it on a rented CPU box.
 
 Run: uv run python scripts/build_shards.py --config configs/quipu-moe.toml \
-         --workers 47 --lid-filter --train-tokens 8.3e9
+         --lid-filter --train-tokens 8.3e9 --preflight     # metadata only, minutes
+     uv run python scripts/build_shards.py --config configs/quipu-moe.toml \
+         --lid-filter --train-tokens 8.3e9                 # the build (resumable)
 """
 from __future__ import annotations
 
@@ -371,44 +375,85 @@ def prefetch(items: Iterable[Any], depth: int) -> Iterator[Any]:
     """Iterate `items` in a background thread, up to `depth` items ahead.
 
     Order is preserved exactly, so determinism is unaffected; network reads just
-    overlap with tokenizing. An exception in the producer is re-raised here.
+    overlap with tokenizing. An exception in the producer is re-raised here. When
+    the consumer stops early (closes this generator, or drops it), the producer
+    thread stops after its current item and closes `items` in its own thread, so a
+    finished collection leaves no reader or download behind.
     """
     q: queue.Queue = queue.Queue(maxsize=depth)
     done = object()
+    stop = threading.Event()
+
+    def put(entry: tuple[bool, Any]) -> bool:
+        while not stop.is_set():
+            try:
+                q.put(entry, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def produce() -> None:
+        it = iter(items)
         try:
-            for item in items:
-                q.put((True, item))
+            for item in it:
+                if not put((True, item)):
+                    return
+            put((True, done))
         except BaseException as exc:  # handed to the consumer
-            q.put((False, exc))
-            return
-        q.put((True, done))
+            put((False, exc))
+        finally:
+            close = getattr(it, "close", None)
+            if close is not None:
+                close()
 
     threading.Thread(target=produce, daemon=True, name="prefetch").start()
-    while True:
-        ok, item = q.get()
-        if not ok:
-            raise item
-        if item is done:
-            return
-        yield item
+    try:
+        while True:
+            ok, item = q.get()
+            if not ok:
+                raise item
+            if item is done:
+                return
+            yield item
+    finally:
+        stop.set()
+        while True:  # unblock a producer waiting on a full queue
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+
+def _close(it: Any) -> None:
+    """Close a generator (or anything with close()); a no-op for other iterables."""
+    close = getattr(it, "close", None)
+    if close is not None:
+        close()
 
 
 def batched(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
-    batch: list[Any] = []
-    for item in items:
-        batch.append(item)
-        if len(batch) == size:
+    it = iter(items)
+    try:
+        batch: list[Any] = []
+        for item in it:
+            batch.append(item)
+            if len(batch) == size:
+                yield batch
+                batch = []
+        if batch:
             yield batch
-            batch = []
-    if batch:
-        yield batch
+    finally:
+        _close(it)
 
 
 def flatten(batches: Iterable[list[Any]]) -> Iterator[Any]:
-    for batch in batches:
-        yield from batch
+    it = iter(batches)
+    try:
+        for batch in it:
+            yield from batch
+    finally:
+        _close(it)
 
 
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
@@ -618,15 +663,47 @@ def build_all(root: Path, stream: Iterable[dict], *, val_tokens: int, train_toke
 # 2 percentage points off its weight, the build stops with ShareError before writing
 # train (details in collect_report.json).
 #
+# Failing early (the box bills by the hour): --preflight reads only the code files'
+# language/licence/size/path columns and says whether the files can give the code
+# mix at all; during the build the code mix is projected at every code file from
+# the 20th (what each language holds plus its rate so far, at the file cap) and the
+# code shares are checked the moment code collection ends, before any text is read.
+#
+# Resume: <shard_dir>/_work/state.json (written atomically) records a fingerprint of
+# everything that shapes the collected data (tokenizer and LID hashes, the LID
+# threshold, the pinned dataset revisions and file lists, the sampling settings, the
+# weights) and a checkpoint per phase: the English val (done), code (after every
+# code file, in decision order: bucket files fsynced and their lengths, the
+# collector, the stats, the hash count and the next file) and text (after every
+# language). A rerun of the same command truncates the bucket files back to the
+# checkpoint and carries on from there, so a preempted box loses at most one code
+# file or one text language, and the shards are byte-identical to an uninterrupted
+# build. A different fingerprint is refused (--fresh starts over); --from-work
+# accepts changed weights / token target and re-allocates from what was collected.
+#
 # Held out, as for the tokenizer and its gate: val = the last sample-10BT file
 # (English, the trainer's loss); val_lang/<bucket> = FineWeb-2's test split; code_val
 # = github-code-clean files code_heldout_first_file.. (exact-dedup against train code).
 
 TEXT_PREFIX = "text:"
 MIX_WORK = "_work"
+STATE = "state.json"
+STATE_VERSION = 1
+HASHES = "hashes.u64"
 COLLECT_REPORT = "collect_report.json"
+PREFLIGHT_REPORT = "preflight.json"
 SHARE_CHECK_MIN_WEIGHT = 0.05
 SHARE_CHECK_MAX_OFF = 0.02
+PROJECTION_MIN_FILES = 20
+LID_WARN_DROP = 0.40         # warn when LID drops more than this of a language's first file
+DOWNLOAD_ATTEMPTS = 12
+BACKOFF_CAP_S = 300
+DOWNLOAD_WORKERS = 6
+
+
+def retry_wait(attempt: int) -> float:
+    """Seconds to wait after failed attempt `attempt` (1-based): 5, 10, 20, ... <= 300."""
+    return min(BACKOFF_CAP_S, 5 * 2 ** (attempt - 1))
 
 
 class MixSpec(NamedTuple):
@@ -650,29 +727,43 @@ class MixSpec(NamedTuple):
     batch_docs: int = 256
     text_order: tuple[str, ...] | None = None  # FineWeb-2 collection order; None: config
     keep_work: bool = False
+    # Code train files (the file cap), numbered from 0: the projection's horizon.
+    # None: no projection (the share check after code collection still runs).
+    code_files: int | None = None
+    projection_min_files: int = PROJECTION_MIN_FILES
 
 
 class MixSources(NamedTuple):
-    """Row sources for build_mix: zero-argument callables returning rows.
+    """Row sources for build_mix.
 
-    code_train / code_val: rows {"code", "language", "license", "path"[, "file"]}; a
+    code_train(start_file): rows {"code", "language", "license", "path", "file"} of
+    code files start_file, start_file + 1, ... in file order ("file" is the file's
+    index, from 0). A resumed build passes the file after its last checkpoint. A
     real source that filters rows before they become dicts attaches what it dropped
-    to the next row it yields, as row[FILTERED] = {"rows_scanned": n, ...}.
-    text_train / text_val: language -> rows {"text"[, "file"]}. Every *_val source
-    must yield held-out rows only, never rows its train source can reach.
+    to the next row it yields, as row[FILTERED] = {"rows_scanned": n, ...}, and ends
+    every file with a marker row {FILE_END: index, FILTERED: {...}} (what the file's
+    last row groups dropped); without markers, a change of "file" ends a file.
+    code_val(): the held-out code rows. text_train / text_val: language -> rows
+    {"text"[, "file"]}. Every *_val source must yield held-out rows only, never rows
+    its train source can reach.
     """
-    code_train: Callable[[], Iterable[dict]]
+    code_train: Callable[[int], Iterable[dict]]
     code_val: Callable[[], Iterable[dict]]
     text_train: dict[str, Callable[[], Iterable[dict]]]
     text_val: dict[str, Callable[[], Iterable[dict]]]
 
 
 FILTERED = "_filtered"
+FILE_END = "_file_end"
 
 
 def uses_mix(data_cfg: Any) -> bool:
     """True when a DataConfig asks for the data v2 build (it has code weights)."""
     return bool(getattr(data_cfg, "code_language_weights", None))
+
+
+def _file_mark(counts: Counter, file: Any) -> sm.Offer:
+    return sm.Offer(sm.MARK, "", "", {"counts": counts, "file_done": file})
 
 
 def code_offers(rows: Iterable[dict], languages: Iterable[str],
@@ -682,53 +773,90 @@ def code_offers(rows: Iterable[dict], languages: Iterable[str],
     The rows read and filtered on the way to each offer travel with it (meta) and
     are counted when the Runner decides it, not when they are read: the Runner reads
     ahead by a worker-dependent amount, and counting at read time would make the
-    manifest depend on the number of workers.
+    manifest depend on the number of workers. The end of each file becomes a MARK
+    offer carrying the file's trailing counts, so a checkpoint there is exact.
     """
     languages, licenses = frozenset(languages), frozenset(licenses)
     counts: Counter = Counter()
-    for row in rows:
-        counts.update(row.get(FILTERED) or {})
-        counts["rows_scanned"] += 1
-        language = row.get("language")
-        if language not in languages:
-            counts["dropped_language"] += 1
-            continue
-        if row.get("license") not in licenses:
-            counts["dropped_license"] += 1
-            continue
-        code = row.get("code") or ""
-        if not code.strip():
-            counts["skipped_blank"] += 1
-            continue
-        reason = path_skip_reason(row.get("path"))
-        if reason is not None:
-            counts[f"skipped_{reason}"] += 1
-            continue
-        meta = {"counts": counts}
-        if "file" in row:
-            meta["last_file"] = row["file"]
-        yield sm.Offer(sm.CODE, language, code, meta)
-        counts = Counter()
+    current: Any = None
+    it = iter(rows)
+    try:
+        for row in it:
+            if FILE_END in row:
+                counts.update(row.get(FILTERED) or {})
+                yield _file_mark(counts, row[FILE_END])
+                counts, current = Counter(), None
+                continue
+            file = row.get("file")
+            if current is not None and file != current:
+                yield _file_mark(counts, current)
+                counts = Counter()
+            current = file
+            counts.update(row.get(FILTERED) or {})
+            counts["rows_scanned"] += 1
+            language = row.get("language")
+            if language not in languages:
+                counts["dropped_language"] += 1
+                continue
+            if row.get("license") not in licenses:
+                counts["dropped_license"] += 1
+                continue
+            code = row.get("code") or ""
+            if not code.strip():
+                counts["skipped_blank"] += 1
+                continue
+            reason = path_skip_reason(row.get("path"))
+            if reason is not None:
+                counts[f"skipped_{reason}"] += 1
+                continue
+            meta = {"counts": counts}
+            if file is not None:
+                meta["last_file"] = file
+            yield sm.Offer(sm.CODE, language, code, meta)
+            counts = Counter()
+        if current is not None:
+            yield _file_mark(counts, current)
+    finally:
+        _close(it)
 
 
 def text_offers(rows: Iterable[dict], source: str) -> Iterator[sm.Offer]:
-    """Non-blank texts; filter counts travel with the offers as in code_offers."""
+    """Non-blank texts; filter counts travel with the offers as in code_offers, and a
+    change of the rows' "file" (when they have one) becomes a MARK offer."""
     counts: Counter = Counter()
-    for row in rows:
-        counts["rows_scanned"] += 1
-        text = row.get("text") or ""
-        if not text.strip():
-            counts["skipped_blank"] += 1
-            continue
-        yield sm.Offer(sm.TEXT, source, text, {"counts": counts})
-        counts = Counter()
+    current: Any = None
+    it = iter(rows)
+    try:
+        for row in it:
+            file = row.get("file")
+            if current is not None and file != current:
+                yield _file_mark(counts, current)
+                counts = Counter()
+            current = file
+            counts["rows_scanned"] += 1
+            text = row.get("text") or ""
+            if not text.strip():
+                counts["skipped_blank"] += 1
+                continue
+            yield sm.Offer(sm.TEXT, source, text, {"counts": counts})
+            counts = Counter()
+        if current is not None:
+            yield _file_mark(counts, current)
+    finally:
+        _close(it)
 
 
 def _counted(rows: Iterable[dict], counts: Counter) -> Iterator[dict]:
-    """Rows as they are consumed, with any attached filter counts added to counts."""
-    for row in rows:
-        counts.update(row.pop(FILTERED, None) or {})
-        yield row
+    """Rows as they are consumed, with any attached filter counts added to counts
+    (file-end markers are counted and dropped)."""
+    it = iter(rows)
+    try:
+        for row in it:
+            counts.update(row.pop(FILTERED, None) or {})
+            if FILE_END not in row:
+                yield row
+    finally:
+        _close(it)
 
 
 def text_buckets(language: str, lid: bool) -> dict[str, float]:
@@ -741,13 +869,15 @@ def text_buckets(language: str, lid: bool) -> dict[str, float]:
 
 
 def _collect_text(runner: sm.Runner, rows: Iterable[dict], language: str, total: float,
-                  store: sm.BucketStore, spec: MixSpec, *, lid: bool,
-                  slack: float) -> tuple[sm.Collector, Counter]:
-    stats: Counter = Counter()
+                  store: sm.BucketStore, spec: MixSpec, *, lid: bool, slack: float,
+                  stats: Counter | None = None,
+                  on_mark: Callable[[dict], None] | None = None
+                  ) -> tuple[sm.Collector, Counter]:
+    stats = Counter() if stats is None else stats
     col = sm.Collector(text_buckets(language, lid), total, slack=slack, window=spec.window,
                        stall_windows=spec.stall_windows, stall_gain=spec.stall_gain,
                        store=store)
-    runner.collect(text_offers(rows, language), col, stats)
+    runner.collect(text_offers(rows, language), col, stats, on_mark=on_mark)
     return col, stats
 
 
@@ -769,16 +899,340 @@ def _text_summary(col: sm.Collector, stats: Counter) -> dict[str, Any]:
     offers = stats["offers"]
     return {**s, "lid_kept": offers - stats["lid_dropped"],
             "lid_dropped": stats["lid_dropped"],
+            "lid_kept_unsure": stats["lid_kept_unsure"],
             "tokens": sum(col.taken.values()), "collection": col.summary()}
 
 
+class LidWatch:
+    """Warns (loudly, never fails) when language ID drops more than LID_WARN_DROP of a
+    language's documents in its first file (or, for a source without files, in all
+    it read): a sign that the source or the threshold is wrong for that language."""
+
+    def __init__(self, language: str, stats: Counter) -> None:
+        self.language, self.stats = language, stats
+        self.checked = False
+        self.warning: str | None = None
+
+    def on_mark(self, meta: dict) -> None:
+        if not self.checked:
+            self.check("its first file")
+
+    def finish(self) -> str | None:
+        if not self.checked:
+            self.check("everything read")
+        return self.warning
+
+    def check(self, where: str) -> None:
+        self.checked = True
+        offers, dropped = self.stats["offers"], self.stats["lid_dropped"]
+        if not offers or dropped / offers <= LID_WARN_DROP:
+            return
+        as_ = Counter({k.split(":", 1)[1]: v for k, v in self.stats.items()
+                       if k.startswith("lid_dropped_as:")})
+        top = ", ".join(f"{label} {n:,}" for label, n in as_.most_common(3))
+        self.warning = (f"{self.language}: language ID dropped {dropped / offers:.0%} of the "
+                        f"documents in {where} ({dropped:,} of {offers:,}; as {top}). "
+                        "Check the source language and --lid-threshold; the build goes on.")
+        bar = "!" * 78
+        print(f"\n{bar}\nWARNING: {self.warning}\n{bar}\n", file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ resume state
+
+def _jsonable(x: Any) -> Any:
+    return json.loads(json.dumps(x))
+
+
+def _write_json_durable(path: Path, obj: Any) -> None:
+    """Write JSON atomically (temp file, fsync, rename): a crash leaves the old file
+    or the new one, never a torn one."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    replace_with_retry(tmp, path)
+
+
+def mix_fingerprint(spec: MixSpec, setup: sm.DocSetup,
+                    provenance: dict[str, Any] | None) -> dict[str, Any]:
+    """What a resumed build must share with the saved one. "sources": everything that
+    changes which documents are collected (a mismatch needs --fresh); "mix": the
+    weights and token target (a mismatch is allowed with --from-work)."""
+    prov = provenance or {}
+    lid = setup.lid
+    sources = {
+        "val_tokens": spec.val_tokens, "licenses": list(spec.licenses),
+        "max_doc_tokens": spec.max_doc_tokens, "slack": spec.slack, "window": spec.window,
+        "stall_windows": spec.stall_windows, "stall_gain": spec.stall_gain,
+        "text_order": None if spec.text_order is None else list(spec.text_order),
+        "code_files": spec.code_files, "path_skip_rules": CODE_PATH_SKIP_RULES,
+        "tokenizer_sha256": (prov.get("tokenizer") or {}).get("sha256"),
+        "lid": None if lid is None else {
+            "threshold": setup.lid_threshold,
+            "max_chars": getattr(lid, "max_chars", sm.LID_MAX_CHARS),
+            "model_sha256": (prov.get("lid") or {}).get("sha256")},
+        "leakage_guard_files": getattr(setup.guard, "reference_files", None),
+        "datasets": prov.get("sources"),
+    }
+    mix = {"train_tokens": spec.train_tokens, "code_share": spec.code_share,
+           "code_weights": spec.code_weights, "text_weights": spec.text_weights,
+           "html_cap": spec.html_cap}
+    return _jsonable({"sources": sources, "mix": mix})
+
+
+def _diff(old: dict, new: dict) -> list[str]:
+    def short(v: Any) -> str:
+        s = json.dumps(v, sort_keys=True)
+        return s if len(s) <= 100 else s[:97] + "..."
+    return [f"{k}: {short(old.get(k))} -> {short(new.get(k))}"
+            for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
+
+
+class BuildState:
+    """<shard_dir>/_work/state.json: the fingerprint and each phase's checkpoint."""
+
+    def __init__(self, work: Path, fingerprint: dict[str, Any], *, fresh: bool,
+                 from_work: bool) -> None:
+        self.path = Path(work) / STATE
+        self.mix_changed: list[str] = []
+        if fresh and work.exists():
+            shutil.rmtree(work)
+        work.mkdir(parents=True, exist_ok=True)
+        self.resumed = self.path.exists()
+        if not self.resumed:
+            if from_work:
+                raise sm.ResumeError(f"--from-work needs the saved state of an earlier build "
+                                     f"({self.path}); there is none")
+            for p in list(work.iterdir()):  # left by a build that never saved: stale
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+            self.data = {"version": STATE_VERSION, "fingerprint": fingerprint, "phases": {}}
+            self.save()
+            return
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if data.get("version") != STATE_VERSION:
+            raise sm.ResumeError(f"{self.path} is from another builder version; rerun with "
+                                 "--fresh")
+        old = data.get("fingerprint", {})
+        diff = _diff(old.get("sources", {}), fingerprint["sources"])
+        if diff:
+            raise sm.ResumeError(
+                f"the saved build in {work} collected different data, so it cannot be "
+                "resumed:\n  " + "\n  ".join(diff)
+                + "\nrerun with --fresh to discard it (everything is read again), or restore "
+                  "the settings it was started with")
+        mix_diff = _diff(old.get("mix", {}), fingerprint["mix"])
+        if mix_diff and not from_work:
+            raise sm.ResumeError(
+                f"the saved build in {work} has different mix settings:\n  "
+                + "\n  ".join(mix_diff)
+                + "\nrerun with --from-work to re-allocate the mix from the collected buckets "
+                  "(nothing is downloaded again; needs its code collection finished), or "
+                  "--fresh to start over")
+        if from_work and not (data["phases"].get("code") or {}).get("done"):
+            raise sm.ResumeError(f"--from-work needs a finished code collection in the saved "
+                                 f"state {self.path}; rerun without it (same settings) to "
+                                 "finish collecting, or --fresh")
+        self.mix_changed = mix_diff
+        data["fingerprint"] = fingerprint
+        self.data = data
+        self.save()
+
+    def phase(self, name: str) -> Any:
+        return self.data["phases"].get(name)
+
+    def set_phase(self, name: str, value: Any) -> None:
+        self.data["phases"][name] = _jsonable(value)
+        self.save()
+
+    def save(self) -> None:
+        _write_json_durable(self.path, self.data)
+
+
+class HashLog:
+    """Append-only uint64 file of the content hashes of admitted code documents (the
+    code_val dedup set), truncatable to a checkpoint's count like the bucket files."""
+
+    def __init__(self, path: Path, count: int) -> None:
+        self.path = Path(path)
+        if count == 0:
+            self.path.write_bytes(b"")
+            self.hashes: set[int] = set()
+        else:
+            size = self.path.stat().st_size if self.path.exists() else -1
+            if size < 8 * count:
+                raise sm.ResumeError(f"{self.path} holds {size} bytes, less than its "
+                                     f"checkpoint's {count} hashes; rerun with --fresh")
+            os.truncate(self.path, 8 * count)
+            self.hashes = set(np.fromfile(self.path, dtype="<u8").tolist())
+        self.count = count
+        self._f = open(self.path, "ab")
+
+    def add(self, h: int) -> None:
+        self.hashes.add(h)
+        self._f.write(np.uint64(h).tobytes())
+        self.count += 1
+
+    def sync(self) -> None:
+        self._f.flush()
+        os.fsync(self._f.fileno())
+
+    def close(self) -> None:
+        self._f.close()
+
+
+# ------------------------------------------------------------------ build phases
+
+def _val_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Path,
+               state: BuildState, lid: bool) -> tuple[sm.Collector, Counter, sm.BucketStore]:
+    """The trainer's validation text (English, held out); done once, then reused."""
+    ph = state.phase("val")
+    store = sm.BucketStore(work / "val", fresh=False)
+    if ph and ph["done"]:
+        store.restore(ph["store"])
+        col, stats = sm.Collector.from_snapshot(ph["collector"]), Counter(ph["stats"])
+    else:
+        store.restore({})
+        col, stats = _collect_text(runner, sources.text_val[sm.ENGLISH](), sm.ENGLISH,
+                                   spec.val_tokens, store, spec, lid=lid, slack=0.0)
+        state.set_phase("val", {"done": True, "store": store.snapshot(),
+                                "collector": col.snapshot(), "stats": stats})
+    store.close()
+    return col, stats, store
+
+
+def _code_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Path,
+                state: BuildState, *, weights: dict[str, float], total: float,
+                caps: dict[str, float], report: Path, resume: dict[str, Any]
+                ) -> tuple[sm.Collector, Counter, sm.BucketStore, set[int]]:
+    """Code collection over the files in order, checkpointed at every file end."""
+    ph = state.phase("code")
+    store = sm.BucketStore(work / "code", fresh=False)
+    if ph and ph["done"]:
+        store.restore(ph["store"])
+        store.close()
+        log = HashLog(work / HASHES, ph["hashes"])
+        log.close()
+        return (sm.Collector.from_snapshot(ph["collector"]), Counter(ph["stats"]), store,
+                log.hashes)
+    if ph:
+        store.restore(ph["store"])
+        col = sm.Collector.from_snapshot(ph["collector"], store)
+        stats, start = Counter(ph["stats"]), int(ph["next_file"])
+        log = HashLog(work / HASHES, ph["hashes"])
+        resume["code_from_file"] = start
+        print(f"code: resuming at file {start} ({sum(col.taken.values()):,} tokens held)",
+              flush=True)
+    else:
+        store.restore({})
+        col = sm.Collector(weights, total, caps=caps, slack=spec.slack, window=spec.window,
+                           stall_windows=spec.stall_windows, stall_gain=spec.stall_gain,
+                           store=store)
+        stats, start = Counter(), 0
+        log = HashLog(work / HASHES, 0)
+
+    def checkpoint(next_file: int | None, done: bool) -> None:
+        snap = store.snapshot()
+        log.sync()
+        state.set_phase("code", {"done": done, "next_file": next_file, "store": snap,
+                                 "collector": col.snapshot(), "stats": stats,
+                                 "hashes": log.count})
+
+    def project(files_read: int) -> None:
+        files = spec.code_files
+        if files is None or files_read < spec.projection_min_files or files_read >= files:
+            return
+        violations, avail = sm.projection_violations(
+            col, files_read, files, min_weight=SHARE_CHECK_MIN_WEIGHT,
+            max_off=SHARE_CHECK_MAX_OFF)
+        if not violations:
+            return
+        write_manifest(report, {"stage": f"code projection after file {files_read} of {files}",
+                                "violations": violations,
+                                "projected_available_tokens": avail,
+                                "collection": col.summary(), "stats": _plain(stats)})
+        raise sm.ShareError(
+            f"code: after file {files_read} of {files}, the projected mix at the file cap "
+            f"misses its target, so the build stops now rather than read {files - files_read} "
+            "more files:\n  " + "\n  ".join(violations)
+            + f"\n(projected: what each language holds plus its rate so far; see {report}. "
+              "Lower that language's weight, or run --preflight.)")
+
+    def on_mark(meta: dict) -> None:
+        files_read = int(meta["file_done"]) + 1
+        checkpoint(files_read, False)
+        project(files_read)
+
+    if start:
+        project(start)
+    runner.collect(code_offers(sources.code_train(start), weights, spec.licenses), col, stats,
+                   on_admit=lambda offer, res: log.add(sm.content_hash(offer.text)),
+                   on_mark=on_mark)
+    checkpoint(None, True)
+    log.close()
+    store.close()
+    return col, stats, store, log.hashes
+
+
+def _text_phase(runner: sm.Runner, sources: MixSources, spec: MixSpec, work: Path,
+                state: BuildState, *, lid: bool, english_total: float, group_total: float,
+                others: dict[str, float], order: list[str]
+                ) -> tuple[dict[str, tuple[sm.Collector, Counter]], dict[str, str],
+                           sm.BucketStore]:
+    """English, then the other languages in order; each checkpointed when done. An
+    unfinished language is redone from its start after truncating its buckets."""
+    ph = state.phase("text") or {"done": [], "store": {}, "langs": {}}
+    store = sm.BucketStore(work / "text", fresh=False)
+    store.restore(ph["store"])
+    cols: dict[str, tuple[sm.Collector, Counter]] = {}
+    warnings: dict[str, str] = {}
+    for lang in [sm.ENGLISH] + order:
+        saved = ph["langs"].get(lang)
+        if saved is not None:
+            cols[lang] = (sm.Collector.from_snapshot(saved["collector"]),
+                          Counter(saved["stats"]))
+            if saved.get("lid_warning"):
+                warnings[lang] = saved["lid_warning"]
+            continue
+        if lang == sm.ENGLISH:
+            total, slack = english_total, 0.0
+        else:
+            # Each language's target is set when its turn comes, from what the earlier
+            # ones actually held.
+            held = {x: float(sum(cols[x][0].taken.values())) for x in order if x in cols}
+            now, _ = sm.allocate(group_total, others, held)
+            total, slack = now[lang], spec.slack
+        stats: Counter = Counter()
+        watch = LidWatch(lang, stats) if lid else None
+        col, _ = _collect_text(runner, sources.text_train[lang](), lang, total, store, spec,
+                               lid=lid, slack=slack, stats=stats,
+                               on_mark=watch.on_mark if watch else None)
+        warning = watch.finish() if watch else None
+        if warning:
+            warnings[lang] = warning
+        cols[lang] = (col, stats)
+        ph["langs"][lang] = {"collector": col.snapshot(), "stats": stats,
+                             "lid_warning": warning}
+        ph["done"].append(lang)
+        ph["store"] = store.snapshot()
+        state.set_phase("text", ph)
+        print(f"{lang}: {sum(col.taken.values()):,} tokens (target {total:,.0f})", flush=True)
+    store.close()
+    return cols, warnings, store
+
+
 def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup,
-              provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+              provenance: dict[str, Any] | None = None, *, fresh: bool = False,
+              from_work: bool = False) -> dict[str, Any]:
     """val, train, code_val and val_lang for the data v2 mix; manifest written last.
 
-    Raises ShareError (after writing collect_report.json, before writing train) when
-    the collected data cannot give the configured mix within the tolerance, and
-    RuntimeError when a source ran short of what the mix needs.
+    Resumes from <root>/_work when an earlier run of the same build was interrupted
+    (see "Resume" above); fresh=True discards it; from_work=True re-allocates from it
+    with changed weights or token target. Raises ShareError (after writing
+    collect_report.json, before writing train) when the collected data cannot give
+    the configured mix within the tolerance, RuntimeError when a source ran short of
+    what the mix needs, ResumeError when _work cannot be resumed.
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -804,56 +1258,57 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
     E = text_total * tw[sm.ENGLISH]
     G = text_total - E
     caps = {"HTML": spec.html_cap}
-    kw = {"window": spec.window, "stall_windows": spec.stall_windows,
-          "stall_gain": spec.stall_gain}
+    state = BuildState(work, mix_fingerprint(spec, setup, provenance), fresh=fresh,
+                       from_work=from_work)
+    resume: dict[str, Any] = {"resumed": state.resumed, "from_work": from_work,
+                              "mix_changed": state.mix_changed, "code_from_file": None}
+    if state.resumed:
+        print(f"resuming the build saved in {work}"
+              + (" (re-allocating: " + "; ".join(state.mix_changed) + ")"
+                 if state.mix_changed else ""), flush=True)
 
     with sm.Runner(setup, spec.workers, batch_docs=spec.batch_docs) as runner:
         eot = runner.tok.eot
         # 1. The trainer's validation: English, from the held-out file.
-        val_store = sm.BucketStore(work / "val")
-        val_col, val_stats = _collect_text(runner, sources.text_val[sm.ENGLISH](), sm.ENGLISH,
-                                           spec.val_tokens, val_store, spec, lid=lid, slack=0.0)
-        val_store.close()
+        val_col, val_stats, val_store = _val_phase(runner, sources, spec, work, state, lid)
         val = write_split(root / "val", spec.val_tokens, spec.shard_tokens,
                           ((a, TEXT_PREFIX + sm.ENGLISH) for a in val_store.docs(sm.ENGLISH)))
         val["source"] = _text_summary(val_col, val_stats)
         print(f"val:   {val['tokens']:,} tokens", flush=True)
 
         # 2. Code: one pass over the mixed stream, per-language quotas.
-        code_store = sm.BucketStore(work / "code")
-        code_col = sm.Collector(cw, C, caps=caps, slack=spec.slack, store=code_store, **kw)
-        code_stats: Counter = Counter()
-        hashes: set[int] = set()
-        runner.collect(code_offers(sources.code_train(), cw, spec.licenses),
-                       code_col, code_stats,
-                       on_admit=lambda offer, res: hashes.add(sm.content_hash(offer.text)))
-        code_store.close()
+        code_col, code_stats, code_store, hashes = _code_phase(
+            runner, sources, spec, work, state, weights=cw, total=C, caps=caps,
+            report=root / COLLECT_REPORT, resume=resume)
         print(f"code collected: {sum(code_col.taken.values()):,} tokens, "
               f"{code_col.windows} windows, exhausted {sorted(code_col.exhausted)}, "
               f"last file {code_stats.get('last_file')}", flush=True)
 
-        # 3. English, then the other languages one at a time. Each language's target is
-        # set when its turn comes, from what the earlier ones actually held.
-        text_store = sm.BucketStore(work / "text")
-        text_cols: dict[str, tuple[sm.Collector, Counter]] = {}
-        text_cols[sm.ENGLISH] = _collect_text(runner, sources.text_train[sm.ENGLISH](),
-                                              sm.ENGLISH, E, text_store, spec, lid=lid,
-                                              slack=0.0)
-        for lang in order:
-            held = {x: float(sum(text_cols[x][0].taken.values())) for x in order
-                    if x in text_cols}
-            now, _ = sm.allocate(G, others, held)
-            text_cols[lang] = _collect_text(runner, sources.text_train[lang](), lang,
-                                            now[lang], text_store, spec, lid=lid,
-                                            slack=spec.slack)
-            print(f"{lang}: {sum(text_cols[lang][0].taken.values()):,} tokens "
-                  f"(target {now[lang]:,.0f})", flush=True)
-        text_store.close()
-
-        # 4. Final shares. The HTML cap is re-applied inside allocate after every
-        # redistribution of a short language's remainder.
+        # The code mix is known now: check it before any text is read. The HTML cap
+        # is re-applied inside allocate after every redistribution.
         code_have = {b: float(code_store.tokens[b]) for b in cw}
         code_final, code_short = sm.allocate(C, cw, code_have, caps)
+        planned_code = {b: v / C for b, v in code_final.items()}
+        code_violations = _violations(planned_code, cw, {}, {})
+        if code_violations:
+            write_manifest(root / COLLECT_REPORT, {
+                "stage": "after code collection", "violations": code_violations,
+                "code": {"collection": code_col.summary(), "stats": _plain(code_stats),
+                         "planned_share_of_code": planned_code}})
+            raise sm.ShareError(
+                "code is off target right after code collection, before any text was read, "
+                "so no train shards were written:\n  " + "\n  ".join(code_violations)
+                + f"\n(collected per language: {root / COLLECT_REPORT}; a common language "
+                  "short at the file cap needs more files (--max-code-files) or a lower "
+                  "weight; the collected code is kept in _work: rerun with --from-work "
+                  "after changing the weights)")
+
+        # 3. English, then the other languages one at a time.
+        text_cols, lid_warnings, text_store = _text_phase(
+            runner, sources, spec, work, state, lid=lid, english_total=E, group_total=G,
+            others=others, order=order)
+
+        # 4. Final shares.
         eng_have = float(text_store.tokens[sm.ENGLISH])
         grp_have = {x: float(sum(text_cols[x][0].taken.values())) for x in others}
         grp_final, grp_short = sm.allocate(G, others, grp_have) if others else ({}, 0.0)
@@ -867,7 +1322,6 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
                 final.update({TEXT_PREFIX + b: v for b, v in split.items()})
             else:
                 final[TEXT_PREFIX + x] = grp_final[x]
-        planned_code = {b: v / C for b, v in code_final.items()}
         planned_text = {sm.ENGLISH: final[TEXT_PREFIX + sm.ENGLISH] / text_total,
                         **{x: grp_final[x] / text_total for x in others}}
         violations = _violations(planned_code, cw, planned_text, tw)
@@ -878,6 +1332,8 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
             "text": {x: _text_summary(c, s) for x, (c, s) in text_cols.items()},
             "planned_share_of_text": planned_text,
         }
+        for x, warning in lid_warnings.items():
+            collection["text"][x]["lid_warning"] = warning
         short = []
         if code_short > 0.5:
             short.append(f"code: {code_short:,.0f} tokens short of {C:,.0f}")
@@ -892,11 +1348,12 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
                 raise sm.ShareError(
                     "the mix is off target, so no train shards were written:\n  "
                     + "\n  ".join(violations)
-                    + f"\n(collected per language: {root / COLLECT_REPORT}; a common "
-                      "language short at the file cap needs more files (--max-code-files) "
-                      "or a lower weight)")
+                    + f"\n(collected per language: {root / COLLECT_REPORT}; everything "
+                      "collected is kept in _work: change the weights or --train-tokens and "
+                      "rerun with --from-work, nothing is downloaded again)")
             raise RuntimeError("sources ran short: " + "; ".join(short)
-                               + f" (see {root / COLLECT_REPORT})")
+                               + f" (see {root / COLLECT_REPORT}; rerun with --from-work "
+                                 "and a smaller --train-tokens)")
 
         # 5. Train: every bucket interleaved by its final share.
         shares = {b: v / T for b, v in final.items()}
@@ -909,13 +1366,16 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
 
         # 6. Code validation (held-out files), deduplicated against train code.
         cv_read: Counter = Counter()
-        cv_docs = CodeDocs(_counted(sources.code_val(), cv_read), runner.tok,
-                           languages=tuple(cw),
+        cv_rows = _counted(sources.code_val(), cv_read)
+        cv_docs = CodeDocs(cv_rows, runner.tok, languages=tuple(cw),
                            licenses=spec.licenses, html_cap=spec.html_cap,
                            max_doc_tokens=spec.max_doc_tokens, exclude=hashes,
                            leak_guard=setup.guard)
-        cv = write_split(root / "code_val", spec.code_val_tokens, spec.shard_tokens, cv_docs,
-                         allow_short=True)
+        try:
+            cv = write_split(root / "code_val", spec.code_val_tokens, spec.shard_tokens,
+                             cv_docs, allow_short=True)
+        finally:
+            _close(cv_rows)  # stops the held-out downloads at once
         if cv["tokens"] == 0:
             raise RuntimeError("code_val: no held-out code document was written")
         code_val = {**_code_summary(cv, cv_docs), "target_tokens": spec.code_val_tokens,
@@ -1002,12 +1462,24 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
                             for b in final if b.startswith(TEXT_PREFIX) and text_lang(b) == x}}
             for x in tw},
     }
-    lid_info = provenance.get("lid")
-    if lid_info is not None:
-        lid_info = {**lid_info, "threshold": setup.lid_threshold,
-                    "rule": "drop when the top label is not the source language and its "
-                            "probability >= threshold; cmn_Hani goes to zho_Hans or zho_Hant "
-                            "by label (the likelier of the two when unsure), equal halves"}
+    lid_info = None
+    if lid:
+        lid_info = {
+            **(provenance.get("lid") or {}),
+            "threshold": setup.lid_threshold,
+            "max_chars": getattr(setup.lid, "max_chars", sm.LID_MAX_CHARS),
+            "rule": "a text document is dropped when the classifier's top label is not its "
+                    "source language and that label's probability >= threshold (at 0.0, "
+                    "every mismatch is dropped); a mismatch below the threshold is kept "
+                    "and counted as kept_while_unsure. The first max_chars characters are "
+                    "classified. cmn_Hani goes to zho_Hans or zho_Hant by label (the likelier "
+                    "of the two when unsure), equal halves",
+            "by_language": {x: {"kept": s["lid_kept"], "dropped": s["lid_dropped"],
+                                "kept_while_unsure": s["lid_kept_unsure"],
+                                "dropped_as": s.get("lid_dropped_as", {})}
+                            for x, s in collection["text"].items()},
+            "warnings": lid_warnings,
+        }
     manifest: dict[str, Any] = {
         "format": "data v2 (scripts/build_shards.py build_mix)",
         "tokenizer": provenance.get("tokenizer"),
@@ -1032,18 +1504,22 @@ def build_mix(root: Path, spec: MixSpec, sources: MixSources, setup: sm.DocSetup
         "share_check": {"min_weight": SHARE_CHECK_MIN_WEIGHT, "max_off": SHARE_CHECK_MAX_OFF,
                         "violations": final_violations},
         "sampling": {"slack": spec.slack, "window": spec.window,
-                     "stall_windows": spec.stall_windows, "stall_gain": spec.stall_gain},
+                     "stall_windows": spec.stall_windows, "stall_gain": spec.stall_gain,
+                     "projection": None if spec.code_files is None else {
+                         "code_files": spec.code_files,
+                         "from_file": spec.projection_min_files}},
         "workers": spec.workers,
+        "resume": resume,
         "build_started": started,
         "build_finished": _now(),
         "build_seconds": round(time.monotonic() - t0, 1),
     }
     write_manifest(root / MANIFEST, manifest)
-    if not spec.keep_work:
-        shutil.rmtree(work, ignore_errors=True)
-    if final_violations:
+    if final_violations:  # keep _work: --from-work can re-allocate without downloading
         raise sm.ShareError("train was written but its mix is off target:\n  "
                             + "\n  ".join(final_violations))
+    if not spec.keep_work:
+        shutil.rmtree(work, ignore_errors=True)
     return manifest
 
 
@@ -1056,20 +1532,24 @@ def _violations(code_shares: dict[str, float], code_weights: dict[str, float],
 
 # ------------------------------------------------------------------ real sources
 
+def code_file_name(index: int, total: int) -> str:
+    return f"data/train-{index:05d}-of-{total:05d}.parquet"
+
+
 def code_file_path(repo: str, revision: str, index: int, total: int) -> str:
-    return f"datasets/{repo}@{revision}/data/train-{index:05d}-of-{total:05d}.parquet"
+    return f"datasets/{repo}@{revision}/{code_file_name(index, total)}"
 
 
 def iter_code_row_groups(fs: Any, repo: str, revision: str, files: range, total: int,
                          columns: tuple[str, ...] = ("code", "language", "license", "path"),
-                         retries: int = 5,
+                         retries: int = DOWNLOAD_ATTEMPTS,
                          transform: Callable[[Any, int], Any] | None = None) -> Iterator[Any]:
     """The rows of each parquet row group, in file order, one row group at a time.
 
     Every row also carries "file" (its parquet index). A failed read is retried
     from the same (file, row group), so a network blip changes nothing in the output.
     With `transform`, each row group's pyarrow table and file index are passed to it
-    and whatever it returns is yielded instead (the data v2 build filters there).
+    and whatever it returns is yielded instead.
     """
     import pyarrow.parquet as pq
 
@@ -1102,10 +1582,120 @@ def iter_code_row_groups(fs: Any, repo: str, revision: str, files: range, total:
                 attempt += 1
                 if attempt > retries:
                     raise
-                wait = 5 * 2 ** (attempt - 1)
+                wait = retry_wait(attempt)
                 print(f"\nread failed ({path}, row group {rg}): {exc!r}; "
                       f"retry {attempt}/{retries} in {wait}s", file=sys.stderr, flush=True)
                 time.sleep(wait)
+
+
+def iter_text_files(fs: Any, paths: Iterable[str], retries: int = DOWNLOAD_ATTEMPTS,
+                    sleep: Callable[[float], None] = time.sleep) -> Iterator[dict]:
+    """{"text", "file"} rows of each parquet file's "text" column, one row group at a
+    time; a failed read is retried from the same (file, row group) with capped
+    backoff (as train_tokenizer.iter_parquet_text, which waits uncapped)."""
+    import pyarrow.parquet as pq
+
+    for path in paths:
+        rg, n_groups, attempt = 0, None, 0
+        while n_groups is None or rg < n_groups:
+            try:
+                with fs.open(path, "rb", block_size=8 * 1024 * 1024) as f:
+                    pf = pq.ParquetFile(f)
+                    n_groups = pf.metadata.num_row_groups
+                    while rg < n_groups:
+                        texts = pf.read_row_group(rg, columns=["text"]).column("text").to_pylist()
+                        rg += 1
+                        attempt = 0
+                        for t in texts:
+                            yield {"text": t, "file": path}
+            except Exception as exc:
+                attempt += 1
+                if attempt > retries:
+                    raise
+                wait = retry_wait(attempt)
+                print(f"\nread failed ({path}, row group {rg}): {exc!r}; "
+                      f"retry {attempt}/{retries} in {wait}s", file=sys.stderr, flush=True)
+                sleep(wait)
+
+
+def fetch_ahead(indices: Iterable[int], fetch: Callable[[int], Any], ahead: int, *,
+                attempts: int = DOWNLOAD_ATTEMPTS,
+                sleep: Callable[[float], None] = time.sleep) -> Iterator[tuple[int, Path]]:
+    """(index, local path) for each index, IN ORDER, downloading `ahead` files in
+    parallel threads. Each file is deleted as soon as the consumer asks for the next
+    one (or stops), so at most ahead + 1 files are on disk. A failed fetch is retried
+    (attempts in all, waits 5, 10, 20, ... capped at 300 s) and then raises. Closing
+    the generator cancels what has not started and deletes what finishes later."""
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
+
+    if ahead < 1:
+        raise ValueError("ahead must be at least 1")
+    todo = list(indices)
+
+    def fetch_retry(i: int) -> Path:
+        for attempt in range(1, attempts + 1):
+            try:
+                return Path(fetch(i))
+            except Exception as exc:
+                if attempt == attempts:
+                    raise RuntimeError(f"download of code file {i} failed after {attempts} "
+                                       f"attempts: {exc!r}") from exc
+                wait = retry_wait(attempt)
+                print(f"\ndownload failed (file {i}): {exc!r}; retry {attempt}/"
+                      f"{attempts - 1} in {wait}s", file=sys.stderr, flush=True)
+                sleep(wait)
+        raise AssertionError("unreachable")
+
+    def discard(fut: Any) -> None:
+        if not fut.cancelled() and fut.exception() is None:
+            Path(fut.result()).unlink(missing_ok=True)
+
+    pool = ThreadPoolExecutor(ahead, thread_name_prefix="download")
+    pending: deque = deque()
+    pos = 0
+
+    def submit() -> None:
+        nonlocal pos
+        if pos < len(todo):
+            pending.append((todo[pos], pool.submit(fetch_retry, todo[pos])))
+            pos += 1
+
+    try:
+        for _ in range(ahead):
+            submit()
+        while pending:
+            index, fut = pending.popleft()
+            path = fut.result()
+            submit()
+            try:
+                yield index, path
+            finally:
+                path.unlink(missing_ok=True)
+    finally:
+        for _, fut in pending:
+            fut.cancel()
+            fut.add_done_callback(discard)
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def hf_code_fetcher(repo: str, revision: str, total: int, dl_dir: Path
+                    ) -> Callable[[int], Path]:
+    """Download one github-code-clean parquet file whole into dl_dir (never the HF
+    cache) and check its footer, so a truncated download fails (and is retried)."""
+    def fetch(index: int) -> Path:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+
+        path = Path(hf_hub_download(repo, code_file_name(index, total), repo_type="dataset",
+                                    revision=revision, local_dir=dl_dir))
+        try:
+            pq.read_metadata(path)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+    return fetch
 
 
 def lower_priority(kernel32: Any = None) -> bool:
@@ -1138,13 +1728,22 @@ def _sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
-def mix_code_rows(fs: Any, repo: str, revision: str, files: range, total: int,
-                  languages: Iterable[str], licenses: Iterable[str]
-                  ) -> Callable[[], Iterator[dict]]:
-    """A MixSources code source: the files' rows, language and licence filtered in
-    pyarrow before any row becomes a Python object (the rest of the filters are
-    code_offers'). What a row group drops is attached to its next kept row
-    (row[FILTERED]), so it is counted when that row is consumed."""
+def _sha256_text(items: Iterable[str]) -> str:
+    return hashlib.sha256("\n".join(items).encode("utf-8")).hexdigest()
+
+
+def mix_code_rows(fetch: Callable[[int], Any], files: range, languages: Iterable[str],
+                  licenses: Iterable[str], *, ahead: int = DOWNLOAD_WORKERS,
+                  attempts: int = DOWNLOAD_ATTEMPTS,
+                  sleep: Callable[[float], None] = time.sleep
+                  ) -> Callable[..., Iterator[dict]]:
+    """A MixSources code source: rows(start_file) yields the rows of files
+    max(start_file, files.start) .. files.stop - 1 in order. Files are downloaded
+    whole, `ahead` at a time (fetch_ahead), read one row group at a time and deleted
+    once read. Language and licence are filtered in pyarrow before any row becomes a
+    Python object (the rest of the filters are code_offers'); what a row group drops
+    is attached to its next kept row (row[FILTERED]), and each file ends with a marker
+    row {FILE_END: index, FILTERED: what its last row groups dropped}."""
     columns = ("code", "language", "license", "path")
     langs, lics = sorted(languages), sorted(licenses)
 
@@ -1166,16 +1765,37 @@ def mix_code_rows(fs: Any, repo: str, revision: str, files: range, total: int,
         return rows, {"rows_scanned": n - n_keep, "dropped_language": n - n_lang,
                       "dropped_license": n_lang - n_keep}
 
-    def rows() -> Iterator[dict]:
-        groups = iter_code_row_groups(fs, repo, revision, files, total, columns=columns,
-                                      transform=transform)
+    def groups(start: int) -> Iterator[tuple[list[dict], dict[str, int], int | None]]:
+        import pyarrow.parquet as pq
+
+        dl = fetch_ahead(range(max(start, files.start), files.stop), fetch, ahead,
+                         attempts=attempts, sleep=sleep)
+        try:
+            for index, path in dl:
+                with open(path, "rb") as f:
+                    pf = pq.ParquetFile(f)
+                    for rg in range(pf.metadata.num_row_groups):
+                        yield (*transform(pf.read_row_group(rg, columns=list(columns)), index),
+                               None)
+                yield [], {}, index
+        finally:
+            dl.close()
+
+    def rows(start: int = 0) -> Iterator[dict]:
         carry: Counter = Counter()
-        for batch, counts in prefetch(groups, depth=4):
-            carry.update(counts)
-            if batch:
-                batch[0][FILTERED] = dict(carry)
-                carry = Counter()
-                yield from batch
+        it = prefetch(groups(start), depth=4)
+        try:
+            for batch, counts, file_end in it:
+                carry.update(counts)
+                if batch:
+                    batch[0][FILTERED] = dict(carry)
+                    carry = Counter()
+                    yield from batch
+                if file_end is not None:
+                    yield {FILE_END: file_end, FILTERED: dict(carry)}
+                    carry = Counter()
+        finally:
+            it.close()
 
     return rows
 
@@ -1190,35 +1810,161 @@ def _fw2_listing(fs: Any, dataset: str, revision: str, lang: str,
     return [name for name, _ in files], sum(size for _, size in files)
 
 
-def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
-    """The data v2 build from the real sources (Hugging Face), per the config and flags."""
-    import functools
+# ------------------------------------------------------------------ preflight
 
+def code_file_counts(table: Any, languages: Iterable[str], licenses: Iterable[str],
+                     max_bytes: float) -> dict[str, float]:
+    """Bytes of source per language in one code file's {language, license, size,
+    path} columns that pass the build's cheap filters (language, licence, path) and
+    the size cap (max_bytes, about max_doc_tokens tokens)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    keep = pc.and_(
+        pc.and_(pc.fill_null(pc.is_in(table.column("language"),
+                                      value_set=pa.array(sorted(languages))), False),
+                pc.fill_null(pc.is_in(table.column("license"),
+                                      value_set=pa.array(sorted(licenses))), False)),
+        pc.fill_null(pc.less_equal(table.column("size"), max_bytes), False))
+    kept = table.filter(keep)
+    out: Counter = Counter()
+    for lang, size, path in zip(kept.column("language").to_pylist(),
+                                kept.column("size").to_pylist(),
+                                kept.column("path").to_pylist()):
+        if path_skip_reason(path) is None:
+            out[lang] += size
+    return {k: float(v) for k, v in out.items()}
+
+
+def preflight(read_counts: Callable[[int], dict[str, float]], files: Iterable[int],
+              weights: dict[str, float], code_tokens: float, *, caps: dict[str, float],
+              chars_per_token: float = sm.DEFAULT_CHARS_PER_TOKEN,
+              file_bytes: list[int] | None = None, workers: int = 16, header: str = "",
+              report_path: Path | None = None) -> int:
+    """Read every file's counts (in parallel, results in file order), print the
+    report (shard_mix.format_preflight) and return the exit status: 0 when the files
+    can give the code mix, 3 when they cannot."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    files = list(files)
+    with ThreadPoolExecutor(workers) as pool:
+        per_file = list(tqdm(pool.map(read_counts, files), total=len(files), desc="preflight",
+                             unit="file", mininterval=5.0))
+    report = sm.preflight_report(per_file, weights, code_tokens, caps=caps,
+                                 chars_per_token=chars_per_token, file_bytes=file_bytes,
+                                 min_weight=SHARE_CHECK_MIN_WEIGHT,
+                                 max_off=SHARE_CHECK_MAX_OFF)
+    if header:
+        print(header)
+    print(sm.format_preflight(report), flush=True)
+    if report_path is not None:
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        write_manifest(Path(report_path), {"header": header, **report})
+        print(f"(report: {report_path})")
+    return 0 if report["ok"] else 3
+
+
+def _pinned(pinned: str, resolve: Callable[[], str], what: str) -> str:
+    if pinned:
+        return pinned
+    rev = resolve()
+    print(f"WARNING: data.{what} is not pinned in the config; using the Hub's current "
+          f"commit {rev}", file=sys.stderr, flush=True)
+    return rev
+
+
+def _code_train_files(d: Any, args: argparse.Namespace) -> int:
+    return min(args.max_code_files or d.code_heldout_first_file, d.code_heldout_first_file)
+
+
+def run_preflight(cfg: Any, args: argparse.Namespace) -> int:
+    """--preflight: read only the metadata columns of the code train files and report
+    whether they can fill the code mix at the configured token target."""
     from huggingface_hub import HfApi, HfFileSystem
 
-    import train_tokenizer as tt
+    d = cfg.data
+    api, fs = HfApi(), HfFileSystem()
+    rev = _pinned(d.code_revision, lambda: api.dataset_info(d.code_dataset).sha,
+                  "code_revision")
+    listed = {p["name"].rsplit("/", 1)[-1]: p.get("size") or 0
+              for p in fs.ls(f"datasets/{d.code_dataset}@{rev}/data", detail=True)
+              if p["name"].endswith(".parquet")}
+    if len(listed) != d.code_files_total:
+        raise RuntimeError(f"{d.code_dataset}@{rev} has {len(listed)} parquet files; "
+                           f"config says code_files_total = {d.code_files_total}")
+    n = _code_train_files(d, args)
+    file_bytes = [listed[code_file_name(i, d.code_files_total).rsplit("/", 1)[-1]]
+                  for i in range(n)]
+    T = int(args.train_tokens or cfg.train.total_tokens)
+    C = d.code_share * T
+    cpt = args.chars_per_token
+    max_bytes = d.code_max_doc_tokens * cpt
+    langs, lics = tuple(d.code_language_weights), d.code_licenses
+
+    def read(index: int) -> dict[str, float]:
+        import pyarrow.parquet as pq
+
+        path = code_file_path(d.code_dataset, rev, index, d.code_files_total)
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                with fs.open(path, "rb", block_size=1 << 20) as f:
+                    table = pq.ParquetFile(f).read(columns=["language", "license", "size",
+                                                            "path"])
+                return code_file_counts(table, langs, lics, max_bytes)
+            except Exception as exc:
+                if attempt == DOWNLOAD_ATTEMPTS:
+                    raise
+                print(f"\npreflight read failed ({path}): {exc!r}; retry in "
+                      f"{retry_wait(attempt)}s", file=sys.stderr, flush=True)
+                time.sleep(retry_wait(attempt))
+        raise AssertionError("unreachable")
+
+    header = (f"preflight: {d.code_dataset}@{rev[:10]}, code train files 0..{n - 1} "
+              f"({sum(file_bytes) / 1e9:,.0f} GB in all), code target {C:,.0f} tokens "
+              f"({d.code_share:.0%} of {T:,}), {cpt} chars/token; filters: languages, "
+              f"licences, vendored/minified paths, size <= {max_bytes:,.0f} bytes. Estimates "
+              "only: blank, leaked and too-long-in-tokens files are not seen here.")
+    return preflight(read, range(n), dict(d.code_language_weights), C,
+                     caps={"HTML": d.html_cap}, chars_per_token=cpt, file_bytes=file_bytes,
+                     workers=args.preflight_workers, header=header,
+                     report_path=Path(d.shard_dir) / PREFLIGHT_REPORT)
+
+
+def check_vocab(tokenizer_vocab: int, model_vocab: int, name: str) -> None:
+    """The shards' ids must fit the model's embedding and uint16."""
+    if tokenizer_vocab != model_vocab:
+        raise SystemExit(f"tokenizer {name} has a vocabulary of {tokenizer_vocab:,} but "
+                         f"model.vocab_size is {model_vocab:,}: shards built with it would not "
+                         "fit the model. Fix data.tokenizer or model.vocab_size.")
+    if tokenizer_vocab > 65536:
+        raise SystemExit(f"vocab {tokenizer_vocab} does not fit uint16 shards")
+
+
+def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
+    """The data v2 build from the real sources (Hugging Face), per the config and flags.
+
+    Everything that can fail without the network is checked first, before any
+    dataset is touched: the tokenizer (and its vocabulary against the model), the
+    LID model (downloaded and loaded, so a broken fastText install fails in seconds).
+    """
+    import functools
+
+    from huggingface_hub import HfApi, HfFileSystem, hf_hub_download
+
     from quipu.tokenizer import make_tokenizer
 
     d = cfg.data
-    if (d.dataset, d.subset) != (tt.TEXT_DATASET, "sample-10BT"):
-        raise SystemExit(f"data v2 reads English from {tt.TEXT_DATASET} sample-10BT; "
-                         f"the config says {d.dataset} {d.subset}")
-    tw = dict(d.text_language_weights) or {sm.ENGLISH: 1.0}
-    others = [x for x in tw if x != sm.ENGLISH]
-    api, fs = HfApi(), HfFileSystem()
-
     tok_factory = functools.partial(make_tokenizer, d.tokenizer)
     tok = tok_factory()
+    check_vocab(tok.vocab_size, cfg.model.vocab_size, d.tokenizer)
     tokenizer = {"name": d.tokenizer, "vocab_size": tok.vocab_size, "eot": tok.eot,
                  "path": None if d.tokenizer == "gpt2" else d.tokenizer,
                  "sha256": None if d.tokenizer == "gpt2" else _sha256_file(d.tokenizer)}
-    if tok.vocab_size > 65536:
-        raise SystemExit(f"vocab {tok.vocab_size} does not fit uint16 shards")
 
+    api = HfApi()
+    tw = dict(d.text_language_weights) or {sm.ENGLISH: 1.0}
     lid = lid_info = None
     if args.lid_filter:
-        from huggingface_hub import hf_hub_download
-
         lid_rev = d.lid_revision or api.model_info(d.lid_model).sha
         path = hf_hub_download(d.lid_model, LID_FILE, revision=lid_rev)
         lid = sm.FastTextLid(path)
@@ -1230,37 +1976,48 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
         lid_info = {"model": d.lid_model, "revision": lid_rev, "file": LID_FILE,
                     "sha256": _sha256_file(path), "labels": labels}
 
+    import train_tokenizer as tt
     from stepbuild.bench.run import LeakageGuard
+
+    if (d.dataset, d.subset) != (tt.TEXT_DATASET, "sample-10BT"):
+        raise SystemExit(f"data v2 reads English from {tt.TEXT_DATASET} sample-10BT; "
+                         f"the config says {d.dataset} {d.subset}")
+    others = [x for x in tw if x != sm.ENGLISH]
     guard = LeakageGuard()
     setup = sm.DocSetup(tokenizer=tok_factory, max_doc_tokens=d.code_max_doc_tokens,
                         guard=guard, lid=lid, lid_threshold=args.lid_threshold)
 
-    # Pin every dataset to one commit so every read agrees.
-    code_rev = api.dataset_info(d.code_dataset).sha
+    # Every dataset pinned to one commit (the config's), so every read agrees.
+    fs = HfFileSystem()
+    code_rev = _pinned(d.code_revision, lambda: api.dataset_info(d.code_dataset).sha,
+                       "code_revision")
     listed = [p for p in fs.ls(f"datasets/{d.code_dataset}@{code_rev}/data", detail=False)
               if p.endswith(".parquet")]
     if len(listed) != d.code_files_total:
         raise RuntimeError(f"{d.code_dataset}@{code_rev} has {len(listed)} parquet files; "
                            f"config says code_files_total = {d.code_files_total}")
-    max_files = min(args.max_code_files or d.code_heldout_first_file,
-                    d.code_heldout_first_file)
+    max_files = _code_train_files(d, args)
     langs, lics = tuple(d.code_language_weights), d.code_licenses
-    code_train = mix_code_rows(fs, d.code_dataset, code_rev, range(0, max_files),
-                               d.code_files_total, langs, lics)
-    code_val = mix_code_rows(fs, d.code_dataset, code_rev,
-                             range(d.code_heldout_first_file, d.code_files_total),
-                             d.code_files_total, langs, lics)
+    root = Path(d.shard_dir)
+    dl = root / MIX_WORK / "dl"
+    fetch = hf_code_fetcher(d.code_dataset, code_rev, d.code_files_total, dl)
+    code_train = mix_code_rows(fetch, range(0, max_files), langs, lics,
+                               ahead=args.download_workers)
+    code_val = mix_code_rows(fetch, range(d.code_heldout_first_file, d.code_files_total),
+                             langs, lics, ahead=2)
 
     def text_source(paths: list[str]) -> Callable[[], Iterator[dict]]:
-        return lambda: flatten(prefetch(batched(tt.iter_parquet_text(fs, paths), 1000),
-                                        depth=8))
+        return lambda: flatten(prefetch(batched(iter_text_files(fs, paths), 1000), depth=8))
 
-    text_rev = api.dataset_info(tt.TEXT_DATASET).sha
+    text_rev = _pinned(d.text_revision, lambda: api.dataset_info(tt.TEXT_DATASET).sha,
+                       "text_revision")
     names = tt.text_files(fs, text_rev)
     full = [f"datasets/{tt.TEXT_DATASET}@{text_rev}/{n}" for n in names]
     text_train = {sm.ENGLISH: text_source(full[:-1])}
     text_val = {sm.ENGLISH: text_source(full[-1:])}
-    fw2_rev = api.dataset_info(tt.FINEWEB2_DATASET).sha if others else None
+    fw2_rev = (_pinned(d.fineweb2_revision,
+                       lambda: api.dataset_info(tt.FINEWEB2_DATASET).sha, "fineweb2_revision")
+               if others else None)
     fw2: dict[str, Any] = {}
     for x in others:
         train_files, train_bytes = _fw2_listing(fs, tt.FINEWEB2_DATASET, fw2_rev, x, "train")
@@ -1268,6 +2025,7 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
         text_train[x] = text_source(train_files)
         text_val[x] = text_source(test_files)
         fw2[x] = {"train_files": len(train_files), "train_bytes": train_bytes,
+                  "train_files_sha256": _sha256_text(train_files),
                   "test_files": [f.split("/data/", 1)[-1] for f in test_files]}
     # Smallest language first: one that runs dry is then known before the larger
     # ones are collected, and they are given its remainder.
@@ -1281,7 +2039,8 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
         code_val_tokens=d.code_val_tokens, lang_val_tokens=args.lang_val_tokens,
         slack=args.slack, window=args.window, stall_windows=args.stall_windows,
         stall_gain=args.stall_gain, workers=args.workers, batch_docs=args.batch_docs,
-        text_order=order, keep_work=args.keep_work)
+        text_order=order, keep_work=args.keep_work, code_files=max_files,
+        projection_min_files=args.projection_min_files)
     provenance = {
         "tokenizer": tokenizer,
         "lid": lid_info,
@@ -1290,30 +2049,36 @@ def run_mix(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
                      "files_total": d.code_files_total, "train_files": [0, max_files - 1],
                      "heldout_files": [d.code_heldout_first_file, d.code_files_total - 1]},
             "english": {"dataset": tt.TEXT_DATASET, "revision": text_rev,
-                        "train_files": len(names) - 1, "heldout_files": names[-1:]},
+                        "train_files": len(names) - 1, "heldout_files": names[-1:],
+                        "files_sha256": _sha256_text(names)},
             "fineweb2": {"dataset": tt.FINEWEB2_DATASET, "revision": fw2_rev,
                          "collection_order": list(order), "by_language": fw2},
         },
     }
-    return build_mix(Path(d.shard_dir), spec, MixSources(code_train, code_val, text_train,
-                                                         text_val),
-                     setup, provenance)
+    return build_mix(root, spec, MixSources(code_train, code_val, text_train, text_val),
+                     setup, provenance, fresh=args.fresh, from_work=args.from_work)
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/quipu-114m.toml")
     parser.add_argument("--low-priority", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="run at BELOW_NORMAL process priority (Windows; default on)")
     v2 = parser.add_argument_group("data v2 (configs with code_language_weights)")
-    v2.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
-                    help="tokenising processes (default: all cores but one)")
+    v2.add_argument("--workers", type=int, default=min(8, max(1, (os.cpu_count() or 2) - 1)),
+                    help="tokenising processes (default: all cores but one, at most 8; the "
+                         "downloads, not the CPU, set the pace)")
+    v2.add_argument("--download-workers", type=int, default=DOWNLOAD_WORKERS,
+                    help="code parquet files downloaded ahead in parallel (whole files into "
+                         "<shard_dir>/_work/dl, each deleted once read; at most N+1 on disk)")
     v2.add_argument("--lid-filter", action=argparse.BooleanOptionalAction, default=False,
                     help="filter text with the config's lid_model (needs fasttext: Linux)")
     v2.add_argument("--lid-threshold", type=float, default=sm.DEFAULT_LID_THRESHOLD,
-                    help="drop a document when another language wins with at least this "
-                         "probability")
+                    help="drop a text document when another language is the top label with "
+                         "at least this probability (default 0.0: every mismatch is dropped; "
+                         "t > 0 keeps mismatches the classifier is less sure of, counted as "
+                         "kept_while_unsure)")
     v2.add_argument("--train-tokens", type=float, default=None,
                     help="train split size (default: train.total_tokens)")
     v2.add_argument("--max-code-files", type=int, default=None,
@@ -1326,19 +2091,46 @@ def main(argv: list[str] | None = None) -> None:
     v2.add_argument("--stall-windows", type=int, default=sm.DEFAULT_STALL_WINDOWS)
     v2.add_argument("--stall-gain", type=float, default=sm.DEFAULT_STALL_GAIN)
     v2.add_argument("--batch-docs", type=int, default=256)
+    v2.add_argument("--projection-min-files", type=int, default=PROJECTION_MIN_FILES,
+                    help="project the code mix at every code file from this one on")
     v2.add_argument("--keep-work", action="store_true",
                     help="keep <shard_dir>/_work (the collected buckets) after the build")
-    args = parser.parse_args(argv)
+    v2.add_argument("--fresh", action="store_true",
+                    help="discard a saved build in <shard_dir>/_work and start over")
+    v2.add_argument("--from-work", action="store_true",
+                    help="re-allocate and write from the buckets a saved build collected "
+                         "(after a share error; the weights / --train-tokens may differ); "
+                         "nothing collected is downloaded again")
+    v2.add_argument("--preflight", action="store_true",
+                    help="only read the code files' language/licence/size/path columns and "
+                         "report whether the build can meet the code mix (exit 3 if not)")
+    v2.add_argument("--chars-per-token", type=float, default=sm.DEFAULT_CHARS_PER_TOKEN,
+                    help="bytes of code per token, for the preflight's estimates")
+    v2.add_argument("--preflight-workers", type=int, default=32,
+                    help="files whose metadata the preflight reads at once")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     if args.low_priority:
         print(f"below-normal priority set: {lower_priority()}", flush=True)
 
     cfg = load_config(args.config)
     if uses_mix(cfg.data):
+        if args.preflight:
+            raise SystemExit(run_preflight(cfg, args))
         try:
             run_mix(cfg, args)
         except sm.ShareError as exc:
             print(f"\nERROR: {exc}", file=sys.stderr, flush=True)
             raise SystemExit(2) from None
+        except sm.ResumeError as exc:
+            print(f"\nERROR: {exc}", file=sys.stderr, flush=True)
+            raise SystemExit(4) from None
+        except sm.WorkerDied as exc:
+            print(f"\nERROR: {exc}", file=sys.stderr, flush=True)
+            raise SystemExit(5) from None
         return
 
     # Heavy imports; the tests never need them.
@@ -1376,8 +2168,8 @@ def main(argv: list[str] | None = None) -> None:
 
     build_all(Path(d.shard_dir), text_rows,
               val_tokens=d.val_tokens, train_tokens=cfg.train.total_tokens,
-              shard_tokens=d.shard_tokens, tok=Tokenizer(),
-              dataset=d.dataset, subset=d.subset, revision=revision, code=code)
+              shard_tokens=d.shard_tokens, tok=Tokenizer(), dataset=d.dataset,
+              subset=d.subset, revision=revision, code=code)
 
 
 if __name__ == "__main__":

@@ -21,24 +21,33 @@ bytes, whatever the number of worker processes. The pieces:
   stop. An exhausted bucket's quota is frozen at what it holds and the remainder is
   re-allocated over the others.
 
-- Runner: tokenises (and LID-labels) documents in `workers` processes (spawn, so it
-  behaves the same on Windows and Linux). Batches are submitted in stream order and
-  their results consumed in the same order (an ordered map with a bounded window),
-  and every admission decision is made in the main process in stream order, so the
-  output does not depend on scheduling. As an optimisation, a batch's documents of
-  buckets that were already full when the batch was submitted are not tokenised; if
-  a later redistribution makes such a document wanted after all, the main process
-  tokenises it itself. Either way the decision and the bytes are the same.
+- Runner: tokenises (and LID-labels) documents in `workers` processes (a
+  concurrent.futures ProcessPoolExecutor, spawn, so it behaves the same on Windows
+  and Linux). Batches are submitted in stream order and their results consumed in
+  the same order (a deque of futures, bounded), and every admission decision is made
+  in the main process in stream order, so the output does not depend on scheduling.
+  A worker that dies (killed for memory, a crash in native code) or fails to start
+  raises WorkerDied at once; it never hangs the build. As an optimisation, a batch's
+  documents of buckets that were already full when the batch was submitted are not
+  tokenised; if a later redistribution makes such a document wanted after all, the
+  main process tokenises it itself. Either way the decision and the bytes are the same.
+  A source may put MARK offers in its stream (the end of each of its files); they are
+  handled in decision order too (on_mark), which is where a build checkpoints.
 
-- BucketStore: each collected bucket is appended to a flat uint16 file with its
-  document ends, so the final train split can interleave buckets by their final
-  shares (weighted_interleave) without holding anything in memory.
+- BucketStore: each collected bucket is appended to a flat uint16 file
+  (<bucket>.bin, named from the sanitised bucket name) with an append-only file of
+  document ends (<bucket>.ends, uint64), so the final train split can interleave
+  buckets by their final shares (weighted_interleave) without holding anything in
+  memory, and a build killed part way can truncate the files back to its last
+  checkpoint (snapshot / restore) and carry on.
 
 Language ID (spec 11): lid_decision keeps a document when the classifier's top label
-is its source language (cmn_Hani: zho_Hans or zho_Hant), drops it when a different
-label wins with probability >= threshold, and keeps it when the classifier is unsure.
-cmn_Hani is split into zho_Hans / zho_Hant by the classifier's label (or, when unsure,
-by whichever of the two it rates higher).
+is its source language (cmn_Hani: zho_Hans or zho_Hant) and drops it when a different
+label wins with probability >= threshold. The default threshold is 0.0: any mismatch
+is dropped, as the spec says. A threshold t > 0 keeps a mismatched document whose top
+label has probability < t ("kept while unsure", counted). cmn_Hani is split into
+zho_Hans / zho_Hant by the classifier's label (or, when unsure, by whichever of the
+two it rates higher).
 """
 from __future__ import annotations
 
@@ -48,10 +57,12 @@ import math
 import multiprocessing
 import os
 import unicodedata
-from array import array
 from collections import Counter, deque
+from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
+from urllib.parse import quote
 
 import numpy as np
 
@@ -71,12 +82,20 @@ TOO_LONG = "too_long"
 LEAK = "leak"
 LID_DROP = "lid_drop"
 
+MARK = "mark"  # Offer.kind of a source's end-of-file marker (no document)
+
 DEFAULT_SLACK = 0.10
 DEFAULT_WINDOW = 40_000        # offers per window: about one github-code-clean file
 DEFAULT_STALL_WINDOWS = 10
 DEFAULT_STALL_GAIN = 1e-4      # of the bucket's original quota per window
-DEFAULT_LID_THRESHOLD = 0.5
+DEFAULT_LID_THRESHOLD = 0.0    # any mismatch is dropped (spec 11)
 LID_MAX_CHARS = 2000
+DEFAULT_CHARS_PER_TOKEN = 3.79  # code, the quipu-moe tokenizer (preflight estimates)
+
+# Set in the environment the worker processes are spawned with: one process per core
+# already, so the tokenizer and any BLAS must not start thread pools of their own.
+WORKER_ENV = {"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+              "TOKENIZERS_PARALLELISM": "false", "RAYON_NUM_THREADS": "1"}
 
 
 def content_hash(code: str) -> int:
@@ -148,53 +167,119 @@ class ShareError(RuntimeError):
     """The achieved mix is too far from the configured weights (see share_violations)."""
 
 
+class WorkerDied(RuntimeError):
+    """A tokenising worker process died or could not start."""
+
+
+class ResumeError(RuntimeError):
+    """A build's saved state cannot be resumed (see scripts/build_shards.py)."""
+
+
 # ------------------------------------------------------------------ collection
 
-class BucketStore:
-    """Per-bucket token files: <dir>/<i>.bin (uint16, documents back to back) plus the
-    end offset of every document. Append while collecting; read back with docs()."""
+def bucket_stem(bucket: str) -> str:
+    """A file-safe, reversible name for a bucket ("C++" -> "C%2B%2B")."""
+    return quote(bucket, safe="").replace(".", "%2E").replace("~", "%7E")
 
-    def __init__(self, directory: Path) -> None:
+
+class BucketStore:
+    """Per-bucket token files: <dir>/<stem>.bin (uint16, documents back to back) and
+    <dir>/<stem>.ends (uint64, the running token count after each document), both
+    append-only. Append while collecting; read back with docs() after close().
+
+    fresh=True deletes whatever an earlier build left in the directory. fresh=False
+    keeps it for restore(snapshot), which a resumed build must call before anything
+    else: it truncates every file back to the snapshot and deletes files of buckets
+    the snapshot does not have (written after it)."""
+
+    def __init__(self, directory: Path, *, fresh: bool = True) -> None:
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
-        for p in list(self.dir.glob("*.bin")):
-            p.unlink()
-        self._files: dict[str, Any] = {}
-        self._names: dict[str, str] = {}
-        self._ends: dict[str, array] = {}
+        if fresh:
+            for p in list(self.dir.glob("*.bin")) + list(self.dir.glob("*.ends")):
+                p.unlink()
+        self._ready = fresh
+        self._files: dict[str, tuple[Any, Any]] = {}
         self.tokens: Counter[str] = Counter()
+        self._docs: Counter[str] = Counter()
+
+    def _paths(self, bucket: str) -> tuple[Path, Path]:
+        stem = bucket_stem(bucket)
+        return self.dir / f"{stem}.bin", self.dir / f"{stem}.ends"
 
     def append(self, bucket: str, ids: np.ndarray) -> None:
-        f = self._files.get(bucket)
-        if f is None:
-            name = f"{len(self._names):03d}.bin"  # bucket names may not be file-safe
-            self._names[bucket] = name
-            f = self._files[bucket] = open(self.dir / name, "wb")
-            self._ends[bucket] = array("q")
-        f.write(ids.astype("<u2", copy=False).tobytes())
+        if not self._ready:
+            raise RuntimeError("a BucketStore opened with fresh=False needs restore() first")
+        files = self._files.get(bucket)
+        if files is None:
+            data, ends = self._paths(bucket)
+            files = self._files[bucket] = (open(data, "ab"), open(ends, "ab"))
+        files[0].write(ids.astype("<u2", copy=False).tobytes())
         self.tokens[bucket] += len(ids)
-        self._ends[bucket].append(self.tokens[bucket])
+        self._docs[bucket] += 1
+        files[1].write(np.uint64(self.tokens[bucket]).tobytes())
+
+    def snapshot(self, *, sync: bool = True) -> dict[str, list[int]]:
+        """{bucket: [tokens, documents]} after flushing (and fsyncing) every file."""
+        for f in (f for pair in self._files.values() for f in pair):
+            f.flush()
+            if sync:
+                os.fsync(f.fileno())
+        return {b: [self.tokens[b], self._docs[b]] for b in sorted(self._docs)
+                if self._docs[b]}
+
+    def restore(self, snapshot: dict[str, list[int]]) -> None:
+        """Back to `snapshot` (see the class docstring). Raises ResumeError when a file
+        is shorter than the snapshot says (lost or damaged)."""
+        self.close()
+        keep = {bucket_stem(b) for b in snapshot}
+        for p in list(self.dir.glob("*.bin")) + list(self.dir.glob("*.ends")):
+            if p.stem not in keep:
+                p.unlink()
+        self.tokens, self._docs = Counter(), Counter()
+        for bucket, (tokens, documents) in snapshot.items():
+            data, ends = self._paths(bucket)
+            have = (data.stat().st_size if data.exists() else -1,
+                    ends.stat().st_size if ends.exists() else -1)
+            if have[0] < 2 * tokens or have[1] < 8 * documents:
+                raise ResumeError(f"{self.dir}: bucket {bucket!r} has {have} bytes on disk, "
+                                  f"less than its checkpoint ({2 * tokens}, {8 * documents}); "
+                                  "the work directory is damaged: rerun with --fresh")
+            os.truncate(data, 2 * tokens)
+            os.truncate(ends, 8 * documents)
+            if documents:
+                with open(ends, "rb") as f:
+                    f.seek(8 * (documents - 1))
+                    last = int(np.frombuffer(f.read(8), dtype="<u8")[0])
+                if last != tokens:
+                    raise ResumeError(f"{ends}: last end {last} != checkpoint {tokens} tokens; "
+                                      "rerun with --fresh")
+            self.tokens[bucket], self._docs[bucket] = tokens, documents
+        self._ready = True
 
     def close(self) -> None:
-        for f in self._files.values():
-            f.close()
-        self._files = {b: None for b in self._files}
+        for pair in self._files.values():
+            for f in pair:
+                f.close()
+        self._files = {}
 
     def documents(self, bucket: str) -> int:
-        return len(self._ends.get(bucket, ()))
+        return self._docs.get(bucket, 0)
 
     def docs(self, bucket: str) -> Iterator[np.ndarray]:
         """The bucket's documents in collection order (memory-mapped)."""
         if self.tokens[bucket] == 0:
             return iter(())
-        if self._files.get(bucket) is not None:
+        if bucket in self._files:
             raise RuntimeError("close() the store before reading it")
-        data = np.memmap(self.dir / self._names[bucket], dtype="<u2", mode="r")
-        ends = self._ends[bucket]
+        data_path, ends_path = self._paths(bucket)
+        data = np.memmap(data_path, dtype="<u2", mode="r", shape=(self.tokens[bucket],))
+        ends = np.memmap(ends_path, dtype="<u8", mode="r", shape=(self._docs[bucket],))
 
         def gen() -> Iterator[np.ndarray]:
             start = 0
             for end in ends:
+                end = int(end)
                 yield data[start:end]
                 start = end
         return gen()
@@ -233,9 +318,42 @@ class Collector:
         self.offers = 0
         self.windows = 0
         self.redistributions = 0
+        # Documents of each bucket that reached a decision (past the cheap filters and
+        # LID), wanted or not: how common the bucket is in the stream (projections).
+        self.offered: Counter[str] = Counter()
         self._stalled: Counter[str] = Counter()
         self._window_start = dict(self.taken)
         self._requota()
+
+    def snapshot(self) -> dict[str, Any]:
+        """Everything needed to rebuild this collector exactly (JSON-safe)."""
+        return {"params": {"weights": self.weights, "total": self.total, "caps": self.caps,
+                           "slack": self.slack, "window": self.window,
+                           "stall_windows": self.stall_windows, "stall_gain": self.stall_gain},
+                "state": {"taken": self.taken, "docs": dict(self.docs),
+                          "exhausted": self.exhausted, "offers": self.offers,
+                          "windows": self.windows, "redistributions": self.redistributions,
+                          "offered": dict(self.offered), "stalled": dict(self._stalled),
+                          "window_start": self._window_start}}
+
+    @classmethod
+    def from_snapshot(cls, snap: dict[str, Any], store: BucketStore | None = None
+                      ) -> "Collector":
+        col = cls(store=store, **snap["params"])
+        st = snap["state"]
+        if set(st["taken"]) != set(col.weights):
+            raise ResumeError(f"collector state has buckets {sorted(st['taken'])}, "
+                              f"weights have {sorted(col.weights)}")
+        col.taken = {b: int(st["taken"][b]) for b in col.weights}
+        col.docs = Counter(st["docs"])
+        col.exhausted = {b: dict(v) for b, v in st["exhausted"].items()}
+        col.offers, col.windows = int(st["offers"]), int(st["windows"])
+        col.redistributions = int(st["redistributions"])
+        col.offered = Counter(st["offered"])
+        col._stalled = Counter(st["stalled"])
+        col._window_start = {b: int(st["window_start"][b]) for b in col.weights}
+        col._requota()
+        return col
 
     def _requota(self) -> None:
         held = {b: float(self.taken[b]) for b in self.exhausted}
@@ -300,8 +418,107 @@ class Collector:
                      "otherwise only the source's file cap ends collection"),
             "by_bucket": {b: {"weight": self.weights[b], "initial_quota": self.initial[b],
                               "quota": self.base[b], "tokens": self.taken[b],
-                              "documents": self.docs[b]} for b in self.weights},
+                              "documents": self.docs[b],
+                              "offered_documents": self.offered[b]} for b in self.weights},
         }
+
+
+def projected_available(col: Collector, files_read: int, files_left: int) -> dict[str, float]:
+    """What each bucket of a collector over a file-by-file source should hold after
+    `files_left` more files: what it holds plus its rate so far. The rate is counted
+    from the documents OFFERED (wanted or not, so a bucket that has been full part of
+    the time is not under-rated) times its mean admitted document size. An exhausted
+    bucket holds what it has."""
+    out = {}
+    for b in col.weights:
+        if b in col.exhausted or col.docs[b] == 0 or files_read <= 0:
+            out[b] = float(col.taken[b])
+            continue
+        per_file = col.offered[b] / files_read * (col.taken[b] / col.docs[b])
+        out[b] = col.taken[b] + per_file * max(files_left, 0)
+    return out
+
+
+def projection_violations(col: Collector, files_read: int, files_total: int, *,
+                          min_weight: float = 0.05, max_off: float = 0.02,
+                          what: str = "code") -> tuple[list[str], dict[str, float]]:
+    """share_violations of the mix the collector is heading for at the file cap."""
+    avail = projected_available(col, files_read, files_total - files_read)
+    alloc, _ = allocate(col.total, col.weights, avail, col.caps)
+    shares = {b: v / col.total for b, v in alloc.items()}
+    return (share_violations(shares, col.weights, min_weight=min_weight, max_off=max_off,
+                             what=what), avail)
+
+
+def preflight_report(per_file: list[dict[str, float]], weights: dict[str, float],
+                     total_tokens: float, *, caps: dict[str, float] | None = None,
+                     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+                     file_bytes: list[int] | None = None, min_weight: float = 0.05,
+                     max_off: float = 0.02) -> dict[str, Any]:
+    """Whether the code files, in order, can fill the code mix.
+
+    per_file: for each file the build would read, the bytes of source per language
+    that pass the cheap filters (language, licence, path, size). Bytes become tokens
+    at chars_per_token (code is nearly all ASCII). A language needs the files up to the
+    one where its running total reaches its quota (allocate over the weights and caps);
+    the build reads until every language is full, so it reads the most any language
+    needs, or every file if one never fills. ok: the mix the files can give is within
+    max_off of every weight >= min_weight.
+    """
+    caps = caps or {}
+    quota, _ = allocate(total_tokens, weights, None, caps)
+    running = dict.fromkeys(weights, 0.0)
+    needed: dict[str, int | None] = dict.fromkeys(weights)
+    for i, counts in enumerate(per_file):
+        for b in weights:
+            running[b] += counts.get(b, 0.0) / chars_per_token
+            if needed[b] is None and running[b] >= quota[b]:
+                needed[b] = i + 1
+    final, short = allocate(total_tokens, weights, running, caps)
+    shares = {b: v / total_tokens for b, v in final.items()}
+    violations = share_violations(shares, weights, min_weight=min_weight, max_off=max_off)
+    unfilled = [b for b in weights if needed[b] is None]
+    files_read = (len(per_file) if unfilled or not per_file
+                  else max(n for n in needed.values() if n is not None))
+    limiting = (unfilled if unfilled else
+                [b for b in weights if needed[b] == files_read])
+    return {
+        "files": len(per_file), "total_tokens": total_tokens,
+        "chars_per_token": chars_per_token,
+        "by_language": {b: {"weight": weights[b], "quota_tokens": quota[b],
+                            "available_tokens": running[b], "files_to_fill": needed[b],
+                            "projected_share": shares[b]} for b in weights},
+        "files_read": files_read,
+        "limiting_languages": limiting,
+        "download_bytes": sum(file_bytes[:files_read]) if file_bytes else None,
+        "shortfall_tokens": short,
+        "violations": violations,
+        "ok": not violations,
+    }
+
+
+def format_preflight(report: dict[str, Any]) -> str:
+    """The preflight report as a table and a verdict (see preflight_report)."""
+    lines = [f"{'language':<12}{'weight':>8}{'quota':>12}{'available':>12}"
+             f"{'files to fill':>15}{'share':>9}"]
+    for b, r in report["by_language"].items():
+        need = r["files_to_fill"]
+        off = abs(r["projected_share"] - r["weight"]) * 100
+        flag = "" if r["weight"] < 0.05 or off <= 2 else "  <-- off target"
+        lines.append(f"{b:<12}{r['weight']:>8.2%}{r['quota_tokens']:>12.3e}"
+                     f"{r['available_tokens']:>12.3e}"
+                     f"{(str(need) if need is not None else 'never'):>15}"
+                     f"{r['projected_share']:>9.2%}{flag}")
+    gb = report["download_bytes"]
+    lines.append(f"the build would read {report['files_read']} of {report['files']} code files"
+                 + (f" (~{gb / 1e9:,.1f} GB to download)" if gb else "")
+                 + f"; limited by {', '.join(report['limiting_languages']) or '-'}")
+    if report["ok"]:
+        lines.append("verdict: OK - every language of weight >= 5% within 2 pp of its weight")
+    else:
+        lines.append("verdict: FAIL - the files cannot give the configured code mix:")
+        lines += [f"  {v}" for v in report["violations"]]
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ documents
@@ -323,6 +540,7 @@ class Result(NamedTuple):
     ids: np.ndarray | None
     label: str | None = None
     prob: float | None = None
+    unsure: bool = False  # LID labelled it another language but below the threshold
 
 
 def normalise_for_lid(text: str, max_chars: int = LID_MAX_CHARS) -> str:
@@ -331,11 +549,17 @@ def normalise_for_lid(text: str, max_chars: int = LID_MAX_CHARS) -> str:
     return " ".join(unicodedata.normalize("NFKC", text[:max_chars]).split())
 
 
+def lid_accepts(source: str, label: str) -> bool:
+    """True when `label` is the source language (cmn_Hani: either Chinese script)."""
+    return label in (ZH_BUCKETS if source == ZH_SOURCE else (source,))
+
+
 def lid_decision(source: str, label: str, prob: float, probs: dict[str, float],
                  threshold: float) -> tuple[str, bool]:
-    """(bucket, keep) for a text document of `source` that the classifier labelled."""
-    accepted = ZH_BUCKETS if source == ZH_SOURCE else (source,)
-    if label in accepted:
+    """(bucket, keep) for a text document of `source` that the classifier labelled.
+    Kept when the label is the source language; otherwise dropped when the label's
+    probability >= threshold (always, at the default 0.0), else kept (unsure)."""
+    if lid_accepts(source, label):
         return (label if source == ZH_SOURCE else source), True
     if prob >= threshold:
         return source, False
@@ -418,28 +642,37 @@ def process_doc(kind: str, source: str, text: str, skip: frozenset[str], setup: 
         return Result(source, OK, np.asarray(ids, dtype=np.uint16))
     label = prob = None
     bucket = source
+    unsure = False
     if setup.lid is not None:
         label, prob, probs = setup.lid.predict(text)
         bucket, keep = lid_decision(source, label, prob, probs, setup.lid_threshold)
         if not keep:
             return Result(source, LID_DROP, None, label, prob)
+        unsure = not lid_accepts(source, label)
     if bucket in skip:
-        return Result(bucket, DEFERRED, None, label, prob)
+        return Result(bucket, DEFERRED, None, label, prob, unsure)
     ids = encode_document(text, tok)
     if ids is None:
-        return Result(bucket, BLANK, None, label, prob)
-    return Result(bucket, OK, np.asarray(ids, dtype=np.uint16), label, prob)
+        return Result(bucket, BLANK, None, label, prob, unsure)
+    return Result(bucket, OK, np.asarray(ids, dtype=np.uint16), label, prob, unsure)
 
 
 _WORKER: dict[str, Any] = {}
 
 
 def _init_worker(setup: DocSetup) -> None:
-    # One process per core already: keep the Rust tokenizer single-threaded.
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["RAYON_NUM_THREADS"] = "1"
+    # One process per core already: keep the Rust tokenizer single-threaded (the
+    # spawn environment has WORKER_ENV too; this covers a caller that bypassed it).
+    for key, value in WORKER_ENV.items():
+        os.environ[key] = value
     _WORKER["setup"] = setup
     _WORKER["tok"] = setup.tokenizer()
+    if setup.lid is not None and hasattr(setup.lid, "model"):
+        setup.lid.model  # load it now: a broken install fails at start, not mid-build
+
+
+def _ping() -> bool:
+    return True
 
 
 def _run_job(job: tuple[int, list[tuple[str, str, str]], frozenset[str]]
@@ -449,23 +682,42 @@ def _run_job(job: tuple[int, list[tuple[str, str, str]], frozenset[str]]
     return seq, [process_doc(k, s, t, skip, setup, tok) for k, s, t in docs]
 
 
+WORKER_DIED = ("a tokenising worker process died or failed to start (killed for memory? "
+               "a crash in the tokenizer or fastText? an exception in the worker "
+               "initializer?), so the build stops here rather than hang. Everything up "
+               "to the last checkpoint is kept in <shard_dir>/_work: rerun the same "
+               "command to resume.")
+
+
+def _result(fut: Future) -> Any:
+    try:
+        return fut.result()
+    except BrokenProcessPool as exc:
+        raise WorkerDied(f"{WORKER_DIED} ({exc})") from exc
+
+
 def ordered_map(fn: Callable[[Any], Any], jobs: Iterable[Any], pool: Any,
                 ahead: int) -> Iterator[Any]:
-    """fn over jobs, results in SUBMISSION order: an ordered imap with at most `ahead`
-    jobs in flight (Pool.imap would read the whole job stream ahead, unbounded).
+    """fn over jobs, results in SUBMISSION order: a deque of futures with at most
+    `ahead` jobs in flight (Executor.map would read the whole job stream ahead).
     A job is pulled only after the result `ahead` places before it was handed out,
-    so what the consumer has done by then is fixed, not a matter of timing."""
+    so what the consumer has done by then is fixed, not a matter of timing. A dead
+    worker raises WorkerDied (BrokenProcessPool underneath) instead of hanging."""
     if pool is None:
         for job in jobs:
             yield fn(job)
         return
-    pending: deque = deque()
-    for job in jobs:
-        pending.append(pool.apply_async(fn, (job,)))
-        if len(pending) > ahead:
-            yield pending.popleft().get()
-    while pending:
-        yield pending.popleft().get()
+    pending: deque[Future] = deque()
+    try:
+        for job in jobs:
+            pending.append(pool.submit(fn, job))
+            if len(pending) > ahead:
+                yield _result(pending.popleft())
+        while pending:
+            yield _result(pending.popleft())
+    finally:
+        for fut in pending:
+            fut.cancel()
 
 
 def batched(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
@@ -491,16 +743,39 @@ class Runner:
         self.batch_docs = batch_docs
         self.ahead = ahead if ahead is not None else 4 * workers
         self.tok = setup.tokenizer()
-        self.pool = None
+        self.pool: ProcessPoolExecutor | None = None
+        self._saved_env: dict[str, str | None] = {}
         if workers > 1:
+            # Workers are spawned on demand while the pool lives, so the environment
+            # they inherit is set for the pool's lifetime and restored by close().
+            for key, value in WORKER_ENV.items():
+                self._saved_env[key] = os.environ.get(key)
+                os.environ[key] = value
             ctx = multiprocessing.get_context("spawn")
-            self.pool = ctx.Pool(workers, initializer=_init_worker, initargs=(setup,))
+            self.pool = ProcessPoolExecutor(workers, mp_context=ctx, initializer=_init_worker,
+                                            initargs=(setup,))
+            try:  # a worker that cannot start fails here, in seconds
+                _result(self.pool.submit(_ping))
+            except BaseException:
+                self.close()
+                raise
 
     def close(self) -> None:
-        if self.pool is not None:
-            self.pool.terminate()
-            self.pool.join()
-            self.pool = None
+        pool, self.pool = self.pool, None
+        if pool is not None:
+            procs = list((getattr(pool, "_processes", None) or {}).values())
+            pool.shutdown(wait=False, cancel_futures=True)
+            for p in procs:  # do not wait for a batch nobody will read
+                if p.is_alive():
+                    p.terminate()
+            for p in procs:
+                p.join(timeout=10)
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._saved_env = {}
 
     def __enter__(self) -> "Runner":
         return self
@@ -514,38 +789,64 @@ class Runner:
         return seq, [process_doc(k, s, t, skip, self.setup, self.tok) for k, s, t in docs]
 
     def collect(self, offers: Iterable[Offer], collector: Collector, stats: Counter, *,
-                on_admit: Callable[[Offer, Result], None] | None = None) -> None:
+                on_admit: Callable[[Offer, Result], None] | None = None,
+                on_mark: Callable[[dict], None] | None = None) -> None:
         """Offer documents in order until collector.done or offers run out.
 
         Decision order per document (fixed, so the counts are deterministic too):
         text: dropped by LID; then over quota; code: over quota; then (both) leak,
         too long, admitted. stats counts: offers, admitted, skipped_quota, lid_dropped,
-        dropped_leakage, skipped_too_long, skipped_blank.
+        lid_kept_unsure, dropped_leakage, skipped_too_long, skipped_blank. A MARK
+        offer adds its meta["counts"] to stats and calls on_mark(meta), in the same
+        order. The offers iterator is closed when collection ends (a generator's
+        read-ahead threads and downloads stop with it).
         """
-        if collector.done:
-            return
+        offers_it = iter(offers)
+        try:
+            if collector.done:
+                return
+            self._collect(offers_it, collector, stats, on_admit, on_mark)
+        finally:
+            close = getattr(offers_it, "close", None)
+            if close is not None:
+                close()
+
+    def _collect(self, offers: Iterator[Offer], collector: Collector, stats: Counter,
+                 on_admit: Callable[[Offer, Result], None] | None,
+                 on_mark: Callable[[dict], None] | None) -> None:
         pending: dict[int, tuple[list[Offer], frozenset[str]]] = {}
+
+        def sent(o: Offer, skip: frozenset[str]) -> bool:
+            # Code of a full language is not even sent; text goes out for its LID label.
+            return o.kind != MARK and not (o.kind == CODE and o.source in skip)
 
         def jobs() -> Iterator[tuple[int, list[tuple[str, str, str]], frozenset[str]]]:
             for seq, batch in enumerate(batched(offers, self.batch_docs)):
                 skip = collector.full()
                 pending[seq] = (batch, skip)
-                # Code of a full language is not even sent; text goes out for its LID label.
-                yield seq, [(o.kind, o.source, o.text) for o in batch
-                            if not (o.kind == CODE and o.source in skip)], skip
+                yield seq, [(o.kind, o.source, o.text) for o in batch if sent(o, skip)], skip
 
         fn = _run_job if self.pool is not None else self._local
-        for seq, results in ordered_map(fn, jobs(), self.pool, self.ahead):
-            batch, skip = pending.pop(seq)
-            it = iter(results)
-            for offer in batch:
-                if offer.kind == CODE and offer.source in skip:
-                    res = Result(offer.source, DEFERRED, None)
-                else:
-                    res = next(it)
-                self._decide(offer, res, collector, stats, on_admit)
-                if collector.done:
-                    return
+        results_it = ordered_map(fn, jobs(), self.pool, self.ahead)
+        try:
+            for seq, results in results_it:
+                batch, skip = pending.pop(seq)
+                it = iter(results)
+                for offer in batch:
+                    if offer.kind == MARK:
+                        stats.update(offer.meta.get("counts") or {})
+                        if on_mark is not None:
+                            on_mark(offer.meta)
+                        continue
+                    if offer.kind == CODE and offer.source in skip:
+                        res = Result(offer.source, DEFERRED, None)
+                    else:
+                        res = next(it)
+                    self._decide(offer, res, collector, stats, on_admit)
+                    if collector.done:
+                        return
+        finally:
+            results_it.close()
 
     def _decide(self, offer: Offer, res: Result, collector: Collector, stats: Counter,
                 on_admit: Callable[[Offer, Result], None] | None) -> None:
@@ -559,6 +860,9 @@ class Runner:
                 stats["lid_dropped"] += 1
                 stats[f"lid_dropped_as:{res.label}"] += 1
                 return
+            if res.unsure:
+                stats["lid_kept_unsure"] += 1
+            collector.offered[res.bucket] += 1
             if not collector.wants(res.bucket):
                 stats["skipped_quota"] += 1
                 return
