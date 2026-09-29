@@ -82,7 +82,9 @@ uv run python -m stepbuild.dataset.build --phase mine \
 The mine phase makes no `gh` call. It writes the same shards, `SOURCES.jsonl`,
 `manifest.json` and `report.md` as the one-command build (`--limit` without
 `--phase` still does both in one go, as before). A rerun skips repos already
-mined. A candidate whose licence lookup failed on the laptop is reported as
+mined. Each repo keeps at most 50 examples after dedupe, spread over its history
+(`--max-per-repo N` changes it, `0` turns the cap off); the cap is recomputed
+from the mined data on every run, so changing it needs no re-mining. A candidate whose licence lookup failed on the laptop is reported as
 failed; rerun discover on the laptop to retry it.
 
 ## 4. Bring results back

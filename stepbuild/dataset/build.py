@@ -52,13 +52,20 @@ history) and by a hash of the normalised reply (LF line endings, trailing
 whitespace stripped): the same files written twice teach nothing new and, across
 splits, would leak. Repos are visited train first, then validation, then test
 (each sorted by name), and the first example with a given key is kept, so a
-collision keeps the train copy. The split is format_example's (assign_split, by
+collision keeps the train copy. Then each repo is capped at --max-per-repo
+examples (MAX_PER_REPO, 0 = no cap): a repo with k > N examples left after
+dedupe keeps those at indices round(i * k / N), i = 0..N-1, of its examples in
+first-parent order (cap_indices), so one huge repo cannot dominate the data and
+what it keeps is spread over its whole history. The selection depends only on
+the mined data, so it is recomputed on every run and the manifest and resume
+logic do not see it. The split is format_example's (assign_split, by
 repo). Shards are `<split>-NNN.jsonl`, SHARD_ROWS rows each, written atomically
 (every split gets at least an empty -000 shard; stale higher-numbered shards from
 an earlier, larger build are removed). SOURCES.jsonl lists the repos that
 contributed at least one kept example. report.md gives repos found / licensed /
 mined per tag, examples per split, drops for every filters.REASONS key (zeros
-included), the token caps, leakage skips, dedupe counts and the token counter.
+included), the token caps, leakage skips, dedupe counts, the per-repo cap (with
+the CAP_TABLE_ROWS largest repos before and after it) and the token counter.
 """
 from __future__ import annotations
 
@@ -91,6 +98,8 @@ MAX_FILE_LINES = 400
 MAX_USER_TOKENS = 6000
 MAX_TOTAL_TOKENS = 8000
 SHARD_ROWS = 2000
+MAX_PER_REPO = 50       # examples kept per repo after dedupe (0 = no cap); see cap_indices
+CAP_TABLE_ROWS = 10
 TAG_ORDER = ("fullstack", "flask", "react")
 PARAMS = {
     "max_files": MAX_FILES, "max_lines": MAX_LINES, "max_file_lines": MAX_FILE_LINES,
@@ -263,8 +272,21 @@ def _read_jsonl(path: Path):
                 yield json.loads(line)
 
 
-def assemble(out: Path, entries: Sequence[dict], mined_dir: Path) -> dict:
-    """Dedupe, shard, and write SOURCES.jsonl. Returns the assembly counts."""
+def cap_indices(k: int, n: int) -> list[int]:
+    """Which of a repo's k examples (first-parent order) the per-repo cap keeps:
+    all of them when n is 0 or k <= n, else the n indices round(i * k / n) for i
+    in 0..n-1 (Python's round, half to even), which are distinct because k / n > 1
+    and are spread evenly over the history, starting at the first example."""
+    if n <= 0 or k <= n:
+        return list(range(k))
+    return sorted({round(i * k / n) for i in range(n)})
+
+
+def assemble(
+    out: Path, entries: Sequence[dict], mined_dir: Path, max_per_repo: int = 0
+) -> dict:
+    """Dedupe, cap per repo, shard, and write SOURCES.jsonl. Returns the assembly
+    counts. `max_per_repo` 0 means no cap (build() passes MAX_PER_REPO)."""
     by_split: dict[str, list[dict]] = {s: [] for s in SPLITS}
     split_of_repo: dict[str, str] = {}
     for e in entries:
@@ -294,8 +316,11 @@ def assemble(out: Path, entries: Sequence[dict], mined_dir: Path) -> dict:
         shards[split].append(name)
         rows_out[split] = []
 
+    capped = 0
+    per_repo: dict[str, tuple[int, int]] = {}
     for e in ordered:
         split = split_of_repo[e["repo"]]
+        kept: list[dict] = []
         for row in _read_jsonl(mined_dir / f"{repo_dir_name(e['repo'])}.jsonl"):
             key = _reply_key(row)
             dup = "sha" if row["commit"] in seen_sha else "reply" if key in seen_reply else None
@@ -307,6 +332,11 @@ def assemble(out: Path, entries: Sequence[dict], mined_dir: Path) -> dict:
             if dup == "reply":
                 dup_reply += 1
                 continue
+            kept.append(row)
+        chosen = [kept[i] for i in cap_indices(len(kept), max_per_repo)]
+        capped += len(kept) - len(chosen)
+        per_repo[e["repo"]] = (len(kept), len(chosen))
+        for row in chosen:
             rows_out[split].append(row)
             kept_per_repo[e["repo"]] += 1
             by_split[split].append(e["repo"])
@@ -334,6 +364,9 @@ def assemble(out: Path, entries: Sequence[dict], mined_dir: Path) -> dict:
         "dedupe_reply": dup_reply,
         "shards": shards,
         "sources": len(sources),
+        "max_per_repo": max_per_repo,
+        "capped": capped,
+        "per_repo": per_repo,
     }
 
 
@@ -361,6 +394,9 @@ def render_report(
         f"- caps: user message <= {MAX_USER_TOKENS} tokens, system + user + reply <= "
         f"{MAX_TOTAL_TOKENS} tokens",
         f"- token counter: {TOKEN_COUNTER}",
+        f"- per-repo cap: {assembled['max_per_repo']}"
+        + (" (no cap)" if assembled["max_per_repo"] == 0 else
+           " examples per repo, after dedupe, spread over its history"),
         "",
         "## Repos",
         "",
@@ -414,6 +450,7 @@ def render_report(
         f"- examples after the caps and the guard: {formatted}",
         f"- duplicates removed: {assembled['dedupe_sha'] + assembled['dedupe_reply']} "
         f"({assembled['dedupe_sha']} by commit SHA, {assembled['dedupe_reply']} by reply)",
+        f"- examples removed by the per-repo cap: {assembled['capped']}",
         f"- kept in the shards: {sum(ex.values())}",
         "",
         "### Drops per filter reason",
@@ -421,6 +458,15 @@ def render_report(
         *_table(["reason", "commits"], [[r, drops[r]] for r in REASONS]
                 + [["total", sum(drops[r] for r in REASONS)]]),
     ]
+    top = sorted(assembled["per_repo"].items(), key=lambda kv: (-kv[1][0], kv[0].casefold()))
+    top = [(repo, b, a) for repo, (b, a) in top if b > 0][:CAP_TABLE_ROWS]
+    if top:
+        lines += [
+            "",
+            f"### Largest repos (top {CAP_TABLE_ROWS} by examples before the per-repo cap)",
+            "",
+            *_table(["repo", "before cap", "after cap"], [list(t) for t in top]),
+        ]
     failed = [(c.repo, e.get("error", "")) for c, e in zip(candidates, entries)
               if e.get("status") == "failed"]
     if failed:
@@ -439,10 +485,13 @@ def build(
     command: str = "",
     phase: str | None = None,
     candidates_path: Path | None = None,
+    max_per_repo: int = MAX_PER_REPO,
 ) -> dict:
     """Run the build, or one phase of it (module docstring). Returns the assembly
     counts, or for the discover phase {"candidates", "licensed", "path"}. `runner`
     runs gh (discover phase only); `clone_runner` runs git clone (mine phase)."""
+    if not isinstance(max_per_repo, int) or max_per_repo < 0:
+        raise ValueError(f"max_per_repo must be an int >= 0, got {max_per_repo!r}")
     if phase not in (None, *PHASES):
         raise ValueError(f"phase must be one of {PHASES} or None, got {phase!r}")
     started = datetime.datetime.now().astimezone()
@@ -511,7 +560,7 @@ def build(
         manifest["repos"][c.repo] for c in candidates
         if manifest["repos"].get(c.repo, {}).get("status") == "mined"
     ]
-    assembled = assemble(out, entries, mined_dir)
+    assembled = assemble(out, entries, mined_dir, max_per_repo=max_per_repo)
     finished = datetime.datetime.now().astimezone()
     meta = {
         "command": command or f"build(limit={limit}, out={out})",
@@ -535,7 +584,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "reads candidates.json; default: both")
     parser.add_argument("--candidates", type=Path, default=None,
                         help=f"candidates file for --phase mine (default OUT/{CANDIDATES_FILE})")
+    parser.add_argument("--max-per-repo", type=int, default=MAX_PER_REPO,
+                        help=f"examples kept per repo after dedupe, spread over its history "
+                             f"(default {MAX_PER_REPO}; 0 = no cap)")
     args = parser.parse_args(argv)
+    if args.max_per_repo < 0:
+        parser.error("--max-per-repo must be 0 (no cap) or more")
     if args.limit is None and args.phase != "mine":
         parser.error("--limit is required unless --phase mine")
     if args.limit is not None and args.limit < 1:
@@ -545,6 +599,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stderr)
     argv_list = sys.argv[1:] if argv is None else list(argv)
     result = build(args.limit, args.out, phase=args.phase, candidates_path=args.candidates,
+                   max_per_repo=args.max_per_repo,
                    command="python -m stepbuild.dataset.build " + " ".join(argv_list))
     if args.phase == "discover":
         print(f"wrote {result['candidates']} candidates ({result['licensed']} licensed) "
