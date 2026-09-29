@@ -397,6 +397,12 @@ def main() -> None:
     parser.add_argument("--code-share", type=float, default=CODE_SHARE)
     parser.add_argument("--english-share", type=float, default=ENGLISH_SHARE)
     parser.add_argument("--max-code-files", type=int, default=MAX_CODE_FILES)
+    parser.add_argument("--max-windows", type=int, default=MAX_WINDOWS,
+                        help="code sampler: a language not filled by this window is "
+                             "exhausted (about one code file per window)")
+    parser.add_argument("--min-window-gain", type=float, default=MIN_WINDOW_GAIN,
+                        help="code sampler: a language gaining under this fraction of its "
+                             "quota in a window is exhausted")
     parser.add_argument("--low-priority", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--threads", type=int, default=4,
                         help="RAYON_NUM_THREADS for the trainer (default 4; see below)")
@@ -432,7 +438,8 @@ def main() -> None:
     fw2_test = {lang: fineweb2_files(fs, fw2_rev, lang, "test") for lang in FINEWEB2_LANGUAGES}
 
     code_budget = args.sample_bytes * args.code_share
-    sampler = QuotaSampler(LANGUAGE_WEIGHTS, code_budget)
+    sampler = QuotaSampler(LANGUAGE_WEIGHTS, code_budget, max_windows=args.max_windows,
+                           min_gain=args.min_window_gain)
     code_stats: Counter = Counter()
     text_stats: Counter = Counter()
     fw2_summary: dict[str, dict] = {}
