@@ -130,6 +130,7 @@ INFRA_CHECKS = ("model_error", "prompt_too_long")
 N_MODEL_STEPS = sum(1 for s in make_plan("app", "spec").steps if s.model_step)
 LEAK_JACCARD = 0.9
 SHINGLE = 5
+LEAK_FILE_MIN_CHARS = 200  # LeakageGuard.find_file ignores shorter reference files
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _TOKEN = re.compile(r"\w+|[^\w\s]")
@@ -201,11 +202,19 @@ class LeakageGuard:
     once from every app's reference replies, so one guard can screen many replies:
     check_no_leakage screens a library with it, and the dataset build
     (stepbuild.dataset.build) skips mined examples it flags, so a leaked reference
-    never reaches the shards in the first place."""
+    never reaches the shards in the first place.
+
+    find_file screens a single source file with no FILE markers (a pretraining code
+    document, scripts/build_shards.py): it matches when the file, whitespace
+    collapsed, equals any reference FILE block of at least LEAK_FILE_MIN_CHARS
+    collapsed characters. Shorter blocks (an empty __init__.py, a one-line config)
+    are left out: they are generic, and exact copies of them on GitHub are not
+    leaks of a solution."""
 
     def __init__(self) -> None:
         self._whole: dict[str, str] = {}
         self._by_path: dict[str, list[tuple[str, frozenset]]] = {}
+        self._files: dict[str, str] = {}
         for app in list_apps():
             for n, reply in enumerate(load_reference(app), start=1):
                 where = f"{app} step {n}"
@@ -214,6 +223,19 @@ class LeakageGuard:
                     self._by_path.setdefault(block.path, []).append(
                         (where, _shingles(block.content))
                     )
+                    collapsed = _collapse(block.content)
+                    if len(collapsed) >= LEAK_FILE_MIN_CHARS:
+                        self._files.setdefault(collapsed, f"{where} {block.path}")
+
+    @property
+    def reference_files(self) -> int:
+        """How many distinct reference files find_file compares against."""
+        return len(self._files)
+
+    def find_file(self, content: str) -> str | None:
+        """None if the source file `content` is clean, else the reference file it
+        copies ("<app> step <n> <path>"), whitespace ignored."""
+        return self._files.get(_collapse(content))
 
     def find(self, reply: str) -> str | None:
         """None if `reply` is clean, else what it copies, worded to follow a label
