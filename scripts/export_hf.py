@@ -148,6 +148,20 @@ class MoEExport:
     results_dir: Path | None = None
     card_inputs: object | None = None        # quipu.model_card.CardInputs
     log: object = print
+    # The evaluation splits of the int4 quality measurement (default cfg.data.shard_dir).
+    # A chat config's shard_dir is the SFT data: main() passes pretraining_shard_dir.
+    eval_shard_dir: Path | None = None
+
+
+def pretraining_shard_dir(cfg) -> Path:
+    """The pretraining shards of a config: its own data.shard_dir, or for a config
+    that inherits (the chat SFT config, whose shard_dir is the chat data) the base
+    config's, the first file in cfg.layers."""
+    from quipu.config import load_config
+
+    if len(cfg.layers) > 1:
+        return Path(load_config(cfg.layers[0]).data.shard_dir)
+    return Path(cfg.data.shard_dir)
 
 
 def parity_input(cfg, n_rows: int = 2, width: int = 256) -> torch.Tensor:
@@ -260,7 +274,8 @@ def _int4_quality(e: MoEExport, ref, q) -> dict:
     q.to(device)
     splits = {label: evalsets.split_batches(split, cfg.train.micro_batch, cfg.model.context,
                                             e.bpb_batches)
-              for label, split in evalsets.eval_splits(cfg.data.shard_dir).items()}
+              for label, split in evalsets.eval_splits(
+                  e.eval_shard_dir or cfg.data.shard_dir).items()}
     bpb: dict[str, dict[str, float]] = {label: {} for label in splits}
     tokens: dict[str, int] = {}
     ce = tasks = None
@@ -458,7 +473,9 @@ def main(argv: list[str] | None = None) -> int:
     moe.add_argument("--results-dir", default="results/export")
     moe.add_argument("--run-dir", default="results/moe")
     moe.add_argument("--ab-dir", default="results/ab")
-    moe.add_argument("--manifest", default=None, help="default: <shard_dir>/manifest.json")
+    moe.add_argument("--manifest", default=None,
+                     help="default: <pretraining shard_dir>/manifest.json (for a chat config, "
+                          "its base config's)")
     moe.add_argument("--ledger", default="results/spend.json")
     moe.add_argument("--milestones-dir", default="results/moe/milestones")
     moe.add_argument("--code-eval-dir", default="results/code_eval")
@@ -476,8 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     def p(v):
         return None if v is None else Path(v)
 
+    shards = pretraining_shard_dir(cfg)
     inputs = CardInputs(run_dir=p(args.run_dir), ab_dir=p(args.ab_dir),
-                        manifest=p(args.manifest) or Path(cfg.data.shard_dir) / "manifest.json",
+                        manifest=p(args.manifest) or shards / "manifest.json",
                         ledger=p(args.ledger), milestones_dir=p(args.milestones_dir),
                         code_eval_dir=p(args.code_eval_dir), experts_dir=p(args.experts_dir),
                         sft_manifest=p(args.sft_manifest), hardware=args.hardware)
@@ -489,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         chat=args.chat, int4=args.int4, card_only=args.card_only, parity_tol=args.parity_tol,
         device=device,
         bpb_batches=args.bpb_batches, int4_code_eval=args.int4_code_eval, repo_id=args.repo_id,
-        results_dir=p(args.results_dir), card_inputs=inputs))
+        results_dir=p(args.results_dir), card_inputs=inputs, eval_shard_dir=shards))
 
 
 if __name__ == "__main__":

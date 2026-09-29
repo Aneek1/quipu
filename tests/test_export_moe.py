@@ -197,6 +197,40 @@ def test_chat_export_carries_the_chat_template(tmp_path):
     assert "chat model" in card and "base_model: AneekC/" in card
 
 
+
+def test_chat_export_measures_int4_bpb_on_the_pretraining_eval_splits(tmp_path):
+    # The chat config's shard_dir is the SFT data, whose val/ is chat conversations:
+    # labelled "English" and measured there, the chat card's int4 table would be wrong.
+    import dataclasses
+
+    from tests.moe_fixtures import TEXTS, encode_split
+    from quipu.data import write_shard
+
+    code, cfg, tok, _, _ = _export(tmp_path, int4=True)
+    assert code == 0
+    base = json.loads((tmp_path / "hf" / "int4_report.json").read_text(encoding="utf-8"))
+    chat_dir = tmp_path / "chat-sft"
+    write_shard(chat_dir / "val" / "shard_000.bin", encode_split(tok, TEXTS["code"], 300))
+    chat_cfg = dataclasses.replace(cfg, data=dataclasses.replace(cfg.data,
+                                                                 shard_dir=str(chat_dir)))
+    out = tmp_path / "hf_chat"
+    e = export_hf.MoEExport(cfg=chat_cfg, ckpt_dir=Path(cfg.train.ckpt_dir), out=out,
+                            int4=True, chat=True, parity_tol=1e-5, bpb_batches=2,
+                            eval_shard_dir=Path(cfg.data.shard_dir), log=lambda _m: None,
+                            card_inputs=model_card.CardInputs())
+    assert export_hf.export_moe(e) == 0
+    rep = json.loads((out / "int4_report.json").read_text(encoding="utf-8"))
+    assert rep["bpb"] == base["bpb"] and rep["bpb_tokens"] == base["bpb_tokens"]
+
+
+def test_eval_shard_dir_of_a_chat_config_is_its_pretraining_shards():
+    sft = load_config(ROOT / "configs" / "quipu-moe-sft.toml")
+    assert sft.data.shard_dir == "data/chat-sft"
+    assert export_hf.pretraining_shard_dir(sft) == Path("data/shards-moe")
+    full = load_config(ROOT / "configs" / "quipu-moe.toml")
+    assert export_hf.pretraining_shard_dir(full) == Path("data/shards-moe")
+
+
 REAL_TOKENIZER = ROOT / "artifacts" / "tokenizer" / "tokenizer.json"
 
 
