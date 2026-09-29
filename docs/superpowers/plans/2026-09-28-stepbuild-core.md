@@ -305,6 +305,7 @@ All rules exactly as spec §3.1 (extensions, excluded paths, low-information mes
   - Run git with `--no-renames` (`git log`/`git show`), so a rename shows as a delete plus an add and is dropped as `deleted_file` instead of passing as a one-file edit.
   - The report lists drop counts for every key in `filters.REASONS` (including `deleted_file`, and zeros), plus the format caps (over `max_user_tokens`, over `max_total_tokens`) and dedupe counts.
   - The tree lists files only, depth-limited, like the harness's PROJECT TREE (no directory entries; format_example drops entries FileBlock rejects anyway).
+  - PROJECT TREE lists at most 60 files (backend/ and frontend/src/ first), shared by dataset and harness. (one implementation: `stepbuild.harness.prompt.render_tree`, `TREE_MAX_FILES`.)
   - Pass the same `max_files`/`max_lines`/`max_file_lines` to `drop_reason` and `format_example`.
   - The report records the token counter: ceil(chars / 3), the harness's `default_count_tokens`, not the plan's chars / 4 (Task 9 deviation, chosen so dataset examples fit the harness budget).
 - [ ] Tests (no network): discover parses recorded search JSON fixtures, tags correctly, retries on a scripted 429 then succeeds, uses the cache on a second call; licence keeps MIT, drops `NOASSERTION`/None/GPL; mine over a tiny repo built in `tmp_path` with `git init` (git-marked) yields the expected commits and skips the root commit; build end-to-end with injected runner + tiny repo writes shards, SOURCES, report with correct counts.

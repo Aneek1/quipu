@@ -44,7 +44,9 @@ Tree. The parent commit's files (no directory entries), as the harness shows
 its PROJECT TREE: the harness's own visibility rule (no node_modules/,
 __pycache__/, acceptance tests, lockfiles), minus generated or vendored paths,
 at most TREE_DEPTH directories deep, and at most MAX_TREE_FILES entries (the
-shallowest first), listed sorted.
+shallowest first), listed sorted. This is only the candidate list: the formatter
+renders it with the harness's render_tree, which applies the TREE_MAX_FILES cap
+and ordering (the one implementation of the tree text).
 """
 from __future__ import annotations
 

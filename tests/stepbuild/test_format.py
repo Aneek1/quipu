@@ -11,7 +11,8 @@ from stepbuild.dataset.filters import Commit, FileChange
 from stepbuild.dataset.format import format_example
 from stepbuild.dataset.split import assign_split
 from stepbuild.harness.blocks import FileBlock, parse_blocks, render_blocks
-from stepbuild.harness.prompt import SYSTEM_PROMPT
+from stepbuild.harness.plan import make_plan
+from stepbuild.harness.prompt import SYSTEM_PROMPT, build_messages, render_tree
 from stepbuild.harness.retrieve import ExampleLibrary
 
 MODELS_BEFORE = "class Store:\n    pass\n"
@@ -217,3 +218,28 @@ def test_env_files_and_secret_context_are_left_out(path, text):
 def test_a_name_containing_env_later_is_shown():
     user = fmt(context={"backend/settings.env.py": "X = 1\n"})["messages"][1]["content"]
     assert "=== FILE: backend/settings.env.py ===" in user
+
+
+def test_tree_is_capped_and_identical_to_the_harness_tree(tmp_path):
+    tree = [f"docs/page_{i:03d}.md" for i in range(100)] + TREE
+    row = fmt(tree=tree)
+    user = row["messages"][1]["content"]
+    dataset_tree = user.split("PROJECT TREE:\n", 1)[1]
+    assert dataset_tree == render_tree(tree)
+    lines = dataset_tree.split("\n")[:-1]
+    assert len(lines) == 61
+    assert lines[:3] == TREE  # backend/ and frontend/src/ survive the cap
+    assert lines[-1] == "... (43 more files not shown)"
+
+    plan = make_plan("todo", "A todo list.")
+    files = {p: "x\n" for p in tree}
+    harness_user = build_messages(plan, plan.steps[0], files, [], max_tokens=10**9)[1]["content"]
+    harness_tree = harness_user.split("\nPROJECT TREE:\n", 1)[1].split("\nREPLY WITH:\n", 1)[0]
+    assert harness_tree == dataset_tree
+
+    # a capped row still loads through the harness's loader
+    path = tmp_path / "train-00000.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (ex,) = ExampleLibrary.from_jsonl([path], split=row["split"]).examples
+    assert ex.step == "Add the item store"
+    assert ex.reply == row["messages"][2]["content"]

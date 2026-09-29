@@ -7,8 +7,10 @@ pieces are built with the harness's own parts rather than copies of them:
 - the system message is prompt.SYSTEM_PROMPT verbatim;
 - the user message is "STEP: <message>", a blank line, "CONTEXT FILES:" with the
   context as FILE blocks (render_blocks; "(none yet)" when there is none, as in the
-  harness), a blank line, and "PROJECT TREE:" with one path per line. That is the
-  same framing and separators the harness uses for those sections;
+  harness), a blank line, and "PROJECT TREE:" rendered by the harness's own
+  render_tree (at most prompt.TREE_MAX_FILES files, backend/ and frontend/src/
+  first, then "... (N more files not shown)"). That is the same framing,
+  separators and tree text the harness uses for those sections;
 - the assistant message is render_blocks of every changed file's post-commit
   contents, in the commit's order.
 
@@ -40,7 +42,7 @@ from typing import Mapping, Sequence
 from stepbuild.dataset.filters import Commit, contains_secret, drop_reason
 from stepbuild.dataset.split import assign_split
 from stepbuild.harness.blocks import BlockError, FileBlock, render_blocks
-from stepbuild.harness.prompt import SYSTEM_PROMPT, default_count_tokens
+from stepbuild.harness.prompt import SYSTEM_PROMPT, default_count_tokens, render_tree
 
 TAGS = frozenset({"fullstack", "flask", "react"})
 NO_CONTEXT = "(none yet)\n"
@@ -116,7 +118,7 @@ def format_example(
     user = (
         f"STEP: {step}\n\n"
         f"CONTEXT FILES:\n{render_blocks(ctx) if ctx else NO_CONTEXT}\n"
-        "PROJECT TREE:\n" + "".join(p + "\n" for p in tree if _is_tree_path(p))
+        "PROJECT TREE:\n" + render_tree([p for p in tree if _is_tree_path(p)])
     )
     if default_count_tokens(user) > max_user_tokens:
         return None

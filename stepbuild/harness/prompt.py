@@ -12,7 +12,8 @@ around it:
     EXAMPLES:        retrieved dataset examples, each labelled as coming from a
                      different project (omitted when there are none)
     CONTEXT FILES:   FILE blocks of the files the step builds on (rule below)
-    PROJECT TREE:    sorted relative paths of the project's files
+    PROJECT TREE:    relative paths of the project's files, at most TREE_MAX_FILES
+                     (render_tree, shared with the dataset formatter)
     REPLY WITH:      the reply format and the files to write; always last, so it
                      is the freshest thing in the model's context
 
@@ -38,12 +39,21 @@ must stay hidden even if a caller passes them in by mistake), node_modules and
 __pycache__. The tree also leaves out noise that says nothing about the code
 (lockfiles, .gitkeep, pytest.ini).
 
+Tree cap. render_tree is the ONE implementation of the PROJECT TREE text; the
+dataset formatter (stepbuild.dataset.format) calls it too, so training examples
+and inference prompts list files the same way. PROJECT TREE lists at most
+TREE_MAX_FILES (60) files (backend/ and frontend/src/ first), shared by dataset
+and harness. Order: files under backend/ or frontend/src/ first, sorted, then
+every other file, sorted; the first max_files of that order are shown in that
+order, followed by "... (N more files not shown)" when any were left out.
+Duplicates are listed once.
+
 Budget. The system and user messages together must fit in `max_tokens`, counted
 with `count_tokens` (default ceil(chars / 3), deliberately pessimistic for code).
 The runner derives max_tokens from the model's context window. When over, examples
 are skipped first: each is kept, in rank order, only if it still fits, so a small
 lower-ranked example can survive a large higher-ranked one. Then the tree is
-trimmed from the end with a note saying how many paths were left out. FILE blocks
+trimmed further (below the TREE_MAX_FILES cap) from the end with a note saying how many paths were left out. FILE blocks
 are never cut: half a file is worse than no attempt, since the model would rewrite
 the missing half from nothing. If the prompt is still over budget, PromptTooLong
 is raised with the measured size, and the runner records a failed attempt.
@@ -73,6 +83,8 @@ SYSTEM_PROMPT = (
     "new contents of each file you change, in the FILE block format."
 )
 DEFAULT_MAX_TOKENS = 8000
+TREE_MAX_FILES = 60
+_TREE_FIRST = ("backend/", "frontend/src/")
 
 _FRONTEND_SRC = "frontend/src/"
 _FRONTEND_EXTS = (".js", ".jsx", ".css")
@@ -150,6 +162,30 @@ def _in_tree(path: str) -> bool:
     return _visible(path) and path.rsplit("/", 1)[-1] not in _TREE_NOISE
 
 
+def tree_order(paths: Sequence[str]) -> list[str]:
+    """`paths` without duplicates, files under backend/ or frontend/src/ first
+    (sorted), then the rest (sorted): the order render_tree shows and cuts in."""
+    unique = set(paths)
+    first = sorted(p for p in unique if p.startswith(_TREE_FIRST))
+    rest = sorted(p for p in unique if not p.startswith(_TREE_FIRST))
+    return first + rest
+
+
+def render_tree(paths: Sequence[str], max_files: int = TREE_MAX_FILES) -> str:
+    """The PROJECT TREE body: the first `max_files` of tree_order(paths), one per
+    line, then "... (N more files not shown)" if N > 0 were left out. Shared by
+    the harness prompt and the dataset formatter, so both render it identically."""
+    if isinstance(paths, str):
+        raise TypeError("paths must be a sequence of path strings, not a single str")
+    if max_files < 0:
+        raise ValueError("max_files must be >= 0")
+    ordered = tree_order(paths)
+    lines = ordered[:max_files]
+    if len(ordered) > len(lines):
+        lines = lines + [f"... ({len(ordered) - len(lines)} more files not shown)"]
+    return "".join(line + "\n" for line in lines)
+
+
 def _render_example(n: int, example: Example) -> str:
     reply = example.reply.rstrip("\n")
     return f"{_EXAMPLE_LABEL.format(n=n)}\nStep: {example.step}\n{reply}\n"
@@ -189,7 +225,8 @@ def build_messages(
         f"Write every file listed, even one you do not change: {', '.join(step.allowed_files)}. "
         "No other text and no ``` fences.\n"
     )
-    tree = sorted(p for p in files if _in_tree(p))
+    tree = [p for p in files if _in_tree(p)]
+    tree_cap = min(len(set(tree)), TREE_MAX_FILES)
     system_tokens = count(SYSTEM_PROMPT)
 
     def assemble(kept: Sequence[Example], shown: int) -> str:
@@ -199,10 +236,7 @@ def build_messages(
                 "EXAMPLES:\n" + "\n".join(_render_example(i, e) for i, e in enumerate(kept, 1))
             )
         parts.append(f"CONTEXT FILES:\n{context}")
-        lines = tree[:shown]
-        if shown < len(tree):
-            lines = lines + [f"... ({len(tree) - shown} more files not shown)"]
-        parts.append("PROJECT TREE:\n" + "".join(line + "\n" for line in lines))
+        parts.append("PROJECT TREE:\n" + render_tree(tree, shown))
         parts.append(reply_with)
         return "\n".join(parts)
 
@@ -211,13 +245,13 @@ def build_messages(
 
     kept: list[Example] = []
     for example in examples:  # skip, don't stop: a smaller later example may fit
-        if size(assemble(kept + [example], len(tree))) <= max_tokens:
+        if size(assemble(kept + [example], tree_cap)) <= max_tokens:
             kept.append(example)
-    user = assemble(kept, len(tree))
+    user = assemble(kept, tree_cap)
     if size(user) > max_tokens:
         # kept is empty here (anything kept fit with the full tree). Largest tree
         # prefix that fits, by binary search; the result is checked exactly.
-        lo, hi = 0, len(tree)
+        lo, hi = 0, tree_cap
         while lo < hi:
             mid = (lo + hi + 1) // 2
             if size(assemble(kept, mid)) <= max_tokens:

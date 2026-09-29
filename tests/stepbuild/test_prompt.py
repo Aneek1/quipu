@@ -18,7 +18,10 @@ from stepbuild.harness.prompt import (
     append_feedback,
     build_messages,
     default_count_tokens,
+    TREE_MAX_FILES,
     feedback_messages,
+    render_tree,
+    tree_order,
 )
 from stepbuild.harness.retrieve import Example
 
@@ -189,7 +192,9 @@ def test_project_tree_is_sorted_and_omits_noise():
     user = _user(build_messages(PLAN, _step(1), TEMPLATE_FILES, []))
     tree = _section(user, "\nPROJECT TREE:\n").strip().split("\n")
     noise = {"frontend/package-lock.json", "frontend/src/components/.gitkeep", "backend/pytest.ini"}
-    assert tree == sorted(set(TEMPLATE_FILES) - noise)
+    kept = set(TEMPLATE_FILES) - noise
+    first = sorted(p for p in kept if p.startswith(("backend/", "frontend/src/")))
+    assert tree == first + sorted(kept - set(first))  # backend/, frontend/src/ first
     assert "backend/requirements.txt" in tree
 
 
@@ -251,12 +256,17 @@ def test_budget_trims_tree_after_examples_but_never_cuts_a_file():
     models = "\n".join(f"LINE_{i} = {i}" for i in range(1000)) + "\n"  # ~15k chars
     files = {**TEMPLATE_FILES, **many, "backend/models.py": models}
     ex = [Example("An example", _block("e.py", "e = 1\n"))]
-    msgs = build_messages(PLAN, _step(1), files, ex, max_tokens=8000)
+    # The 60-file cap alone fits easily, so set the budget just under it.
+    capped = _size(build_messages(PLAN, _step(1), files, [], max_tokens=10**9, count_tokens=len))
+    budget = capped - 200
+    msgs = build_messages(PLAN, _step(1), files, ex, max_tokens=budget, count_tokens=len)
     user = _user(msgs)
-    assert _size(msgs, default_count_tokens) <= 8000
+    assert _size(msgs) <= budget
     assert "An example" not in user
     assert _block("backend/models.py", models) in user  # whole file, not truncated
-    assert "more files not shown" in _section(user, "\nPROJECT TREE:\n")
+    tree = _section(user, "\nPROJECT TREE:\n").strip().split("\n")
+    assert len(tree) - 1 < 60  # trimmed below the cap
+    assert tree[-1] == f"... ({len(set(files)) - 3 - (len(tree) - 1)} more files not shown)"
     assert user.index("\nPROJECT TREE:\n") < user.index("\nREPLY WITH:\n")
 
 
@@ -358,3 +368,57 @@ def test_feedback_cap_uses_the_callers_counter_and_leaves_short_output_alone():
     untouched = feedback_messages(base, "r", [_check("pytest", False, "short")])
     assert "--- pytest ---\nshort\n" in untouched[-1]["content"]
     assert TRIMMED not in untouched[-1]["content"]
+
+
+# ------------------------------------------------------------ tree cap (render_tree)
+
+
+def test_tree_max_files_is_60():
+    assert TREE_MAX_FILES == 60
+
+
+def test_render_tree_caps_100_paths_at_60_with_a_note():
+    paths = [f"docs/p{i:03d}.md" for i in range(100)]
+    text = render_tree(paths)
+    assert text.endswith("\n")
+    lines = text.split("\n")[:-1]
+    assert len(lines) == 61
+    assert lines[:60] == sorted(paths)[:60]
+    assert lines[60] == "... (40 more files not shown)"
+
+
+def test_render_tree_at_or_under_the_cap_lists_all_with_no_note():
+    for n in (0, 1, 59, 60):
+        paths = [f"docs/p{i:03d}.md" for i in range(n)]
+        text = render_tree(paths)
+        assert text == "".join(p + "\n" for p in sorted(paths))
+        assert "more files not shown" not in text
+
+
+def test_render_tree_keeps_backend_and_frontend_src_first():
+    noise = [f"aaa/n{i:03d}.txt" for i in range(100)]  # sorts before backend/
+    keep = ["frontend/src/App.jsx", "backend/app.py", "frontend/src/components/List.jsx",
+            "backend/models.py"]
+    lines = render_tree(noise + keep).split("\n")[:-1]
+    assert lines[:4] == sorted(keep)
+    assert lines[4:60] == sorted(noise)[:56]
+    assert lines[60] == "... (44 more files not shown)"
+    # frontend/ outside src/ is not prioritised
+    assert tree_order(["zz.md", "frontend/package.json", "backend/a.py"]) == [
+        "backend/a.py", "frontend/package.json", "zz.md"]
+
+
+def test_render_tree_dedupes_and_rejects_a_str():
+    assert render_tree(["b.py", "a.py", "b.py"]) == "a.py\nb.py\n"
+    with pytest.raises(TypeError):
+        render_tree("a.py")
+
+
+def test_harness_tree_is_capped_at_60_even_with_budget_to_spare():
+    many = {f"docs/page_{i:03d}.md": "x\n" for i in range(100)}
+    files = {**TEMPLATE_FILES, **many}
+    user = _user(build_messages(PLAN, _step(1), files, [], max_tokens=10**9))
+    lines = _section(user, "\nPROJECT TREE:\n").strip().split("\n")
+    assert len(lines) == 61
+    assert lines[-1] == "... (48 more files not shown)"  # 100 docs + 8 template files
+    assert "backend/models.py" in lines and "frontend/src/App.jsx" in lines
