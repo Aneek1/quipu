@@ -37,25 +37,37 @@ Money (the box is billed per hour; the credit is not refundable):
   time since the box session started x its rate, over every box session, plus named
   adjustments. --budget-usd caps that total (so it includes setup, shard building
   and earlier invocations). --usd-per-hour is required to train: it starts the box
-  session on first use (`python -m quipu.spend start` at box start is better: it
-  also counts the setup before this runs). The ledger is ticked at start, every
-  60 s (a background thread) and after every run, so a SIGKILL loses <= 60 s. A
-  corrupt or unreadable ledger stops the orchestrator (exit 2), never reads as $0.
+  session on first use. `python -m quipu.spend start` at box start is better: it
+  also counts the setup before this runs, and installs the per-minute ticker that
+  counts idle box time (no tool running); `python -m quipu.spend stop` before the
+  box is stopped. The ledger is also ticked here at start, every 60 s (a background
+  thread) and after every run, so a SIGKILL loses <= 60 s. A corrupt or unreadable
+  ledger stops the orchestrator (exit 2), never reads as $0.
 - --spent-usd X (spend the ledger cannot see, e.g. an earlier box) is stored as the
   adjustment named --spent-key (default "spent-usd"): passing the same flag again
-  replaces it, never adds it twice. Use another key for another amount.
+  replaces it, never adds it twice; --spent-usd 0 clears it; leaving the flag out
+  keeps the ledger's amount. Use another key for another amount.
 - Before each run (and each retry) its cost is estimated from the slowest measured
   tokens/s of the runs so far (tokens / wall clock of a first, not resumed attempt,
   overhead included; after a restart, from the cached runs), or from
-  --tokens-per-second + --overhead-seconds before any run is measured; a run that
-  would take spend past --budget-usd is refused and nothing after it starts.
-- During a run, once spend + STOP_GRACE_S of box time reaches the budget, the child
-  gets SIGINT (Windows: CTRL_BREAK) and writes its interrupt checkpoint; after
-  STOP_GRACE_S it is terminated, then killed. The run is "stopped_budget": not
+  --tokens-per-second + --overhead-seconds before any run is measured. A run that
+  will resume from its checkpoint is costed for its remaining steps (plus the
+  startup overhead once more). A run whose cost + the grace reserve (--stop-grace-s
+  of box time) would take spend past --budget-usd is refused and nothing after it
+  starts.
+- During a run, once spend + --stop-grace-s (default STOP_GRACE_S, 300 s) of box
+  time reaches the budget, the child gets SIGINT (Windows: CTRL_BREAK) and writes
+  its interrupt checkpoint; after the grace it is terminated, then killed. The log
+  reports how long the child took from the interrupt to its exit (the checkpoint's
+  save time: what the grace must cover). The run is "stopped_budget": not
   cached, its checkpoint kept, so the next invocation (with more budget) resumes it.
   The orchestrator then exits 4. The runs keep train.budget_usd 0 (the orchestrator
   guards); train.budget_usd / usd_per_hour and the per-run bookkeeping keys
   (RESERVED_OVERRIDES) are refused as --override.
+- Stopping: Ctrl+C, SIGTERM and SIGHUP (POSIX; the first of these two raises, a
+  repeat is ignored) all take the same path: the running child (in its own session,
+  so a terminal hangup never reaches it) is sent the interrupt and given the grace
+  to checkpoint, summary.md and winners.toml are written, exit 130.
 - Resume: each finished run is cached as results/ab/cache/<key>.json, key = hash of
   the config file, the --override flags and the run's settings and tokens. A re-run
   of the orchestrator skips every cached run. A crashed run (exit 1) is retried once
@@ -376,12 +388,14 @@ class SpendGuard:
 
     def __init__(self, budget_usd: float | None, ledger: Ledger, usd_per_hour: float,
                  prior_tokens_per_s: float = PRIOR_TOKENS_PER_S,
-                 overhead_s: float = PRIOR_OVERHEAD_S) -> None:
+                 overhead_s: float = PRIOR_OVERHEAD_S,
+                 grace_s: float = STOP_GRACE_S) -> None:
         self.budget_usd = budget_usd
         self.ledger = ledger
         self._rate = usd_per_hour
         self.prior_tokens_per_s = prior_tokens_per_s
         self.overhead_s = overhead_s
+        self.grace_s = grace_s               # box time kept for an interrupt checkpoint
         self.measured: list[float] = []      # effective tokens/s of measured runs
 
     @property
@@ -392,26 +406,39 @@ class SpendGuard:
     def spent(self) -> float:
         return self.ledger.spent_usd()
 
-    def deadline_reached(self, reserve_s: float = STOP_GRACE_S) -> bool:
-        """True once spend plus `reserve_s` of box time reaches the budget."""
+    def reserve_usd(self) -> float:
+        """The grace reserve: grace_s of box time, for a run's interrupt checkpoint."""
+        return self.grace_s / 3600 * self.usd_per_hour
+
+    def deadline_reached(self, reserve_s: float | None = None) -> bool:
+        """True once spend plus `reserve_s` (default grace_s) of box time reaches
+        the budget."""
         if self.budget_usd is None:
             return False
+        reserve_s = self.grace_s if reserve_s is None else reserve_s
         return self.spent() + reserve_s / 3600 * self.usd_per_hour >= self.budget_usd
 
     def observe(self, tokens: int, wall_s: float) -> None:
         if wall_s > 0:
             self.measured.append(tokens / wall_s)
 
-    def estimate_s(self, tokens: int) -> float:
+    def estimate_s(self, tokens: int, resumed: bool = False) -> float:
+        """A run of `tokens`. A resumed run's `tokens` are only those left; it pays
+        the startup (and compile) again, which a measured rate spreads over a whole
+        run, so the overhead is added for it."""
         if self.measured:
-            return tokens / min(self.measured)       # the slowest run: conservative
+            return (tokens / min(self.measured)     # the slowest run: conservative
+                    + (self.overhead_s if resumed else 0.0))
         return tokens / self.prior_tokens_per_s + self.overhead_s
 
-    def estimate_usd(self, tokens: int) -> float:
-        return self.estimate_s(tokens) / 3600 * self.usd_per_hour
+    def estimate_usd(self, tokens: int, resumed: bool = False) -> float:
+        return self.estimate_s(tokens, resumed) / 3600 * self.usd_per_hour
 
     def allows(self, cost_usd: float) -> bool:
-        return self.budget_usd is None or self.spent() + cost_usd <= self.budget_usd
+        """The run fits: spend + its cost + the grace reserve stays within budget (a
+        run the deadline would stop anyway is not started)."""
+        return (self.budget_usd is None
+                or self.spent() + cost_usd + self.reserve_usd() <= self.budget_usd)
 
 
 # ---- the orchestrator -----------------------------------------------------------------------
@@ -436,10 +463,11 @@ class Orchestrator:
         usd_per_hour: float | None = None,
         tokens_per_second: float = PRIOR_TOKENS_PER_S,
         overhead_s: float = PRIOR_OVERHEAD_S,
-        spent_usd: float = 0.0,
+        spent_usd: float | None = None,
         spent_key: str = SPENT_KEY,
         ledger: Ledger | None = None,
         tick_every: float | None = None,
+        stop_grace_s: float = STOP_GRACE_S,
         with_fp8: bool = False,
         skip_sweeps: bool = False,
         pairs: tuple[str, ...] = DEFAULT_PAIRS,
@@ -457,7 +485,7 @@ class Orchestrator:
         self.out = Path(out).resolve()
         self.runner = runner
         self.clock = clock
-        self.echo = echo or (lambda s: print(s, flush=True))
+        self.echo = echo or _echo
         pairs = tuple(pairs) + (("precision",) if with_fp8 and "precision" not in pairs else ())
         unknown = [p for p in pairs if p not in PAIR_BY_NAME]
         if unknown:
@@ -486,7 +514,8 @@ class Orchestrator:
         rate = usd_per_hour
         if rate is None:
             rate = self.ledger.usd_per_hour or self.cfg.train.usd_per_hour
-        self.guard = SpendGuard(budget_usd, self.ledger, rate, tokens_per_second, overhead_s)
+        self.guard = SpendGuard(budget_usd, self.ledger, rate, tokens_per_second, overhead_s,
+                                grace_s=stop_grace_s)
         self.guard.measured = self._cached_throughput()
         self.spent_at_start: float | None = None
         self._bpt = bytes_per_token
@@ -515,7 +544,7 @@ class Orchestrator:
             self.echo(f"[ab] started a box session in {self.ledger.path} at "
                       f"${self.usd_per_hour_arg:.2f}/h (run `python -m quipu.spend start` "
                       "when the box starts to count the setup too)")
-        if self.spent_usd:
+        if self.spent_usd is not None:           # 0 clears an earlier amount
             self.ledger.adjust(self.spent_key, self.spent_usd)
         self.ledger.tick()
         self.spent_at_start = self.ledger.spent_usd()
@@ -525,9 +554,18 @@ class Orchestrator:
         """The ledger's spend with --spent-usd applied (for the dry run, which
         writes nothing)."""
         spent = self.ledger.spent_usd()
-        if self.spent_usd:
+        if self.spent_usd is not None:
             spent += self.spent_usd - self.ledger.adjustments.get(self.spent_key, 0.0)
         return spent
+
+    def estimate_for(self, spec: RunSpec, ctx: RunContext) -> tuple[float, int]:
+        """(estimated cost, checkpoint step). A run that will resume (its latest.pt
+        exists: SubprocessRunner adds --resume) is costed for the steps it has left."""
+        done = _checkpoint_step(ctx.ckpt_dir)
+        if done <= 0 or ctx.steps <= 0:
+            return self.guard.estimate_usd(spec.tokens), 0
+        left = max(0, ctx.steps - done) / ctx.steps
+        return self.guard.estimate_usd(int(round(spec.tokens * left)), resumed=True), done
 
     def _tick(self) -> None:
         try:
@@ -656,11 +694,12 @@ class Orchestrator:
 
         result = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            cost = self.guard.estimate_usd(spec.tokens)
+            cost, done = self.estimate_for(spec, ctx)
             if not self.guard.allows(cost):
                 self.stopped = "budget"
                 self.echo(
-                    f"[ab] refused {spec.name}: estimated ${cost:.2f} would take spend from "
+                    f"[ab] refused {spec.name}: estimated ${cost:.2f} (+ ${self.guard.reserve_usd():.2f} "
+                    f"reserved for a stop checkpoint) would take spend from "
                     f"${self.guard.spent():.2f} past the ${self.guard.budget_usd:.2f} budget; "
                     "no further runs start"
                 )
@@ -671,8 +710,9 @@ class Orchestrator:
                 result.status = "failed"
                 result.reason += "; retry refused by the budget"
                 break
-            self.echo(f"[ab] start {spec.name} ({spec.tokens:,} tokens, attempt {attempt}, "
-                      f"est ${cost:.2f}, spent ${self.guard.spent():.2f})")
+            resume = f", resuming from step {done}/{ctx.steps}" if done else ""
+            self.echo(f"[ab] start {spec.name} ({spec.tokens:,} tokens, attempt {attempt}"
+                      f"{resume}, est ${cost:.2f}, spent ${self.guard.spent():.2f})")
             t0 = self.clock()
             result = dataclasses.replace(self.runner(spec, ctx))   # never mutate the runner's object
             wall = self.clock() - t0
@@ -1031,6 +1071,27 @@ class Orchestrator:
         return text
 
 
+def _echo(line: str) -> None:
+    """print, but a closed terminal (a hangup: EIO, a broken pipe) does not stop the
+    orchestrator mid-run: the log files still get everything."""
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+_STEP_CKPT = re.compile(r"^step_(\d+)\.pt$")
+
+
+def _checkpoint_step(ckpt_dir: Path) -> int:
+    """The step a resume would start from: the newest step_*.pt, when latest.pt
+    (what makes the runner pass --resume) exists; else 0."""
+    if not (ckpt_dir / "latest.pt").exists():
+        return 0
+    steps = [int(m.group(1)) for p in ckpt_dir.iterdir() if (m := _STEP_CKPT.match(p.name))]
+    return max(steps, default=0)
+
+
 def _f(x: float | None, digits: int = 4) -> str:
     return "-" if x is None else f"{x:.{digits}f}"
 
@@ -1094,11 +1155,13 @@ class SubprocessRunner:
       child is interrupted (SIGINT; on Windows CTRL_BREAK, which the trainer handles
       as SIGBREAK) so it writes its interrupt checkpoint, given grace_s, then
       terminated, then killed: the run is "stopped_budget".
-    - Ctrl+C here (KeyboardInterrupt): on POSIX the child got the SIGINT too, so it
-      is first given grace_s to checkpoint and exit; then it is interrupted, then
-      terminated, then killed (kill_wait_s between the last steps). On Windows the
-      child runs in its own process group (so CTRL_BREAK can reach it alone) and
-      does not see the console's Ctrl+C: it is interrupted first.
+    - The child runs in its own session on POSIX (start_new_session: a terminal
+      hangup or Ctrl+C never reaches it directly) and in its own process group on
+      Windows (so CTRL_BREAK can reach it alone). Ctrl+C here, or SIGTERM / SIGHUP
+      (main installs handlers that raise KeyboardInterrupt), forwards the interrupt
+      to the child explicitly, gives it grace_s to checkpoint and exit, then
+      terminates, then kills it (kill_wait_s between the last steps). How long the
+      child took from the interrupt to its exit (its interrupt checkpoint) is logged.
     - "out of memory" in the output with a failed exit is failed_oom (not retried).
     - --resume is added when the run's checkpoint exists (a retry after a crash, or
       a run the budget stopped); a stale run log without a checkpoint is removed so
@@ -1113,7 +1176,7 @@ class SubprocessRunner:
         self.cmd = cmd or [sys.executable, "-m", "quipu.train"]
         self.device = device
         self.cwd = Path(cwd)
-        self.echo = echo or (lambda s: print(s, flush=True))
+        self.echo = echo or _echo
         self.grace_s = grace_s
         self.kill_wait_s = kill_wait_s
         self.poll_s = poll_s
@@ -1146,19 +1209,27 @@ class SubprocessRunner:
     def _stop_child(self, proc: Any, child_got_it: bool) -> None:
         """Let the child checkpoint and exit; escalate only if it does not:
         (wait grace_s if it already got the interrupt) -> interrupt -> terminate ->
-        kill."""
+        kill. The time from the interrupt to the exit is logged: it is the interrupt
+        checkpoint's save time, what grace_s (--stop-grace-s) must cover."""
+        t0 = time.monotonic()
+
+        def exited(how: str) -> None:
+            self.echo(f"[ab] child exited {time.monotonic() - t0:.1f} s after the interrupt "
+                      f"({how}; grace {self.grace_s:.0f} s)")
+
         if child_got_it:
             if self._wait(proc, self.grace_s):
-                return
+                return exited("checkpoint and exit")
             if self._interrupt(proc) and self._wait(proc, self.kill_wait_s):
-                return
+                return exited("after a second interrupt")
         elif self._interrupt(proc) and self._wait(proc, self.grace_s):
-            return
+            return exited("checkpoint and exit")
         proc.terminate()
         if self._wait(proc, self.kill_wait_s):
-            return
+            return exited("terminated: no checkpoint within the grace")
         proc.kill()
         proc.wait()
+        exited("killed: no checkpoint within the grace")
 
     # -- one run --
 
@@ -1189,8 +1260,7 @@ class SubprocessRunner:
         t0 = time.monotonic()
         proc = subprocess.Popen(
             args, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", env=env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+            encoding="utf-8", errors="replace", env=env, **_popen_kwargs())
 
         def watch() -> None:
             while not done.wait(self.poll_s):
@@ -1239,7 +1309,8 @@ class SubprocessRunner:
         except KeyboardInterrupt:
             done.set()
             self.echo(f"[ab] interrupted: letting {spec.name} write its checkpoint")
-            self._stop_child(proc, child_got_it=os.name != "nt")
+            # Its own session / process group: the child did not get the signal.
+            self._stop_child(proc, child_got_it=False)
             raise
         except BaseException:
             done.set()
@@ -1295,10 +1366,77 @@ class SubprocessRunner:
         )
 
 
+def _popen_kwargs(posix: bool = os.name != "nt") -> dict[str, Any]:
+    """A child of its own: a new session on POSIX (a terminal hangup or the
+    terminal's Ctrl+C never reaches it; the orchestrator forwards the interrupt),
+    a new process group on Windows (CTRL_BREAK reaches it alone)."""
+    if posix:
+        return {"start_new_session": True}
+    return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+
+
 def _baseline_ref(losses: list[float], step: int) -> float | None:
     window = [x for x in losses[max(0, step - DIVERGE_WINDOW):step]
               if x is not None and math.isfinite(x)]
     return sum(window) / len(window) if window else None
+
+
+# ---- stop signals ------------------------------------------------------------------------------
+
+STOP_SIGNALS = ("SIGTERM", "SIGHUP")
+
+
+def _stop_signal_handler(echo: Callable[[str], None] = _echo) -> Callable[[int, Any], None]:
+    """SIGTERM / SIGHUP take Ctrl+C's path (KeyboardInterrupt: the running child is
+    interrupted and given its grace to checkpoint, summary and winners are written,
+    exit 130). Only the first one raises: a repeat (a hangup followed by a
+    supervisor's SIGTERM) must not cut the child's checkpoint short. Ctrl+C still
+    escalates, as before."""
+    fired = False
+
+    def stop(signum: int, frame: Any) -> None:
+        nonlocal fired
+        if fired:
+            echo(f"[ab] signal {signum} again; still stopping (waiting for the running "
+                 "child's checkpoint; Ctrl+C escalates)")
+            return
+        fired = True
+        echo(f"[ab] signal {signum}: stopping like Ctrl+C (the running child checkpoints "
+             "first)")
+        raise KeyboardInterrupt
+
+    return stop
+
+
+def install_stop_signals(echo: Callable[[str], None] = _echo) -> dict[int, Any]:
+    """POSIX, main thread only: SIGTERM and SIGHUP raise KeyboardInterrupt (once).
+    Returns the previous handlers."""
+    if os.name == "nt" or threading.current_thread() is not threading.main_thread():
+        return {}
+    handler = _stop_signal_handler(echo)
+    previous: dict[int, Any] = {}
+    for name in STOP_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            previous[sig] = signal.signal(sig, handler)
+    return previous
+
+
+def run_until_stopped(o: "Orchestrator") -> int:
+    """o.run() with the stop signals installed: 0, EXIT_BUDGET, or EXIT_INTERRUPTED
+    after Ctrl+C / SIGTERM / SIGHUP (summary and winners written either way)."""
+    previous = install_stop_signals()
+    try:
+        return o.run()
+    except KeyboardInterrupt:
+        try:
+            print("[ab] interrupted; summary written", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass
+        return EXIT_INTERRUPTED
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 # ---- CLI --------------------------------------------------------------------------------------
@@ -1377,13 +1515,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--usd-per-hour", type=float,
                    help="the box's rate (required to train; starts the box session if "
                         "`python -m quipu.spend start` was not run)")
-    p.add_argument("--spent-usd", type=float, default=0.0,
+    p.add_argument("--spent-usd", type=float, default=None,
                    help="spend the ledger cannot see; recorded once as the adjustment "
-                        "--spent-key (the same key again replaces it, never adds)")
+                        "--spent-key (the same key again replaces it, never adds; 0 "
+                        "clears it; left out, the ledger's amount stands)")
     p.add_argument("--spent-key", default=SPENT_KEY)
     p.add_argument("--tokens-per-second", type=float, default=PRIOR_TOKENS_PER_S,
                    help="throughput assumed before a run is measured (and for --dry-run)")
     p.add_argument("--overhead-seconds", type=float, default=PRIOR_OVERHEAD_S)
+    p.add_argument("--stop-grace-s", type=float, default=STOP_GRACE_S,
+                   help="an interrupted run's time to write its checkpoint; also the box "
+                        "time kept in reserve under --budget-usd (the log reports how long "
+                        "each interrupt checkpoint took)")
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--pairs", default=",".join(DEFAULT_PAIRS),
                    help=f"comma list from {','.join(PAIR_BY_NAME)}")
@@ -1405,10 +1548,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: --override {item!r} must be section.key=value", file=sys.stderr)
             return EXIT_USAGE
         extra[k.strip()] = v.strip()
+    if not math.isfinite(args.stop_grace_s) or args.stop_grace_s < 0:
+        print("error: --stop-grace-s must be a number of seconds >= 0", file=sys.stderr)
+        return EXIT_USAGE
     try:
         o = Orchestrator(
             args.config, args.out,
-            SubprocessRunner(device=args.device),
+            SubprocessRunner(device=args.device, grace_s=args.stop_grace_s),
+            stop_grace_s=args.stop_grace_s,
             budget_usd=args.budget_usd, usd_per_hour=args.usd_per_hour,
             tokens_per_second=args.tokens_per_second, overhead_s=args.overhead_seconds,
             spent_usd=args.spent_usd, spent_key=args.spent_key, tick_every=TICK_S,
@@ -1446,11 +1593,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, LedgerError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    try:
-        return o.run()
-    except KeyboardInterrupt:
-        print("[ab] interrupted; summary written", file=sys.stderr, flush=True)
-        return EXIT_INTERRUPTED
+    return run_until_stopped(o)
 
 
 if __name__ == "__main__":

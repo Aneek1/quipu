@@ -14,3 +14,4 @@ node_modules/
 data/stepbuild/
 artifacts/
 remote-runs/
+results/spend.json*

@@ -22,6 +22,53 @@ class FakeClock:
 RATE = 0.36   # $/h: 100 s = $0.01
 
 
+class FakeSystem:
+    """Stands in for crontab, pgrep-like cron detection and process spawning, so no
+    test ever touches the real crontab or starts a real ticker process."""
+
+    def __init__(self, crontab: str | None = "", cron_alive: bool = True,
+                 posix: bool = True, nohup: bool = True) -> None:
+        self.crontab = crontab          # None: no crontab binary
+        self._cron_alive = cron_alive
+        self.posix = posix
+        self.nohup = nohup
+        self.spawned: list[list[str]] = []
+        self.runs: list[list[str]] = []
+
+    def which(self, name):
+        if name == "crontab":
+            return None if self.crontab is None else "/usr/bin/crontab"
+        if name == "nohup":
+            return "/usr/bin/nohup" if self.nohup else None
+        return None
+
+    def run(self, args, input=None):
+        import subprocess
+        self.runs.append(list(args))
+        if args == ["crontab", "-l"]:
+            if self.crontab == "":
+                return subprocess.CompletedProcess(args, 1, "", "no crontab for root\n")
+            return subprocess.CompletedProcess(args, 0, self.crontab, "")
+        if args == ["crontab", "-"]:
+            self.crontab = input
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError(f"unexpected command {args}")
+
+    def cron_alive(self):
+        return self._cron_alive
+
+    def spawn(self, args, cwd):
+        self.spawned.append(list(args))
+        return 4242
+
+
+@pytest.fixture(autouse=True)
+def fake_system(monkeypatch):
+    fake = FakeSystem()
+    monkeypatch.setattr(spend, "SYSTEM", fake)
+    return fake
+
+
 def usd(seconds: float, rate: float = RATE) -> float:
     return seconds / 3600 * rate
 
@@ -171,7 +218,8 @@ def test_writes_are_atomic_and_merge_what_another_process_wrote(tmp_path):
     final = Ledger.load(path, clock=clock)
     assert final.adjustments == {"from-b": 0.5}
     assert final.sessions[-1]["last_seen"] == clock.t
-    assert not [p for p in tmp_path.iterdir() if p.name != "spend.json"]   # no temp files
+    leftovers = [p for p in tmp_path.iterdir() if p.name not in ("spend.json", "spend.json.lock")]
+    assert not leftovers                                                    # no temp files
 
 
 def test_tick_if_due_writes_at_most_once_per_interval(tmp_path):
@@ -185,7 +233,7 @@ def test_tick_if_due_writes_at_most_once_per_interval(tmp_path):
     assert led.tick_if_due(60) is True
 
 
-def test_cli_start_show_and_adjust(tmp_path, capsys):
+def test_cli_start_show_and_adjust(tmp_path, capsys, fake_system):
     path = tmp_path / "spend.json"
     assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5",
                        "--box-start", "1000"]) == 0
@@ -197,3 +245,226 @@ def test_cli_start_show_and_adjust(tmp_path, capsys):
     assert "spent $" in capsys.readouterr().out
     path.write_text("garbage", encoding="utf-8")
     assert spend.main(["--ledger", str(path), "show"]) == 2
+
+
+# ---- two writers: the lock and the merge ------------------------------------------------
+
+def test_a_stale_in_memory_adjustment_never_overwrites_a_newer_disk_value(tmp_path):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    a = Ledger.load(path, clock=clock)
+    a.start_session(RATE)
+    a.adjust("k", 1.0)
+    b = Ledger.load(path, clock=clock)
+    b.adjust("k", 2.0)                       # the newer value, from another process
+    clock.t += 60
+    a.tick()                                 # a still holds k = 1.0 in memory
+    a.adjust("other", 0.5)
+    assert Ledger.load(path).adjustments == {"k": 2.0, "other": 0.5}
+    assert a.adjustments == {"k": 2.0, "other": 0.5}     # a now sees the disk's value
+
+
+def test_a_start_is_not_lost_to_a_concurrent_tick(tmp_path, capsys):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    a = Ledger.load(path, clock=clock)
+    a.start_session(RATE)
+    b = Ledger.load(path, clock=clock)
+    clock.t += 120
+    b.start_session(0.72)                    # a new session while a keeps ticking
+    new_start = clock.t
+    clock.t += 60
+    a.tick()                                 # a's memory still has the old session last
+    disk = Ledger.load(path, clock=clock)
+    assert len(disk.sessions) == 2
+    old, new = disk.sessions
+    assert old["last_seen"] <= new_start     # the old session was never extended
+    assert new["box_start"] == new_start and new["last_seen"] == clock.t
+    assert "changed" in capsys.readouterr().err
+
+
+def test_the_ledger_lock_excludes_a_second_writer(tmp_path):
+    path = tmp_path / "spend.json"
+    with spend._file_lock(spend.lock_path(path)):
+        other = Ledger.load(path, clock=FakeClock())
+        other.lock_timeout_s = 0.2
+        with pytest.raises(LedgerError, match="lock"):
+            other.start_session(RATE)
+    other.start_session(RATE)                # released: it goes through
+    assert len(Ledger.load(path).sessions) == 1
+
+
+def test_a_read_during_a_windows_replace_is_retried(tmp_path, monkeypatch):
+    path = tmp_path / "spend.json"
+    led = Ledger.load(path, clock=FakeClock())
+    led.start_session(RATE)
+    real = Path.read_text
+    fails = {"n": 2}
+
+    def flaky(self, *a, **kw):
+        if self == path and fails["n"]:
+            fails["n"] -= 1
+            raise PermissionError(13, "in use by a replace")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr(spend.time, "sleep", lambda s: None)
+    assert len(Ledger.load(path).sessions) == 1
+    assert fails["n"] == 0
+
+
+RACE_ADDER = """
+import sys
+from quipu.spend import Ledger
+Ledger.load(sys.argv[1]).adjust("k" + sys.argv[2], 1.0)
+"""
+RACE_TICKER = """
+import sys
+from quipu.spend import Ledger
+led = Ledger.load(sys.argv[1])
+for _ in range(int(sys.argv[2])):
+    led.tick()
+"""
+
+
+def test_concurrent_adjust_writers_and_a_ticker_lose_nothing(tmp_path):
+    """The reviewer's race probe as a test: N processes each add one adjustment
+    while another process ticks in a tight loop. Every adjustment survives."""
+    import os
+    import subprocess
+    import sys
+
+    root = Path(spend.__file__).resolve().parents[1]
+    env = dict(os.environ, PYTHONPATH=str(root))
+    n = 4
+    for trial in range(3):
+        path = tmp_path / f"race{trial}.json"
+        Ledger.load(path).start_session(1.0)
+        procs = [subprocess.Popen([sys.executable, "-c", RACE_TICKER, str(path), "150"],
+                                  cwd=root, env=env)]
+        procs += [subprocess.Popen([sys.executable, "-c", RACE_ADDER, str(path), str(i)],
+                                   cwd=root, env=env) for i in range(n)]
+        assert [p.wait(timeout=120) for p in procs] == [0] * (n + 1)
+        data = json.loads(path.read_text("utf-8"))
+        assert sorted(data["adjustments"]) == [f"k{i}" for i in range(n)], trial
+        assert len(data["sessions"]) == 1
+
+
+# ---- idle box time: the per-minute ticker ------------------------------------------------
+
+def test_start_installs_a_tagged_crontab_line_once(tmp_path, fake_system, capsys):
+    fake_system.crontab = "0 3 * * * /usr/bin/backup\n"
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5"]) == 0
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5"]) == 0
+    lines = [ln for ln in fake_system.crontab.splitlines() if ln.strip()]
+    assert lines[0] == "0 3 * * * /usr/bin/backup"            # other lines are kept
+    ours = [ln for ln in lines if spend.CRON_TAG in ln]
+    assert len(ours) == 1                                      # idempotent
+    line = ours[0]
+    assert line.startswith("* * * * * cd ")
+    assert "-m quipu.spend --ledger" in line and str(path.resolve()) in line
+    assert " tick >/dev/null 2>&1" in line
+    assert fake_system.spawned == []
+    assert "crontab" in capsys.readouterr().out                # says what it installed
+
+
+def test_without_crontab_start_spawns_a_nohup_tick_loop(tmp_path, fake_system, capsys):
+    fake_system.crontab = None
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5"]) == 0
+    (args,) = fake_system.spawned
+    assert args[0] == "nohup" and args[2:5] == ["-m", "quipu.spend", "--ledger"]
+    assert args[-3:] == ["tick", "--loop", "60"]
+    assert spend.ticker_pid_path(path).read_text().strip() == "4242"
+    assert "4242" in capsys.readouterr().out
+
+
+def test_a_crontab_without_a_running_cron_daemon_falls_back_to_the_loop(tmp_path, fake_system):
+    fake_system._cron_alive = False
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5"]) == 0
+    assert fake_system.spawned and spend.CRON_TAG not in (fake_system.crontab or "")
+
+
+def test_stop_removes_the_ticker_and_ends_the_session(tmp_path, fake_system, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(spend.time, "time", clock)
+    fake_system.crontab = "0 3 * * * /usr/bin/backup\n"
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.36"]) == 0
+    spend.ticker_pid_path(path).write_text("777")             # a loop from an earlier start
+    clock.t += 1000
+    assert spend.main(["--ledger", str(path), "stop"]) == 0
+    assert spend.CRON_TAG not in fake_system.crontab
+    assert "/usr/bin/backup" in fake_system.crontab
+    assert not spend.ticker_pid_path(path).exists()
+    clock.t += 5000                                            # the box is gone
+    led = Ledger.load(path, clock=clock)
+    assert led.spent_usd() == pytest.approx(usd(1000))         # not counted to now
+    with pytest.raises(LedgerError, match="ended"):
+        led.tick()                                             # a stray tick cannot revive it
+    assert led.ensure_session(RATE) is True                    # the next tool starts a new one
+
+
+def test_the_tick_loop_exits_when_its_pid_file_is_replaced_or_the_session_ends(tmp_path):
+    import os
+
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    Ledger.load(path, clock=clock).start_session(RATE)
+    pid_file = spend.ticker_pid_path(path)
+    pid_file.write_text(str(os.getpid()))
+    naps = []
+
+    def sleep(s):
+        naps.append(s)
+        clock.t += s
+        if len(naps) == 3:
+            pid_file.write_text("1")                           # a newer start took over
+
+    assert spend.tick_loop(path, 60, clock=clock, sleep=sleep) == 0
+    assert len(naps) == 3
+    assert Ledger.load(path).sessions[-1]["last_seen"] == clock.t - 60
+    # An ended session: the loop stops at once.
+    pid_file.write_text(str(os.getpid()))
+    Ledger.load(path, clock=clock).end_session()
+    naps.clear()
+    assert spend.tick_loop(path, 60, clock=clock, sleep=sleep) == 0
+    assert naps == []
+
+
+def test_a_new_start_after_an_unended_session_warns_about_the_uncounted_gap(tmp_path, capsys):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    led = Ledger.load(path, clock=clock)
+    led.start_session(RATE)
+    clock.t += 600
+    led.tick()                               # last seen here; the box died unticked
+    clock.t += 7200
+    again = Ledger.load(path, clock=clock)
+    again.start_session(RATE)
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "2:00" in err and "spend adjust" in err
+    assert f"${usd(7200):.2f}" in err
+    assert again.sessions[0]["last_seen"] == 1_000_600.0      # ended at its last tick
+    assert again.spent_usd() == pytest.approx(usd(600))
+
+
+def test_start_after_a_stopped_session_does_not_warn(tmp_path, capsys):
+    clock = FakeClock()
+    path = tmp_path / "spend.json"
+    led = Ledger.load(path, clock=clock)
+    led.start_session(RATE)
+    clock.t += 600
+    led.end_session()
+    clock.t += 7200
+    Ledger.load(path, clock=clock).start_session(RATE)
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_cli_start_no_ticker_installs_nothing(tmp_path, fake_system):
+    path = tmp_path / "spend.json"
+    assert spend.main(["--ledger", str(path), "start", "--usd-per-hour", "0.5",
+                       "--no-ticker"]) == 0
+    assert fake_system.runs == [] and fake_system.spawned == []

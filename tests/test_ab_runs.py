@@ -666,6 +666,8 @@ with open(os.environ["FAKE_TRAIN_CALLS"], "a") as f:
     f.write(a.run_id + (" resume" if a.resume else "") + "\n")
 if behave.get("env_out"):
     Path(behave["env_out"]).write_text(json.dumps(dict(os.environ)))
+if behave.get("sid_out"):
+    Path(behave["sid_out"]).write_text(str(os.getsid(0)))
 import signal
 def on_stop(signum, frame):
     Path(behave["marker"]).write_text("interrupt checkpoint")
@@ -847,3 +849,184 @@ def test_child_env_resume_flag_skipped_steps_and_startup(tmp_path, monkeypatch):
     ctx.ckpt_dir.mkdir(parents=True, exist_ok=True)
     (ctx.ckpt_dir / "latest.pt").write_text("x")
     assert runner(spec, ctx).resumed is True
+
+
+# ---- the budget's grace reserve, resumed estimates, --spent-usd 0, --stop-grace-s -------------
+
+def test_allows_keeps_the_stop_grace_reserve(tmp_path):
+    led = Ledger.load(tmp_path / "box" / "spend.json", clock=FakeClock())
+    g = ab.SpendGuard(1.0, led, 0.36, grace_s=300)       # reserve: 300 s x $0.36/h = $0.03
+    assert g.allows(0.96) is True
+    assert g.allows(0.98) is False                       # fits the budget, not the reserve
+    assert ab.SpendGuard(1.0, led, 0.36, grace_s=0).allows(0.98) is True
+
+
+def test_a_resumed_runs_estimate_scales_by_its_remaining_steps(tmp_path):
+    o = orch(tmp_path, FakeRunner(FakeClock(), val_by_settings))
+    spec = one_spec(o)                                   # 200M tokens = 381 steps
+    ctx = o.context_for(spec, None)
+    full, done = o.estimate_for(spec, ctx)
+    assert done == 0 and full == pytest.approx(o.guard.estimate_usd(spec.tokens))
+    ctx.ckpt_dir.mkdir(parents=True)
+    (ctx.ckpt_dir / "latest.pt").write_text("x")
+    (ctx.ckpt_dir / "step_000100.pt").write_text("x")
+    (ctx.ckpt_dir / "step_000191.pt").write_text("x")
+    part, done = o.estimate_for(spec, ctx)
+    assert done == 191
+    left = spec.tokens * (381 - 191) / 381
+    assert part == pytest.approx((left / ab.PRIOR_TOKENS_PER_S + ab.PRIOR_OVERHEAD_S)
+                                 / 3600 * 0.55)
+
+
+def test_a_resumed_run_that_fits_the_budget_is_not_refused(tmp_path):
+    clock = FakeClock()
+    runner = FakeRunner(clock, val_by_settings)
+    # p1-base at 200M: $0.33 in full at the prior, ~$0.19 with 190 of 381 steps left.
+    o = orch(tmp_path, runner, clock, budget_usd=0.28, skip_sweeps=True,
+             pairs=("attnres",), seed_reruns=False)
+    spec = ab.RunSpec("p1-base", "pair", o.base_settings(), o.arm_tokens)
+    ckpt = o.context_for(spec, None).ckpt_dir
+    ckpt.mkdir(parents=True)
+    (ckpt / "latest.pt").write_text("x")
+    (ckpt / "step_000191.pt").write_text("x")
+    o.run()
+    assert runner.calls[:1] == ["p1-base"]
+
+
+def test_spent_usd_zero_clears_the_adjustment_and_none_keeps_it(tmp_path):
+    clock = FakeClock()
+    kw = dict(skip_sweeps=True, pairs=("attnres",), seed_reruns=False)
+    orch(tmp_path, FakeRunner(clock, val_by_settings), clock, spent_usd=1.0, **kw).run()
+    orch(tmp_path, FakeRunner(clock, val_by_settings), clock, **kw).run()     # not passed
+    assert Ledger.load(tmp_path / "box" / "spend.json").adjustments == {ab.SPENT_KEY: 1.0}
+    o = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, spent_usd=0.0, **kw)
+    assert o.projected_spent() == pytest.approx(o.ledger.spent_usd() - 1.0)
+    o.run()
+    assert Ledger.load(tmp_path / "box" / "spend.json").adjustments == {ab.SPENT_KEY: 0.0}
+
+
+def test_stop_grace_s_reaches_the_runner_and_the_budget_reserve(tmp_path, monkeypatch):
+    made = []
+
+    class Spy(ab.Orchestrator):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+    monkeypatch.setattr(ab, "Orchestrator", Spy)
+    monkeypatch.setattr(ab, "checkpoint_disk_check", lambda o: (True, "ok"))
+    assert ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"), "--dry-run",
+                    "--stop-grace-s", "120"]) == 0
+    (o,) = made
+    assert o.guard.grace_s == 120 and o.runner.grace_s == 120
+    assert o.spent_usd is None                           # --spent-usd not passed
+
+
+def test_the_budget_deadline_uses_the_configured_grace(tmp_path):
+    clock = FakeClock()
+    o = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, budget_usd=1.0,
+             usd_per_hour=0.36, stop_grace_s=60)          # $1 = 10,000 s of box time
+    o.begin()
+    ctx = o.context_for(one_spec(o), None)
+    clock.t = 10_000 - 61
+    assert ctx.budget_check() is False
+    clock.t = 10_000 - 59
+    assert ctx.budget_check() is True
+
+
+# ---- stopping cleanly: signals, sessions, the interrupt forwarded -------------------------------
+
+def test_stopping_a_child_reports_how_long_its_interrupt_checkpoint_took():
+    said = []
+    runner = ab.SubprocessRunner(device="cpu", grace_s=300, kill_wait_s=30, echo=said.append)
+    runner._interrupt = lambda proc: True
+    runner._stop_child(FakeProc(alive_for=0), child_got_it=False)
+    assert any("exited" in s and "after the interrupt" in s for s in said)
+
+
+def test_a_stop_signal_raises_keyboard_interrupt_once():
+    said = []
+    handler = ab._stop_signal_handler(said.append)
+    with pytest.raises(KeyboardInterrupt):
+        handler(15, None)
+    handler(15, None)                                    # a repeat does not cut the grace short
+    assert len(said) == 2 and "again" in said[1]
+
+
+def test_children_run_in_their_own_session_on_posix():
+    assert ab._popen_kwargs(posix=True) == {"start_new_session": True}
+    assert ab._popen_kwargs(posix=False) == {
+        "creationflags": getattr(ab.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)}
+
+
+def test_ctrl_c_forwards_the_interrupt_to_the_child_explicitly(tmp_path, monkeypatch):
+    """The child no longer shares the terminal's process group, so it only learns
+    of a Ctrl+C from the orchestrator: it must be sent, and the child checkpoints."""
+    marker = tmp_path / "marker"
+    behave = {"losses": [3.0] * 400, "sleep": 0.05, "marker": str(marker)}
+
+    def echo(line):
+        if line.startswith("step 3/"):
+            raise KeyboardInterrupt
+
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave, grace_s=20, kill_wait_s=5)
+    runner.echo = echo
+    o = orch(tmp_path, runner, arm_tokens=400 * 524_288)
+    spec = one_spec(o)
+    with pytest.raises(KeyboardInterrupt):
+        runner(spec, o.context_for(spec, None))
+    assert marker.read_text() == "interrupt checkpoint"
+
+
+def test_echo_survives_a_closed_terminal(monkeypatch):
+    def gone(*a, **kw):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr("builtins.print", gone)
+    ab._echo("a line after the terminal hung up")        # no exception
+
+
+SIGNAL_DRIVER = r'''
+import importlib.util, json, os, sys
+from pathlib import Path
+root, out, script, sig_name = sys.argv[1:5]
+sys.path.insert(0, root)
+spec = importlib.util.spec_from_file_location("ab_runs", Path(root) / "scripts" / "ab_runs.py")
+ab = importlib.util.module_from_spec(spec); sys.modules["ab_runs"] = ab; spec.loader.exec_module(ab)
+runner = ab.SubprocessRunner(cmd=[sys.executable, script], device="cpu", grace_s=20, kill_wait_s=5)
+o = ab.Orchestrator(Path(root) / "configs" / "quipu-moe-ab.toml", out, runner, budget_usd=100.0,
+                    usd_per_hour=0.55, skip_sweeps=True, pairs=("attnres",), seed_reruns=False,
+                    arm_tokens=400 * 524_288, bytes_per_token=None)
+o.begin()
+sys.exit(ab.run_until_stopped(o))
+'''
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and sessions")
+@pytest.mark.parametrize("sig_name", ["SIGTERM", "SIGHUP"])
+def test_sigterm_or_sighup_stops_the_orchestrator_through_the_checkpoint_path(
+        tmp_path, monkeypatch, sig_name):
+    import os
+    import signal
+    import subprocess
+
+    marker, sid_out = tmp_path / "marker", tmp_path / "sid"
+    behave = {"losses": [3.0] * 400, "sleep": 0.05, "marker": str(marker),
+              "sid_out": str(sid_out)}
+    fake_subprocess_runner(tmp_path, monkeypatch, behave)      # writes the script + env
+    driver = tmp_path / "driver.py"
+    driver.write_text(SIGNAL_DRIVER, encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, str(driver), str(ROOT), str(tmp_path / "ab"),
+         str(tmp_path / "fake_train.py"), sig_name],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        if line.startswith("step 3/"):
+            proc.send_signal(getattr(signal, sig_name))
+            break
+    rest = proc.stdout.read()
+    assert proc.wait(timeout=60) == ab.EXIT_INTERRUPTED, rest
+    assert marker.read_text() == "interrupt checkpoint"         # the child checkpointed
+    # The child ran in its own session: a terminal hangup never reached it directly.
+    assert int(sid_out.read_text()) != os.getsid(0)
+    assert (tmp_path / "ab" / "summary.md").exists()
