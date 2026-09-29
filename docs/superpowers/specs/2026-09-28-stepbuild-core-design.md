@@ -116,3 +116,12 @@ TDD throughout. CPU-only, no network in unit tests (GitHub discovery is tested a
 - **Few repos with both Flask and React and a permissive licence.** Handled by design: single-side repos are collected too (§3.1 `discover.py`), and the report shows counts per tag.
 - **Windows sandbox is not a security boundary.** The benchmark only runs code from our own models on our own specs; it is not safe for untrusted code, and the spec says so.
 - **`npm run build` is slow** (~10–30 s). Accepted; it runs once per frontend step, not per token.
+
+## 8. Reference model: gpt-oss-120b (added 2026-09-29, owner decision)
+
+The benchmark's leaderboard includes **gpt-oss-120b** (OpenAI open weights, ~117B total / ~5.1B active MoE, Apache-2.0) as the large reference model. The goal for Quipu is stated honestly: **approach gpt-oss-120b on this benchmark at a small fraction of its size and cost**, not to beat it in general.
+
+- **Backend:** a `StepModel` implementation for an OpenAI-compatible chat endpoint (vLLM or llama.cpp server on a rented 80 GB GPU, e.g. one H100/H200 for about an hour; or a hosted inference API). The backend applies the model's own chat format, caps new tokens at `REPLY_RESERVE`, uses temperature 0, and records the endpoint, weights revision/quantisation and reasoning-effort setting in the run provenance.
+- **Same conditions as every model:** same harness, prompts, example library (train split only, leakage-guarded), retries and scoring; the reference run is published with its full summary.md.
+- **Reported alongside the pass rates:** parameters (total/active), memory needed to run, tokens per second, and cost of the run — the axes where a small model can win.
+- **When:** after the Track A backend exists (it shares the OpenAI-compatible client); a separate short plan covers it.
