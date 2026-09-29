@@ -1,13 +1,19 @@
-"""Sample the quipu-moe data mix and train its byte-level BPE tokenizer (spec section 4).
+"""Sample the quipu-moe data mix and train its byte-level BPE tokenizer (spec 4 and 11).
 
-The sample is the section 5 mix in miniature: code_share (60%) of the bytes from
-codeparrot/github-code-clean (permissive licences, the per-language weights below,
-the shard builder's minified/vendored filters), the rest from FineWeb-Edu
-sample-10BT. It is streamed straight into the trainer, a batch of documents at a
-time; nothing but the trainer's own word counts is held in memory.
+The sample is the section 11 mix in miniature, by bytes:
+  - code_share (60%) from codeparrot/github-code-clean (permissive licences, the
+    per-language weights below, the shard builder's minified/vendored filters);
+  - english_share (28%) from FineWeb-Edu sample-10BT;
+  - the rest (12%) from FineWeb-2, the nine other languages in about equal shares.
+    Languages are read one after another; one that runs out of documents leaves
+    its shortfall to the languages after it (the last one absorbs the rest). No
+    language-ID filter: the tokenizer only needs text in roughly the right script.
+It is streamed straight into the trainer, a batch of documents at a time; nothing
+but the trainer's own word counts is held in memory.
 
 Held out for scripts/tokenizer_gate.py, by construction:
-  - text: the LAST parquet file of sample-10BT (training reads only the others);
+  - English: the LAST parquet file of sample-10BT (training reads only the others);
+  - other languages: FineWeb-2's test split (training reads only train);
   - code: files code_heldout_first_file.. (840..879, the shard builder's code val
     files); training reads files from 0 upward and never reaches them.
 The content hash of every code document in the sample is also written, so the gate
@@ -23,7 +29,7 @@ and the exhausted languages are written to the manifest.
 Outputs, beside --out: tokenizer.json, sample_manifest.json, sample_code_hashes.npy.
 
 Run: uv run python scripts/train_tokenizer.py --out artifacts/tokenizer/tokenizer.json \
-         --sample-bytes 1000000000 --vocab 32768
+         --sample-bytes 1000000000 --vocab 49152
 """
 from __future__ import annotations
 
@@ -51,6 +57,14 @@ CODE_HELDOUT_FIRST_FILE = 840
 CODE_LICENSES = ("mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc", "cc0-1.0",
                  "unlicense")
 CODE_SHARE = 0.6
+ENGLISH_SHARE = 0.28
+FINEWEB2_DATASET = "HuggingFaceFW/fineweb-2"
+# Spec section 11: the nine non-English languages of the owner's LID model, as
+# FineWeb-2 subsets. cmn_Hani is sampled as-is here (the zh-Hans/zh-Hant split is a
+# shard-building step).
+FINEWEB2_LANGUAGES = ("ind_Latn", "zsm_Latn", "cmn_Hani", "jpn_Jpan", "kor_Hang",
+                      "tam_Taml", "hin_Deva", "hin_Latn", "urd_Latn")
+ENGLISH = "eng_Latn"
 # Spec section 5. "All others ~15%" is spelled out per language so the weights have
 # the same shape as DataConfig.code_language_weights (Task M2). Names are exactly as
 # they appear in github-code-clean (note GO).
@@ -257,6 +271,69 @@ def text_documents(rows: Iterable[dict], budget: float, *, size: Callable[[str],
         yield text
 
 
+def multilingual_documents(streams: dict[str, Callable[[], Iterable[dict]]], budget: float, *,
+                           size: Callable[[str], float],
+                           summary: dict[str, dict] | None = None) -> Iterator[tuple[str, str]]:
+    """(language, text) from each language's stream in turn, about budget/len each.
+
+    Each language is opened only when its turn comes (streams maps it to a
+    zero-argument callable) and gets an equal share of what the budget still lacks,
+    so a language that runs dry passes its shortfall on to the languages after it.
+    `summary` receives, per language, the target, units taken and documents.
+    """
+    summary = summary if summary is not None else {}
+    langs = list(streams)
+    left = float(budget)
+    for i, lang in enumerate(langs):
+        target = left / (len(langs) - i)
+        stats: Counter = Counter()
+        for text in text_documents(streams[lang](), target, size=size, stats=stats):
+            yield lang, text
+        summary[lang] = {"target": target, "units": stats["units"],
+                         "documents": stats["documents"], "short": stats["units"] < target}
+        left -= stats["units"]
+
+
+def iter_parquet_text(fs: Any, paths: Iterable[str], retries: int = 5) -> Iterator[dict]:
+    """{"text", "file"} rows of each parquet file's "text" column, one row group at a time.
+
+    Like build_shards.iter_code_row_groups: a failed read is retried from the same
+    (file, row group), so a network blip changes nothing in the output.
+    """
+    import pyarrow.parquet as pq
+
+    for path in paths:
+        rg, n_groups, attempt = 0, None, 0
+        while n_groups is None or rg < n_groups:
+            try:
+                with fs.open(path, "rb", block_size=8 * 1024 * 1024) as f:
+                    pf = pq.ParquetFile(f)
+                    n_groups = pf.metadata.num_row_groups
+                    while rg < n_groups:
+                        texts = pf.read_row_group(rg, columns=["text"]).column("text").to_pylist()
+                        rg += 1
+                        attempt = 0
+                        for t in texts:
+                            yield {"text": t, "file": path}
+            except Exception as exc:
+                attempt += 1
+                if attempt > retries:
+                    raise
+                wait = 5 * 2 ** (attempt - 1)
+                print(f"\nread failed ({path}, row group {rg}): {exc!r}; "
+                      f"retry {attempt}/{retries} in {wait}s", file=sys.stderr, flush=True)
+                time.sleep(wait)
+
+
+def fineweb2_files(fs: Any, revision: str, lang: str, split: str) -> list[str]:
+    """Full HfFileSystem paths of one FineWeb-2 language's split, sorted."""
+    listed = fs.ls(f"datasets/{FINEWEB2_DATASET}@{revision}/data/{lang}/{split}", detail=False)
+    paths = sorted(p for p in listed if p.endswith(".parquet"))
+    if not paths:
+        raise RuntimeError(f"{FINEWEB2_DATASET} {lang}/{split} has no parquet files")
+    return paths
+
+
 def utf8_len(s: str) -> int:
     return len(s.encode("utf-8", "surrogatepass"))
 
@@ -315,15 +392,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="artifacts/tokenizer/tokenizer.json")
     parser.add_argument("--sample-bytes", type=float, default=1_000_000_000)
-    parser.add_argument("--vocab", type=int, default=32768)
+    parser.add_argument("--vocab", type=int, default=49152)
     parser.add_argument("--code-share", type=float, default=CODE_SHARE)
+    parser.add_argument("--english-share", type=float, default=ENGLISH_SHARE)
     parser.add_argument("--max-code-files", type=int, default=MAX_CODE_FILES)
     parser.add_argument("--low-priority", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     if args.low_priority:
         print(f"below-normal priority set: {bs.lower_priority()}", flush=True)
-    if not 0 < args.code_share < 1:
-        raise SystemExit("--code-share must be in (0, 1)")
+    other_share = 1 - args.code_share - args.english_share
+    if not (0 < args.code_share < 1 and 0 < args.english_share < 1 and other_share > 0):
+        raise SystemExit("--code-share and --english-share must be in (0, 1) and sum below 1")
     max_files = min(args.max_code_files, CODE_HELDOUT_FIRST_FILE)
 
     from huggingface_hub import HfApi, HfFileSystem
@@ -336,14 +415,17 @@ def main() -> None:
     api, fs = HfApi(), HfFileSystem()
     text_rev = api.dataset_info(TEXT_DATASET).sha
     code_rev = api.dataset_info(CODE_DATASET).sha
+    fw2_rev = api.dataset_info(FINEWEB2_DATASET).sha
     all_text = text_files(fs, text_rev)
     train_text, heldout_text = all_text[:-1], all_text[-1:]
+    fw2_train = {lang: fineweb2_files(fs, fw2_rev, lang, "train") for lang in FINEWEB2_LANGUAGES}
+    fw2_test = {lang: fineweb2_files(fs, fw2_rev, lang, "test") for lang in FINEWEB2_LANGUAGES}
 
     code_budget = args.sample_bytes * args.code_share
-    text_budget = args.sample_bytes - code_budget
     sampler = QuotaSampler(LANGUAGE_WEIGHTS, code_budget)
     code_stats: Counter = Counter()
     text_stats: Counter = Counter()
+    fw2_summary: dict[str, dict] = {}
     hashes: list[int] = []
 
     def docs() -> Iterator[str]:
@@ -356,10 +438,17 @@ def main() -> None:
         print(f"\ncode done: {sampler.total:,.0f} bytes, {sum(sampler.documents.values()):,} "
               f"documents, last file {code_stats.get('last_file')}", flush=True)
         # If every language filled or was exhausted short of the code budget, text is
-        # scaled down with it so the sample keeps the code_share mix.
-        text_bytes = min(text_budget, sampler.total * (1 - args.code_share) / args.code_share)
-        yield from text_documents(text_rows(text_rev, train_text), text_bytes, size=utf8_len,
-                                  stats=text_stats)
+        # scaled down with it so the sample keeps the mix.
+        scale = min(1.0, sampler.total / code_budget)
+        yield from text_documents(text_rows(text_rev, train_text),
+                                  args.sample_bytes * args.english_share * scale,
+                                  size=utf8_len, stats=text_stats)
+        print(f"\nenglish done: {text_stats['units']:,} bytes", flush=True)
+        streams = {lang: (lambda p=fw2_train[lang]: iter_parquet_text(fs, p))
+                   for lang in FINEWEB2_LANGUAGES}
+        for _, text in multilingual_documents(streams, args.sample_bytes * other_share * scale,
+                                              size=utf8_len, summary=fw2_summary):
+            yield text
 
     digest = hashlib.sha256()
     bar = tqdm(total=int(args.sample_bytes), unit="B", unit_scale=True, desc="sample",
@@ -373,20 +462,24 @@ def main() -> None:
     hashes_path = out.with_name("sample_code_hashes.npy")
     np.save(hashes_path, np.asarray(sorted(set(hashes)), dtype=np.uint64))
     code_summary = sampler.summary()
+    fw2_bytes = sum(v["units"] for v in fw2_summary.values())
+    total = code_summary["taken"] + text_stats["units"] + fw2_bytes
     manifest = {
         "tokenizer": {"path": out.name, "sha256": sha256_file(out),
                       "vocab_size": tok.vocab_size, "special_tokens": list(SPECIAL_TOKENS),
                       "pre_tokenizer_rules": list(PRE_TOKENIZER_RULES)},
         "sample": {"bytes_target": int(args.sample_bytes),
-                   "bytes": int(code_summary["taken"] + text_stats["units"]),
+                   "bytes": int(total),
                    "sha256": digest.hexdigest(),
                    "sha256_of": "for each document in order: 8-byte LE length + UTF-8 bytes",
-                   "target_shares": {"code": args.code_share, "text": 1 - args.code_share},
+                   "target_shares": {"code": args.code_share, ENGLISH: args.english_share,
+                                     **{lang: round(other_share / len(FINEWEB2_LANGUAGES), 6)
+                                        for lang in FINEWEB2_LANGUAGES}},
                    "achieved_shares": {
-                       "code": round(code_summary["taken"]
-                                     / (code_summary["taken"] + text_stats["units"]), 6),
-                       "text": round(text_stats["units"]
-                                     / (code_summary["taken"] + text_stats["units"]), 6)}},
+                       "code": round(code_summary["taken"] / total, 6),
+                       ENGLISH: round(text_stats["units"] / total, 6),
+                       **{lang: round(v["units"] / total, 6)
+                          for lang, v in fw2_summary.items()}}},
         "code": {"dataset": CODE_DATASET, "revision": code_rev, "licenses": list(CODE_LICENSES),
                  "files_read": [0, code_stats.get("last_file")],
                  "heldout_files": [CODE_HELDOUT_FIRST_FILE, CODE_FILES_TOTAL - 1],
@@ -399,6 +492,11 @@ def main() -> None:
                  "heldout_files": heldout_text, "bytes": int(text_stats["units"]),
                  "documents": text_stats["documents"],
                  "rows_scanned": text_stats["rows_scanned"]},
+        "fineweb2": {"dataset": FINEWEB2_DATASET, "revision": fw2_rev,
+                     "languages": list(FINEWEB2_LANGUAGES),
+                     "train_files": fw2_train, "heldout_files": fw2_test,
+                     "by_language": fw2_summary, "bytes": int(fw2_bytes),
+                     "lid_filter": None},
         "train_seconds": seconds,
     }
     write_text_atomic(out.with_name("sample_manifest.json"), json.dumps(manifest, indent=2))

@@ -1,17 +1,28 @@
-"""A code-aware byte-level BPE tokenizer (quipu-moe spec section 4), wrapped.
+"""A code-aware, multilingual byte-level BPE tokenizer (quipu-moe spec 4 and 11), wrapped.
 
 GPT-2's tokenizer spends 36.5% of quipu-114m's code validation tokens on pure
 whitespace: indentation is split into many small space tokens. This backend is
-trained on the quipu-moe mix with a pre-tokeniser that gives whitespace structure
-its own pieces, so BPE can learn one token per common indent:
+trained on the quipu-moe mix (code, English and nine other languages) with a
+pre-tokeniser that gives whitespace structure its own pieces, so BPE can learn one
+token per line break plus indent. It is ONE regex whose alternatives are tried in
+this order at each position (the leftmost alternative that matches wins):
 
-  1. runs of newlines are their own pieces ([\\r\\n]+, so CRLF stays together);
-  2. runs of 2 to 16 spaces are their own pieces (a longer run is cut every 16);
-     a SINGLE space is left to the word regex, so " the" stays one token and
-     prose costs no more tokens than with GPT-2;
-  3. runs of 1 to 16 tabs are their own pieces;
-  4. every digit is its own piece;
-  5. what is left is split by the GPT-4 (cl100k) word/punctuation regex.
+  1. NEWLINE_INDENT  a run of newlines plus the up to 16 spaces/tabs after it
+                     (CRLF stays together), so a code line costs one whitespace
+                     token rather than two;
+  2. SPACE_RUN       2 to 16 spaces (a longer run is cut every 16). A SINGLE space
+                     is left to WORD, so " the" stays one token and prose costs no
+                     more tokens than with GPT-2;
+  3. TAB_RUN         1 to 16 tabs;
+  4. DIGIT           every digit alone;
+  5. GPT-4o-style word and punctuation alternatives: contractions; an optional
+     non-letter then letters AND combining marks (so Tamil and Devanagari vowel
+     signs stay inside their word); punctuation runs, which never swallow a
+     following newline (it belongs to NEWLINE_INDENT); any other non-newline
+     whitespace.
+
+One regex rather than a Sequence of Splits: a later Split would cut apart the
+pieces an earlier one made (the space rule would split "\\n" + indent again).
 
 The pieces are then mapped to bytes (ByteLevel, no prefix space, no second regex),
 and the 256-byte alphabet is always in the vocabulary, so any string round-trips
@@ -38,22 +49,23 @@ SPECIAL_TOKENS = ("<|endoftext|>", "<|system|>", "<|user|>", "<|assistant|>", "<
 EOT = SPECIAL_TOKENS[0]
 MAX_VOCAB = 65536  # shards are uint16
 
-NEWLINE_RUN = r"[\r\n]+"
+NEWLINE_INDENT = r"[\r\n]+[ \t]{0,16}"
 SPACE_RUN = r" {2,16}"
 TAB_RUN = r"\t{1,16}"
 DIGIT = r"\p{N}"
-# GPT-4's cl100k pattern (digits are already single pieces by the time it runs).
-WORD = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
-        r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
-PRE_TOKENIZER_RULES = (NEWLINE_RUN, SPACE_RUN, TAB_RUN, DIGIT, WORD)
+CONTRACTION = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+WORD = r"[^\r\n\p{L}\p{M}\p{N}]?[\p{L}\p{M}]+"
+PUNCT = r" ?[^\s\p{L}\p{M}\p{N}]+"
+OTHER_SPACE = r"[^\S\r\n]+(?!\S)|[^\S\r\n]+"
+PRE_TOKENIZER_RULES = (NEWLINE_INDENT, SPACE_RUN, TAB_RUN, DIGIT, CONTRACTION, WORD, PUNCT,
+                       OTHER_SPACE)
 
 
 def build_pre_tokenizer() -> pre_tokenizers.PreTokenizer:
-    """The section 4.1 pre-tokeniser: the rules above in order, then bytes."""
-    splits = [pre_tokenizers.Split(Regex(rule), behavior="isolated")
-              for rule in PRE_TOKENIZER_RULES]
-    return pre_tokenizers.Sequence(
-        splits + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+    """The pre-tokeniser described above: one split on the joined rules, then bytes."""
+    return pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex("|".join(PRE_TOKENIZER_RULES)), behavior="isolated"),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
 
 
 def train_bpe(texts: Iterable[str] | Iterable[list[str]], vocab_size: int,

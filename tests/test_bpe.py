@@ -66,6 +66,12 @@ def tok(tmp_path_factory):
     "emoji 🎉🚀 and a ZWJ family 👨‍👩‍👧 and a lone  nbsp",
     "",
     "trailing spaces   \n  \n",
+    "简体中文和繁體中文，日本語のテキスト、한국어 문장입니다。",
+    "தமிழ் ஒரு திராவிட மொழி ஆகும்.",
+    "हिन्दी भारत की एक भाषा है। संख्या १२३",
+    "mujhe nahin pata ki woh kab aayega, bhai!",
+    "Saya tidak tahu bila dia akan datang.",
+    "\n\n\t\t  \r\n" + " " * 20 + "x\n" + "\t" * 20 + "y",
 ])
 def test_round_trip_is_exact(tok, text):
     assert tok.decode(tok.encode(text)) == text
@@ -88,9 +94,35 @@ def test_special_tokens_have_fixed_low_ids_in_every_training(tmp_path, tok):
     assert tok.eot == 0
 
 
-def test_a_run_of_8_spaces_is_one_token_after_training_on_indented_code(tok):
-    ids = tok.encode("        return total\n")
-    assert tok.decode([ids[0]]) == " " * 8
+def _pieces(text):
+    from quipu.bpe import build_pre_tokenizer
+    from tokenizers import decoders
+
+    return [decoders.ByteLevel().decode([p]) for p, _ in
+            build_pre_tokenizer().pre_tokenize_str(text)]
+
+
+def test_space_runs_are_own_pieces_but_a_single_space_stays_on_its_word():
+    # Indentation now travels with its newline (below); a space run elsewhere
+    # (alignment, a file that starts indented) is still its own piece, cut at 16.
+    assert _pieces("a        = b") == ["a", " " * 8, "=", " b"]
+    assert _pieces(" " * 20 + "x") == [" " * 16, " " * 4, "x"]
+    assert _pieces("\n" + " " * 20 + "x") == ["\n" + " " * 16, " " * 4, "x"]
+    assert _pieces("\t\tx") == ["\t\t", "x"]
+
+
+def test_a_newline_plus_8_spaces_is_one_token_after_training_on_indented_code(tok):
+    ids = tok.encode("x = 1\n        return total\n")
+    assert "\n" + " " * 8 in [tok.decode([i]) for i in ids]
+
+
+def test_punctuation_does_not_swallow_the_newline_and_indent_that_follow(tok):
+    ids = tok.encode("):\n        return total")
+    assert [tok.decode([i]) for i in ids][-3:] == ["\n" + " " * 8, "return", " total"]
+
+
+def test_indic_combining_marks_stay_inside_their_word():
+    assert _pieces("தமிழ் மொழி हिन्दी भाषा") == ["தமிழ்", " மொழி", " हिन्दी", " भाषा"]
 
 
 def test_digits_split_individually(tok):
@@ -170,12 +202,21 @@ def _m(ws, cpt, fails=()):
             "round_trip_failures": list(fails)}
 
 
-def test_judge_applies_the_four_criteria():
-    g_code, g_text = _m(0.365, 2.5), _m(0.02, 4.4)
-    rows = gate.judge(_m(0.10, 3.0), _m(0.02, 4.3), g_code, g_text)
-    assert [r["passed"] for r in rows] == [True, True, True, True]
-    rows = gate.judge(_m(0.16, 2.4, [3]), _m(0.02, 4.1), g_code, g_text)
-    assert [r["passed"] for r in rows] == [False, False, False, False]
+def test_judge_applies_every_criterion_including_each_other_language():
+    gpt2 = {"code": _m(0.365, 2.5), "eng_Latn": _m(0.02, 4.4), "tam_Taml": _m(0.0, 0.6),
+            "cmn_Hani": _m(0.0, 0.8)}
+    good = {"code": _m(0.10, 3.0), "eng_Latn": _m(0.02, 4.3), "tam_Taml": _m(0.0, 3.1),
+            "cmn_Hani": _m(0.0, 1.4)}
+    rows = gate.judge(good, gpt2)
+    assert [r["measure"] for r in rows] == [
+        "Whitespace-only share of code tokens", "Characters per token, code",
+        "Characters per token, eng_Latn", "Characters per token, tam_Taml",
+        "Characters per token, cmn_Hani", "Round trip decode(encode(x)) == x"]
+    assert all(r["passed"] for r in rows)
+    bad = {"code": _m(0.16, 2.4, [3]), "eng_Latn": _m(0.02, 4.1), "tam_Taml": _m(0.0, 3.1),
+           "cmn_Hani": _m(0.0, 0.7)}
+    rows = gate.judge(bad, gpt2)
+    assert [r["passed"] for r in rows] == [False, False, False, True, False, False]
     assert "FAIL" in gate.render(rows, {"tokenizer": "t", "sha256": "0", "vocab_size": 1,
                                         "when": "now", "sets": {}, "measurements": {}})
 
@@ -282,3 +323,42 @@ def test_language_weights_follow_the_spec():
     np.testing.assert_allclose(sum(v for k, v in w.items() if k not in
                                    ("Python", "JavaScript", "TypeScript", "HTML", "CSS",
                                     "SQL")), 0.15)
+
+
+def test_multilingual_documents_share_the_budget_and_pass_a_shortfall_on():
+    opened = []
+
+    def stream(lang, n):
+        def open_():
+            opened.append(lang)
+            return iter([{"text": f"{lang}{i}"} for i in range(n)])
+        return open_
+
+    # Each doc is 1 unit; budget 30 over three languages. "b" has only 4 docs, so
+    # its shortfall of 6 is shared: c gets (30 - 10 - 4) = 16.
+    streams = {"a": stream("a", 100), "b": stream("b", 4), "c": stream("c", 100)}
+    summary = {}
+    got = list(tt.multilingual_documents(streams, 30, size=lambda _: 1, summary=summary))
+    counts = Counter(lang for lang, _ in got)
+    assert counts == {"a": 10, "b": 4, "c": 16}
+    assert summary["b"]["short"] and not summary["a"]["short"]
+    assert opened == ["a", "b", "c"]
+
+
+def test_iter_parquet_text_reads_every_row_group_in_order(tmp_path):
+    import fsspec
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "part.parquet"
+    pq.write_table(pa.table({"text": [f"t{i}" for i in range(25)], "id": list(range(25))}),
+                   path, row_group_size=10)
+    rows = list(tt.iter_parquet_text(fsspec.filesystem("file"), [str(path)]))
+    assert [r["text"] for r in rows] == [f"t{i}" for i in range(25)]
+
+
+def test_the_multilingual_mix_follows_spec_section_11():
+    assert tt.FINEWEB2_LANGUAGES == ("ind_Latn", "zsm_Latn", "cmn_Hani", "jpn_Jpan",
+                                     "kor_Hang", "tam_Taml", "hin_Deva", "hin_Latn",
+                                     "urd_Latn")
+    assert (tt.CODE_SHARE, tt.ENGLISH_SHARE) == (0.6, 0.28)

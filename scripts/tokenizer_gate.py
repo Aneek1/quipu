@@ -1,18 +1,21 @@
-"""The quipu-moe tokenizer gate (spec section 4.3), against GPT-2, on held-out documents.
+"""The quipu-moe tokenizer gate (spec sections 4.3 and 11), against GPT-2, on held-out documents.
 
-Held-out documents are ones train_tokenizer.py never sampled: code from the
-held-out github-code-clean files (840..879, same licence/path/length filters and
-language weights as the sample, counted in documents here) minus any exact
-duplicate of a sampled code document; text from the last sample-10BT parquet file,
-which the sample never opens. Both are read from sample_manifest.json beside the
-tokenizer, and the gate refuses to run if the "held-out" text file was trained on.
+Held-out documents are ones train_tokenizer.py never sampled, all read from
+sample_manifest.json beside the tokenizer:
+  - code: the held-out github-code-clean files (840..879; same licence/path/length
+    filters and language weights as the sample, counted in documents), minus any
+    exact duplicate of a sampled code document;
+  - English: the last sample-10BT parquet file, which the sample never opens (the
+    gate refuses to run if it was trained on);
+  - the nine other languages: FineWeb-2's test split (the sample reads train only).
 
-Criteria, all four must pass (exit 0; otherwise exit 1):
+Criteria, all must pass (exit 0; otherwise exit 1):
   1. whitespace-only share of code tokens < 15%. A token is whitespace-only when
      decoding it on its own gives a non-empty string of whitespace characters;
   2. characters per token on code better than GPT-2's;
-  3. characters per token on text within 5% of GPT-2's (at least 0.95x);
-  4. decode(encode(doc)) == doc for every held-out document.
+  3. characters per token on English within 5% of GPT-2's (at least 0.95x);
+  4. characters per token better than GPT-2's for EACH of the nine other languages;
+  5. decode(encode(doc)) == doc for every held-out document.
 
 Run: uv run python scripts/tokenizer_gate.py --tokenizer artifacts/tokenizer/tokenizer.json
 """
@@ -73,33 +76,45 @@ def measure(tok: Any, docs: Sequence[str], is_ws: np.ndarray) -> dict[str, Any]:
             "round_trip_failures": failures}
 
 
-def judge(new_code: dict, new_text: dict, gpt2_code: dict, gpt2_text: dict) -> list[dict]:
-    """The four section 4.3 criteria as rows {measure, gpt2, new, required, passed}."""
-    ratio = new_text["chars_per_token"] / gpt2_text["chars_per_token"]
-    fails = len(new_code["round_trip_failures"]) + len(new_text["round_trip_failures"])
-    docs = new_code["documents"] + new_text["documents"]
-    return [
+def judge(new: dict[str, dict], gpt2: dict[str, dict],
+          english: str = tt.ENGLISH) -> list[dict]:
+    """The criteria as rows {measure, gpt2, new, required, passed}.
+
+    new and gpt2 map a set name ("code", english, or a FineWeb-2 language) to its
+    measure() result; every set other than code and english must beat GPT-2.
+    """
+    code_n, code_g, eng_n, eng_g = new["code"], gpt2["code"], new[english], gpt2[english]
+    ratio = eng_n["chars_per_token"] / eng_g["chars_per_token"]
+    rows = [
         {"measure": "Whitespace-only share of code tokens",
-         "gpt2": f"{gpt2_code['whitespace_share']:.1%}",
-         "new": f"{new_code['whitespace_share']:.1%}",
+         "gpt2": f"{code_g['whitespace_share']:.1%}",
+         "new": f"{code_n['whitespace_share']:.1%}",
          "required": f"< {WHITESPACE_SHARE_MAX:.0%}",
-         "passed": new_code["whitespace_share"] < WHITESPACE_SHARE_MAX},
+         "passed": code_n["whitespace_share"] < WHITESPACE_SHARE_MAX},
         {"measure": "Characters per token, code",
-         "gpt2": f"{gpt2_code['chars_per_token']:.3f}",
-         "new": f"{new_code['chars_per_token']:.3f}",
+         "gpt2": f"{code_g['chars_per_token']:.3f}",
+         "new": f"{code_n['chars_per_token']:.3f}",
          "required": "better than GPT-2",
-         "passed": new_code["chars_per_token"] > gpt2_code["chars_per_token"]},
-        {"measure": "Characters per token, text",
-         "gpt2": f"{gpt2_text['chars_per_token']:.3f}",
-         "new": f"{new_text['chars_per_token']:.3f} ({ratio:.3f}x)",
+         "passed": code_n["chars_per_token"] > code_g["chars_per_token"]},
+        {"measure": f"Characters per token, {english}",
+         "gpt2": f"{eng_g['chars_per_token']:.3f}",
+         "new": f"{eng_n['chars_per_token']:.3f} ({ratio:.3f}x)",
          "required": f">= {TEXT_RATIO_MIN}x GPT-2",
          "passed": ratio >= TEXT_RATIO_MIN},
-        {"measure": "Round trip decode(encode(x)) == x",
-         "gpt2": "-",
-         "new": f"{docs - fails}/{docs} exact",
-         "required": "every document",
-         "passed": fails == 0},
     ]
+    for name in new:
+        if name in ("code", english):
+            continue
+        n, g = new[name]["chars_per_token"], gpt2[name]["chars_per_token"]
+        rows.append({"measure": f"Characters per token, {name}", "gpt2": f"{g:.3f}",
+                     "new": f"{n:.3f} ({n / g:.2f}x)" if g else f"{n:.3f}",
+                     "required": "better than GPT-2", "passed": n > g})
+    fails = sum(len(m["round_trip_failures"]) for m in new.values())
+    docs = sum(m["documents"] for m in new.values())
+    rows.append({"measure": "Round trip decode(encode(x)) == x", "gpt2": "-",
+                 "new": f"{docs - fails}/{docs} exact", "required": "every document",
+                 "passed": fails == 0})
+    return rows
 
 
 def render(rows: list[dict], info: dict[str, Any]) -> str:
@@ -121,7 +136,6 @@ def render(rows: list[dict], info: dict[str, Any]) -> str:
         lines.append(f"| {set_name} | {tok_name} | {m['documents']:,} | {m['chars']:,} | "
                      f"{m['tokens']:,} | {m['whitespace_tokens']:,} |")
     return "\n".join(lines) + "\n"
-
 
 # ------------------------------------------------------------------ held-out data
 
@@ -145,7 +159,7 @@ def heldout_code(manifest: dict, n: int, exclude: set[int]) -> tuple[list[str], 
                   "by_language": by_lang}
 
 
-def heldout_text(manifest: dict, n: int) -> tuple[list[str], dict]:
+def heldout_english(manifest: dict, n: int) -> tuple[list[str], dict]:
     text = manifest["text"]
     files = text["heldout_files"]
     if set(files) & set(text["train_files"]):
@@ -155,15 +169,29 @@ def heldout_text(manifest: dict, n: int) -> tuple[list[str], dict]:
     return docs, {"files": files, "documents": len(docs)}
 
 
+def heldout_fineweb2(fs: Any, manifest: dict, lang: str, n: int) -> tuple[list[str], dict]:
+    fw2 = manifest["fineweb2"]
+    files = fw2["heldout_files"][lang]
+    if set(files) & set(fw2["train_files"][lang]):
+        raise SystemExit(f"held-out {lang} {files} overlaps the training files")
+    docs = list(tt.text_documents(tt.iter_parquet_text(fs, files), n, size=lambda _: 1))
+    return docs, {"files": ["/".join(f.split("/")[-3:]) for f in files],
+                  "documents": len(docs)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer", default="artifacts/tokenizer/tokenizer.json")
     parser.add_argument("--manifest", default=None,
                         help="default: sample_manifest.json beside the tokenizer")
-    parser.add_argument("--text-sample", type=int, default=2000, help="documents")
+    parser.add_argument("--text-sample", type=int, default=2000, help="English documents")
     parser.add_argument("--code-sample", type=int, default=2000, help="documents")
+    parser.add_argument("--lang-sample", type=int, default=500,
+                        help="documents per FineWeb-2 language")
     parser.add_argument("--out", default="results/tokenizer_gate.md")
     args = parser.parse_args()
+
+    from huggingface_hub import HfFileSystem
 
     from quipu.bpe import BPETokenizer
     from quipu.tokenizer import Tokenizer
@@ -176,22 +204,30 @@ def main() -> None:
     exclude = {int(h) for h in np.load(hashes_path)}
 
     new, gpt2 = BPETokenizer(tok_path), Tokenizer()
-    code_docs, code_info = heldout_code(manifest, args.code_sample, exclude)
-    print(f"code: {len(code_docs)} held-out documents", flush=True)
-    text_docs, text_info = heldout_text(manifest, args.text_sample)
-    print(f"text: {len(text_docs)} held-out documents", flush=True)
+    fs = HfFileSystem()
+    sets: dict[str, list[str]] = {}
+    set_info: dict[str, dict] = {}
+    sets["code"], set_info["code"] = heldout_code(manifest, args.code_sample, exclude)
+    sets[tt.ENGLISH], set_info[tt.ENGLISH] = heldout_english(manifest, args.text_sample)
+    for lang in manifest["fineweb2"]["languages"]:
+        sets[lang], set_info[lang] = heldout_fineweb2(fs, manifest, lang, args.lang_sample)
+    for name, docs in sets.items():
+        print(f"{name}: {len(docs)} held-out documents", flush=True)
+        if not docs:
+            raise SystemExit(f"no held-out documents for {name}")
 
     ws_new, ws_gpt2 = whitespace_table(new), whitespace_table(gpt2)
-    m = {("code", "quipu-moe"): measure(new, code_docs, ws_new),
-         ("text", "quipu-moe"): measure(new, text_docs, ws_new),
-         ("code", "gpt2"): measure(gpt2, code_docs, ws_gpt2),
-         ("text", "gpt2"): measure(gpt2, text_docs, ws_gpt2)}
-    rows = judge(m["code", "quipu-moe"], m["text", "quipu-moe"], m["code", "gpt2"],
-                 m["text", "gpt2"])
+    m_new = {name: measure(new, docs, ws_new) for name, docs in sets.items()}
+    m_gpt2 = {name: measure(gpt2, docs, ws_gpt2) for name, docs in sets.items()}
+    rows = judge(m_new, m_gpt2)
+    measurements = {}
+    for name in sets:
+        measurements[name, "quipu-moe"] = m_new[name]
+        measurements[name, "gpt2"] = m_gpt2[name]
     info = {"tokenizer": str(tok_path).replace("\\", "/"), "sha256": new.sha256(),
             "vocab_size": new.vocab_size,
             "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "sets": {"code": code_info, "text": text_info}, "measurements": m}
+            "sets": set_info, "measurements": measurements}
     report = render(rows, info)
     write_text_atomic(args.out, report)
     print(report, flush=True)
