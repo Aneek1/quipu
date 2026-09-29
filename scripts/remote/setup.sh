@@ -4,9 +4,13 @@
 # re-run after a failure or to update the checkout.
 #
 #   bash setup.sh [--repo-url URL] [--branch NAME] [--workdir DIR] [--skip-gpu-bench]
+#                 [--cpu-only]
 #
+# --cpu-only is for a CPU box that only builds shards (scripts/remote/
+# build_shards_box.md): no nvidia-smi, driver, CUDA or GPU benchmark checks, no Node
+# or npm cache; it checks fastText instead and runs the shard builder's tests.
 # The same settings can come from the environment: REPO_URL, BRANCH, WORKDIR,
-# SKIP_GPU_BENCH=1. The repo is public and cloned over https with plain git:
+# SKIP_GPU_BENCH=1, CPU_ONLY=1. The repo is public and cloned over https with plain git:
 # this box never needs, and must never be given, any GitHub credentials.
 set -euo pipefail
 
@@ -14,13 +18,14 @@ REPO_URL="${REPO_URL:-https://github.com/Aneek1/quipu.git}"
 BRANCH="${BRANCH:-main}"
 WORKDIR="${WORKDIR:-/workspace/quipu}"
 SKIP_GPU_BENCH="${SKIP_GPU_BENCH:-0}"
+CPU_ONLY="${CPU_ONLY:-0}"
 
 NODE_MAJOR=24          # installed from NodeSource when node is missing or too old
 MIN_NODE_MAJOR=22
 MIN_DRIVER_MAJOR=570   # the lock pins torch cu128 wheels; CUDA 12.8 needs driver >= 570
 
 usage() {
-    echo "usage: setup.sh [--repo-url URL] [--branch NAME] [--workdir DIR] [--skip-gpu-bench]"
+    echo "usage: setup.sh [--repo-url URL] [--branch NAME] [--workdir DIR] [--skip-gpu-bench] [--cpu-only]"
     echo "defaults: $REPO_URL, branch $BRANCH, into $WORKDIR"
 }
 while [ $# -gt 0 ]; do
@@ -34,6 +39,7 @@ while [ $# -gt 0 ]; do
             esac
             shift 2 ;;
         --skip-gpu-bench) SKIP_GPU_BENCH=1; shift ;;
+        --cpu-only) CPU_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -52,19 +58,24 @@ case "$(uname -s)-$(uname -m)" in
     *) die "expected Linux on x86_64 (or aarch64), got $(uname -s) $(uname -m)" ;;
 esac
 
-log "GPU and driver"
-command -v nvidia-smi >/dev/null 2>&1 \
-    || die "nvidia-smi not found: this instance has no NVIDIA driver visible. Rent a GPU instance with an NVIDIA CUDA image."
-nvidia-smi
-driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1 | tr -d ' ')"
-driver_major="${driver%%.*}"
-case "$driver_major" in
-    ''|*[!0-9]*) die "could not read the NVIDIA driver version (got '$driver')" ;;
-esac
-if [ "$driver_major" -lt "$MIN_DRIVER_MAJOR" ]; then
-    die "NVIDIA driver $driver is too old for the cu128 torch wheels this project pins (CUDA 12.8 needs driver >= $MIN_DRIVER_MAJOR). Destroy this instance and rent one whose image/host offers CUDA 12.8 or newer (in the Vast search, filter on 'CUDA >= 12.8')."
+if [ "$CPU_ONLY" = "1" ]; then
+    log "CPU-only box (--cpu-only): no GPU, driver or CUDA checks"
+    echo "$(nproc) cores, $(awk '/MemTotal/ {printf "%.0f GB", $2 / 1048576}' /proc/meminfo) RAM, $(df -h --output=avail / | tail -n 1 | tr -d ' ') free on /"
+else
+    log "GPU and driver"
+    command -v nvidia-smi >/dev/null 2>&1 \
+        || die "nvidia-smi not found: this instance has no NVIDIA driver visible. Rent a GPU instance with an NVIDIA CUDA image (or pass --cpu-only on a box that only builds shards)."
+    nvidia-smi
+    driver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1 | tr -d ' ')"
+    driver_major="${driver%%.*}"
+    case "$driver_major" in
+        ''|*[!0-9]*) die "could not read the NVIDIA driver version (got '$driver')" ;;
+    esac
+    if [ "$driver_major" -lt "$MIN_DRIVER_MAJOR" ]; then
+        die "NVIDIA driver $driver is too old for the cu128 torch wheels this project pins (CUDA 12.8 needs driver >= $MIN_DRIVER_MAJOR). Destroy this instance and rent one whose image/host offers CUDA 12.8 or newer (in the Vast search, filter on 'CUDA >= 12.8')."
+    fi
+    echo "driver $driver: OK for CUDA 12.8"
 fi
-echo "driver $driver: OK for CUDA 12.8"
 
 # ---------------------------------------------------------------- system packages
 missing=()
@@ -87,7 +98,9 @@ node_major() {
         echo 0
     fi
 }
-if [ "$(node_major)" -lt "$MIN_NODE_MAJOR" ]; then
+if [ "$CPU_ONLY" = "1" ]; then
+    log "Node: not needed on a shard-building box (--cpu-only)"
+elif [ "$(node_major)" -lt "$MIN_NODE_MAJOR" ]; then
     log "Installing Node $NODE_MAJOR from NodeSource"
     tmp="$(mktemp)"
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" -o "$tmp"
@@ -96,7 +109,9 @@ if [ "$(node_major)" -lt "$MIN_NODE_MAJOR" ]; then
     $SUDO apt-get install -y nodejs
     [ "$(node_major)" -ge "$MIN_NODE_MAJOR" ] || die "node is still older than $MIN_NODE_MAJOR after the NodeSource install"
 fi
-log "node $(node --version), npm $(npm --version)"
+if [ "$CPU_ONLY" != "1" ]; then
+    log "node $(node --version), npm $(npm --version)"
+fi
 
 # ---------------------------------------------------------------- uv
 if ! command -v uv >/dev/null 2>&1; then
@@ -129,6 +144,19 @@ echo "at $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
 # ---------------------------------------------------------------- Python env
 log "uv sync (Python 3.13 and the locked cu128 torch)"
 uv sync --frozen
+
+if [ "$CPU_ONLY" = "1" ]; then
+    log "fastText (the LID filter; built for Linux by uv sync)"
+    uv run --frozen python -c "import fasttext; print('fasttext OK:', fasttext.__file__)" \
+        || die "fasttext does not import: the --lid-filter build cannot run on this box"
+
+    log "Shard builder tests (no network)"
+    uv run --frozen python -m pytest tests/test_build_shards_v2.py tests/test_build_shards.py -q -o addopts=""
+
+    log "Done (CPU-only). The checkout is $WORKDIR; next: scripts/remote/build_shards_box.md"
+    echo "Destroy the instance in the Vast console once the shards are copied off: it bills per hour."
+    exit 0
+fi
 
 log "torch and CUDA"
 uv run --frozen python - <<'PY'

@@ -5,6 +5,9 @@ and long training runs go faster on a rented Linux box with a 4090 or 5090. This
 folder sets one up. Your GitHub login (`gh`) stays on the laptop: the box only
 ever clones public repos over plain https and never gets any GitHub credential.
 
+Building the quipu-moe shards needs no GPU: see
+[build_shards_box.md](build_shards_box.md) (a cheap CPU-only box, `setup.sh --cpu-only`).
+
 ## 1. Rent a box (Vast.ai)
 
 1. In the Vast console, **Account → Keys**, add your SSH **public** key
