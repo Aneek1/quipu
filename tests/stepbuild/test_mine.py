@@ -4,7 +4,10 @@ import subprocess
 import pytest
 
 from stepbuild.dataset import mine as mine_mod
-from stepbuild.dataset.filters import drop_reason
+from stepbuild.dataset.filters import Commit, FileChange, drop_reason
+from stepbuild.dataset.format import format_example
+from stepbuild.harness.plan import make_plan
+from stepbuild.harness.prompt import build_messages, render_tree
 from stepbuild.dataset.mine import MineError, Miner, clone, mine_repo
 from tests.stepbuild.gitrepo import commit, git, init_repo, make_repo
 
@@ -107,10 +110,10 @@ def test_context_and_tree(tmp_path):
     assert "backend/database.py" in ctx
     assert not {"backend/secrets.py", ".env.py", "node_modules/react/index.js"} & set(ctx)
     assert len(ctx) <= 1 + mine_mod.CONTEXT_BM25
-    # Files only, depth <= 2 directories, harness-visible, sorted.
+    # Files only, any depth, harness-visible, sorted (render_tree caps it later).
     assert tree == sorted(tree)
     assert "backend/app.py" in tree and "frontend/src/App.jsx" in tree and "README.md" in tree
-    assert "frontend/src/components/deep/Deep.jsx" not in tree
+    assert "frontend/src/components/deep/Deep.jsx" in tree
     assert not any(p.startswith("node_modules/") or p.endswith("/") for p in tree)
 
 
@@ -156,3 +159,40 @@ def test_empty_repo_raises_mine_error(tmp_path):
     init_repo(tmp_path / "r")
     with pytest.raises(MineError):
         list(mine_repo(tmp_path / "r"))
+
+
+def test_deep_files_reach_the_formatted_tree_and_match_the_harness(tmp_path):
+    noise = {f"docs/page_{i:03d}.md": "x\n" for i in range(80)}
+    make_repo(tmp_path / "r", [
+        ("Initial project skeleton", {
+            "backend/app.py": APP_V1,
+            "frontend/src/components/X.jsx": "export default 1\n",  # 4 segments deep
+            "frontend/dist/bundle.js": "built\n",
+            "vendor/lib.py": "v = 1\n",
+            "frontend/package-lock.json": "{}\n",
+            **noise,
+        }),
+        ("Add a health endpoint returning ok", {"backend/app.py": APP_V2}),
+    ])
+    with Miner(tmp_path / "r") as m:
+        kept = list(m.commits())[1]
+        tree = m.tree(kept)
+    assert "frontend/src/components/X.jsx" in tree
+    assert not {"frontend/dist/bundle.js", "vendor/lib.py", "frontend/package-lock.json"} & set(tree)
+    assert len(tree) == 82  # no depth limit, no count cap before render_tree
+
+    change = FileChange("backend/app.py", APP_V1, APP_V2, 5, 0)
+    row = format_example("o/r", "MIT", "flask", Commit(kept.sha, kept.message, 1, (change,)),
+                         {}, tree)
+    dataset_tree = row["messages"][1]["content"].split("PROJECT TREE:\n", 1)[1]
+    lines = dataset_tree.split("\n")[:-1]
+    assert lines[:2] == ["backend/app.py", "frontend/src/components/X.jsx"]
+    assert len(lines) == 61 and lines[-1] == "... (22 more files not shown)"
+    assert dataset_tree == render_tree(tree)
+
+    # The harness, given the same files, renders the identical tree text.
+    plan = make_plan("todo", "A todo list.")
+    files = {p: "x\n" for p in tree}
+    harness_user = build_messages(plan, plan.steps[0], files, [], max_tokens=10**9)[1]["content"]
+    harness_tree = harness_user.split("\nPROJECT TREE:\n", 1)[1].split("\nREPLY WITH:\n", 1)[0]
+    assert harness_tree == dataset_tree

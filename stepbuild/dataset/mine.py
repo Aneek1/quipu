@@ -40,13 +40,14 @@ lines, no over-long lines, no FILE-marker lines, nothing contains_secret flags.
 Token ids are cached per blob id, since most files are unchanged from one commit
 to the next.
 
-Tree. The parent commit's files (no directory entries), as the harness shows
-its PROJECT TREE: the harness's own visibility rule (no node_modules/,
-__pycache__/, acceptance tests, lockfiles), minus generated or vendored paths,
-at most TREE_DEPTH directories deep, and at most MAX_TREE_FILES entries (the
-shallowest first), listed sorted. This is only the candidate list: the formatter
-renders it with the harness's render_tree, which applies the TREE_MAX_FILES cap
-and ordering (the one implementation of the tree text).
+Tree. Every file of the parent commit (no directory entries, no submodules or
+symlinks), at any depth, filtered only by the harness's own visibility rule (no
+node_modules/, __pycache__/, acceptance tests, lockfiles) and the filters'
+generated/vendored exclusions (dist/, build/, vendor/, .venv/, ...), listed
+sorted. There is no depth limit and no count cap here: the formatter renders the
+list with the harness's render_tree, whose priority order (backend/ and
+frontend/src/ first) and TREE_MAX_FILES cap decide what is shown, exactly as the
+harness does for its own PROJECT TREE.
 """
 from __future__ import annotations
 
@@ -80,8 +81,6 @@ OVERSIZE_LINES = 10_000
 CONTEXT_BM25 = 2
 MAX_CANDIDATE_BYTES = 64 * 1024
 MAX_CANDIDATES = 2000
-TREE_DEPTH = 2
-MAX_TREE_FILES = 200
 TOKEN_CACHE = 5000
 GIT_TIMEOUT = 600
 CLONE_TIMEOUT = 600
@@ -313,12 +312,12 @@ class Miner:
         return self._tree
 
     def tree(self, commit: Commit) -> list[str]:
-        paths = [
+        """Every visible, non-excluded file of the parent commit, sorted; the
+        shared render_tree applies the cap and priority when it is formatted."""
+        return sorted({
             p for _, _, _, p in self._parent_tree(commit)
-            if p.count("/") <= TREE_DEPTH and _in_tree(p) and not _is_excluded(p)
-        ]
-        paths.sort(key=lambda p: (p.count("/"), p))
-        return sorted(paths[:MAX_TREE_FILES])
+            if _in_tree(p) and not _is_excluded(p)
+        })
 
     def _tokenizer(self):
         if self._tok is None:

@@ -53,7 +53,7 @@ New top-level package `stepbuild/` in the quipu repo, following the repo's conve
   "repo": "owner/name", "licence": "MIT", "commit": "abc123", "split": "train",
   "messages": [
     {"role": "system", "content": "You build Flask + React apps one small step at a time. Reply with the complete new contents of each file you change, in the FILE block format."},
-    {"role": "user", "content": "STEP: <commit message>\n\nCONTEXT FILES:\n<up to 3 related files, pre-commit contents, each in a FILE block>\n\nPROJECT TREE:\n<depth-limited file list>"},
+    {"role": "user", "content": "STEP: <commit message>\n\nCONTEXT FILES:\n<up to 3 related files, pre-commit contents, each in a FILE block>\n\nPROJECT TREE:\n<at most 60 files, backend/ and frontend/src/ first>"},
     {"role": "assistant", "content": "<one FILE block per changed file, post-commit contents>"}
   ]
 }
@@ -62,7 +62,7 @@ New top-level package `stepbuild/` in the quipu repo, following the repo's conve
 
 **Context file selection:** the pre-commit versions of the changed files, plus up to 2 further files chosen by BM25 over the repo at that commit using the commit message as the query (reusing `quipu.memory.bm25`). Total user message capped at 6,000 tokens (Qwen tokenizer count via `tokenizers` if installed, else a 4-chars-per-token estimate); examples over the cap are dropped, never truncated mid-file.
 
-**Project tree:** PROJECT TREE lists at most 60 files (backend/ and frontend/src/ first), shared by dataset and harness. Past the cap a final line reads `... (N more files not shown)`.
+**Project tree:** PROJECT TREE lists at most 60 files (backend/ and frontend/src/ first), shared by dataset and harness. Past the cap a final line reads `... (N more files not shown)`. The miner passes every file at any depth; no depth limit.
 
 **Scale target:** 300–1,000 repos; the builder reports repos found / licensed / mined and examples kept vs dropped per filter. No minimum example count is required to finish this spec, but the report must be produced.
 
