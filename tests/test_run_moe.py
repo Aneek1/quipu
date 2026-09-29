@@ -472,12 +472,15 @@ from pathlib import Path
 marker = Path(sys.argv[1])
 def stop(signum, frame):
     marker.write_text("interrupt checkpoint")
+    print("checkpoint step 9 saved in 4.5 s (1.4 GB)", flush=True)
     sys.exit(130)
 for name in ("SIGINT", "SIGBREAK"):
     if hasattr(signal, name):
         signal.signal(getattr(signal, name), stop)
 for i in range(1, 2000):
     print(f"step {i}/2000  loss 3.0000  lr 1.00e-03  grad 1.000  1,000 tok/s", flush=True)
+    if i == 1:
+        print("checkpoint step 1 saved in 20.0 s (1.4 GB)", flush=True)
     time.sleep(0.02)
 '''
 
@@ -498,6 +501,52 @@ def test_subprocess_child_interrupts_so_the_trainer_checkpoints(tmp_path):
     assert marker.read_text() == "interrupt checkpoint"
     assert out.code in rm.TRAIN_INTERRUPT_CODES
     assert out.events and out.events[0][1] >= 1
+    # The trainer's checkpoint lines: recorded, and the grace for later stops is
+    # max(grace_s, 3 x the longest save) = 60 s.
+    assert out.save_s == [20.0, 4.5]
+    assert child.max_save_s == 20.0 and child.effective_grace_s == 60.0
+
+
+def test_parse_save_s_reads_the_trainers_checkpoint_line():
+    assert rm.parse_save_s("checkpoint step 1200 saved in 41.7 s (1.4 GB)\n") == 41.7
+    assert rm.parse_save_s("step 5/20  loss 3.0000") is None
+    assert rm.parse_save_s("note: checkpoint step 5 saved in 1.0 s") is None
+
+
+def test_the_stop_grace_follows_the_longest_save_and_never_shrinks():
+    said = []
+    child = rm.SubprocessChild(grace_s=300.0, kill_wait_s=5.0, echo=said.append)
+    assert child.effective_grace_s == 300.0
+    child._saw_save(50.0)                       # 3 x 50 = 150 < 300: unchanged
+    assert child.effective_grace_s == 300.0 and not said
+    child._saw_save(140.0)
+    assert child.effective_grace_s == 420.0 and "stop grace now 420 s" in said[-1]
+    child._saw_save(10.0)
+    assert child.effective_grace_s == 420.0
+    waits = []
+
+    class Proc:
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 130
+    child._interrupt = lambda proc: True
+    child._stop_child(Proc(), child_got_it=False)
+    assert waits == [420.0]
+
+
+def test_summary_reports_each_attempts_longest_checkpoint_save(tmp_path):
+    import dataclasses
+
+    clock = FakeClock()
+    trainer = FakeTrainer(clock, tps=BT / 2.0)
+
+    def with_saves(cmd, log_path, should_stop):
+        return dataclasses.replace(trainer(cmd, log_path, should_stop), save_s=[12.5, 30.0])
+
+    launcher = make_launcher(tmp_path, clock, with_saves, budget=20.0, gate_minutes=5.0)
+    assert launcher.run() == 0
+    summary = (tmp_path / "results" / "moe" / "summary.md").read_text(encoding="utf-8")
+    assert summary.count("longest checkpoint save 30.0 s") == 2     # gate + long run
 
 
 # ---- sync.sh ---------------------------------------------------------------------------------

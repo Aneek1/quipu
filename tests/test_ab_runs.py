@@ -7,6 +7,7 @@ the CPU (device forced: CUDA_VISIBLE_DEVICES="" does not hide this laptop's GPU)
 """
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -685,6 +686,8 @@ for i, loss in enumerate(losses, 1):
     path.write_text(json.dumps(log))
     print(f"step {i}/{len(losses)}  loss {loss:.4f}  lr 1.00e-03  grad 1.000  1,000 tok/s", flush=True)
     time.sleep(behave.get("sleep", 0.0))
+for s in behave.get("saves", []):
+    print(f"checkpoint step {len(losses)} saved in {s:.1f} s (1.4 GB)", flush=True)
 if behave.get("oom"):
     print("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB", flush=True)
     sys.exit(1)
@@ -749,6 +752,52 @@ def test_healthy_fake_run_reports_val_loss_and_throughput(tmp_path, monkeypatch)
     r = runner(spec, o.context_for(spec, baseline_losses=[3.0] * 12))
     assert r.status == "completed" and r.final_val_loss == 2.5
     assert r.tokens_per_s == 1000.0 and r.spikes == 0 and len(r.train_losses) == 12
+    assert r.max_save_s is None
+
+
+def test_parse_save_s_reads_the_trainers_checkpoint_line():
+    assert ab.parse_save_s("checkpoint step 1200 saved in 41.7 s (1.4 GB)\n") == 41.7
+    assert ab.parse_save_s("checkpoint step 5 saved in 0.0 s (0.0 GB)") == 0.0
+    assert ab.parse_save_s("step 5/20  loss 3.0  1,000 tok/s") is None
+    assert ab.parse_save_s("warning: checkpoint step 5 saved in 1.0 s") is None
+
+
+def test_save_times_raise_the_stop_grace_for_later_stops(tmp_path, monkeypatch):
+    behave = {"losses": [3.0] * 3, "val": 2.5, "saves": [40.0, 150.0, 90.0]}
+    said = []
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave, grace_s=300,
+                                    kill_wait_s=30, echo=said.append)
+    assert runner.effective_grace_s == 300
+    o = orch(tmp_path, runner, arm_tokens=3 * 524_288, stop_grace_s=300)
+    spec = one_spec(o)
+    r = runner(spec, o.context_for(spec, None))
+    assert r.max_save_s == 150.0 and runner.max_save_s == 150.0
+    assert runner.effective_grace_s == 450.0                     # 3 x 150 > 300
+    assert any("stop grace now 450 s" in s for s in said)
+    # The next stop waits the raised grace.
+    runner._interrupt = lambda proc: True
+    proc = FakeProc(alive_for=0)
+    runner._stop_child(proc, child_got_it=False)
+    assert proc.calls == [("wait", 450.0)]
+    # A shorter save later never lowers it; a result without saves reports None.
+    runner._saw_save(10.0)
+    assert runner.effective_grace_s == 450.0
+    assert ab.RunResult.from_dict({k: v for k, v in r.to_dict().items()
+                                   if k != "max_save_s"}).max_save_s is None
+
+
+def test_summary_reports_checkpoint_save_times(tmp_path):
+    clock = FakeClock()
+
+    def outcome(spec):
+        r = val_by_settings(spec)
+        return dataclasses.replace(r, max_save_s=120.0) if spec.name == "p2-attnres" else r
+
+    o = orch(tmp_path, FakeRunner(clock, outcome), clock, skip_sweeps=True, stop_grace_s=300)
+    o.run()
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    assert "## Checkpoint saves" in summary
+    assert "p2-attnres 120.0 s" in summary and "= 360 s" in summary
 
 
 # ---- end to end on the smoke config, for real, on the CPU ------------------------------------

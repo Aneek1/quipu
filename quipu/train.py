@@ -13,7 +13,8 @@ post-run evaluation to see how the model changed over the run.
 Exit codes of `python -m quipu.train` (the weekend launcher decides whether to retry
 from these; see run_main): 0 completed, 1 any other crash, 2 a usage/config error,
 3 the non-finite stop, 130 an interrupt. SIGTERM (and SIGBREAK on Windows) is
-handled like Ctrl+C: the interrupt checkpoint is written, then it exits 130.
+handled like Ctrl+C: the interrupt checkpoint is written, then it exits 130. Only
+the first of these signals raises; repeats during the checkpoint are ignored.
 
 Models and optimizers (quipu-moe, M6): the model comes from build_model (dense
 Quipu or QuipuMoE) and the optimizers from build_optimizers (one AdamW, or Muon +
@@ -574,6 +575,10 @@ class Trainer:
     # ---- checkpoints ---------------------------------------------------------
 
     def save_checkpoint(self) -> Path:
+        """Write step_N.pt, point latest.pt at it, prune, and print one line
+        `checkpoint step N saved in X.X s (Y.Y GB)`: the A/B runner and the box
+        launcher parse it to size the grace they give an interrupt checkpoint."""
+        t0 = time.monotonic()
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         path = self.ckpt_dir / f"step_{self.step:06d}.pt"
         _atomic_save(
@@ -600,6 +605,12 @@ class Trainer:
         # the checkpoint directory can be moved without breaking resume.
         _atomic_save({"file": path.name}, self.ckpt_dir / LATEST)
         self._prune_checkpoints(keep_name=path.name)
+        try:
+            gb = path.stat().st_size / 1e9
+        except OSError:
+            gb = float("nan")
+        print(f"checkpoint step {self.step} saved in {time.monotonic() - t0:.1f} s "
+              f"({gb:.1f} GB)", flush=True)
         return path
 
     def _prune_checkpoints(self, keep_name: str) -> None:
@@ -838,14 +849,20 @@ STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGBREAK") if hasa
 
 
 def _install_stop_handlers() -> dict[int, Any]:
-    """SIGTERM (and SIGBREAK, what CTRL_BREAK_EVENT delivers on Windows) take the
-    same path as Ctrl+C: KeyboardInterrupt, so the loop saves its interrupt
-    checkpoint and the process exits 130. Only the first such signal raises; a
-    repeat while that checkpoint is being written is ignored, so it cannot abort
-    the save (a supervisor that wants the process gone kills it). Returns the
+    """SIGINT (Ctrl+C), SIGTERM and SIGBREAK (what CTRL_BREAK_EVENT delivers on
+    Windows) all take one path: KeyboardInterrupt, so the loop saves its interrupt
+    checkpoint and the process exits 130. Only the first of them raises; any repeat
+    (a second Ctrl+C included) while that checkpoint is being written is ignored
+    with a note, so it cannot abort the save (a supervisor that wants the process
+    gone kills it). SIGINT is taken over only from Python's default handler, which
+    raises KeyboardInterrupt the same way, so Ctrl+C behaves as before on every
+    platform; an ignored or custom SIGINT handler is left alone. Returns the
     previous handlers for run_main to restore. Main thread only (signal.signal)."""
     if threading.current_thread() is not threading.main_thread():
         return {}
+    signals = list(STOP_SIGNALS)
+    if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        signals.insert(0, signal.SIGINT)
     fired = False
 
     def stop(signum: int, frame: Any) -> None:
@@ -860,7 +877,7 @@ def _install_stop_handlers() -> dict[int, Any]:
         raise KeyboardInterrupt
 
     previous = {}
-    for sig in STOP_SIGNALS:
+    for sig in signals:
         try:
             previous[sig] = signal.signal(sig, stop)
         except (OSError, ValueError):       # not settable here

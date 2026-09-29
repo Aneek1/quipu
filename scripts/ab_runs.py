@@ -59,7 +59,9 @@ Money (the box is billed per hour; the credit is not refundable):
   time reaches the budget, the child gets SIGINT (Windows: CTRL_BREAK) and writes
   its interrupt checkpoint; after the grace it is terminated, then killed. The log
   reports how long the child took from the interrupt to its exit (the checkpoint's
-  save time: what the grace must cover). The run is "stopped_budget": not
+  save time: what the grace must cover). The trainer prints each checkpoint's save
+  time; once one is seen, later stops wait max(--stop-grace-s, 3 x the longest save
+  seen), and summary.md reports each run's longest save. The run is "stopped_budget": not
   cached, its checkpoint kept, so the next invocation (with more budget) resumes it.
   The orchestrator then exits 4. The runs keep train.budget_usd 0 (the orchestrator
   guards); train.budget_usd / usd_per_hour and the per-run bookkeeping keys
@@ -258,6 +260,7 @@ class RunResult:
     skipped: int | None = None      # non-finite steps the trainer skipped (run log)
     startup_s: float | None = None  # process start to the first step line
     overhead_s: float | None = None # wall - tokens / steady tokens/s
+    max_save_s: float | None = None # longest checkpoint save the trainer reported
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -1037,6 +1040,7 @@ class Orchestrator:
                 "; ".join(self.labels.get(key, [])) or "-",
             ]) + " |")
         lines += ["", "## Overhead", "", self._overhead_note()]
+        lines += ["", "## Checkpoint saves", "", self._save_note()]
         lines += ["", "## Learning rates", ""] + [f"- {n_}" for n_ in self.lr_notes]
         lines += ["", "## Decisions", "",
                   "| pair | simpler | other | kept | noise | reason |", "|---|---|---|---|---|---|"]
@@ -1069,6 +1073,22 @@ class Orchestrator:
             text += (f" Startup + compile to the first step line: median "
                      f"{statistics.median(start):.0f} s.")
         return text
+
+    def _save_note(self) -> str:
+        """The trainer's reported checkpoint save times, against the stop grace."""
+        saves = {spec.name: self.results[key].max_save_s for spec, key in
+                 ((rec["spec"], rec["key"]) for rec in self.records)
+                 if self.results.get(key) is not None
+                 and self.results[key].max_save_s is not None}
+        grace = f"--stop-grace-s {self.guard.grace_s:.0f} s"
+        if not saves:
+            return f"No checkpoint save time reported yet; stops wait the {grace}."
+        longest = max(saves.values())
+        return (f"Longest checkpoint save per run: "
+                + ", ".join(f"{n} {s:.1f} s" for n, s in saves.items())
+                + f". Longest {longest:.1f} s; stops wait max({grace}, "
+                f"{SAVE_GRACE_FACTOR:g} x {longest:.1f} s) = "
+                f"{max(self.guard.grace_s, SAVE_GRACE_FACTOR * longest):.0f} s.")
 
 
 def _echo(line: str) -> None:
@@ -1144,6 +1164,15 @@ def _val_bytes_per_token(cfg: Config) -> float | None:
 # ---- the training subprocess ------------------------------------------------------------------
 
 STEP_LINE = re.compile(r"^step (\d+)/(\d+)\s+loss (\S+).*?([\d,.]+) tok/s")
+# quipu.train's Trainer.save_checkpoint prints this after every checkpoint.
+SAVE_LINE = re.compile(r"^checkpoint step (\d+) saved in ([\d.]+) s")
+SAVE_GRACE_FACTOR = 3.0   # a stop waits at least this many x the longest save seen
+
+
+def parse_save_s(line: str) -> float | None:
+    """The save time from a trainer `checkpoint step N saved in X.X s` line, else None."""
+    m = SAVE_LINE.match(line.strip())
+    return float(m.group(2)) if m else None
 
 
 class SubprocessRunner:
@@ -1180,6 +1209,19 @@ class SubprocessRunner:
         self.grace_s = grace_s
         self.kill_wait_s = kill_wait_s
         self.poll_s = poll_s
+        self.max_save_s = 0.0          # longest checkpoint save seen, over every run
+
+    @property
+    def effective_grace_s(self) -> float:
+        """grace_s, raised to SAVE_GRACE_FACTOR x the longest checkpoint save seen."""
+        return max(self.grace_s, SAVE_GRACE_FACTOR * self.max_save_s)
+
+    def _saw_save(self, save_s: float) -> None:
+        before = self.effective_grace_s
+        self.max_save_s = max(self.max_save_s, save_s)
+        if self.effective_grace_s > before:
+            self.echo(f"[ab] checkpoint save took {save_s:.1f} s: stop grace now "
+                      f"{self.effective_grace_s:.0f} s")
 
     # -- stopping a child --
 
@@ -1215,14 +1257,14 @@ class SubprocessRunner:
 
         def exited(how: str) -> None:
             self.echo(f"[ab] child exited {time.monotonic() - t0:.1f} s after the interrupt "
-                      f"({how}; grace {self.grace_s:.0f} s)")
+                      f"({how}; grace {self.effective_grace_s:.0f} s)")
 
         if child_got_it:
-            if self._wait(proc, self.grace_s):
+            if self._wait(proc, self.effective_grace_s):
                 return exited("checkpoint and exit")
             if self._interrupt(proc) and self._wait(proc, self.kill_wait_s):
                 return exited("after a second interrupt")
-        elif self._interrupt(proc) and self._wait(proc, self.grace_s):
+        elif self._interrupt(proc) and self._wait(proc, self.effective_grace_s):
             return exited("checkpoint and exit")
         proc.terminate()
         if self._wait(proc, self.kill_wait_s):
@@ -1255,6 +1297,7 @@ class SubprocessRunner:
         oom = False
         first_step_at: float | None = None
         tok_s: list[float] = []
+        saves: list[float] = []
         budget_hit = threading.Event()
         done = threading.Event()
         t0 = time.monotonic()
@@ -1274,7 +1317,7 @@ class SubprocessRunner:
                 if over:
                     budget_hit.set()
                     self.echo(f"[ab] budget reached during {spec.name}: interrupting it "
-                              f"(checkpoint, up to {self.grace_s:.0f} s)")
+                              f"(checkpoint, up to {self.effective_grace_s:.0f} s)")
                     self._stop_child(proc, child_got_it=False)
                     return
 
@@ -1288,6 +1331,10 @@ class SubprocessRunner:
                     self.echo(line.rstrip("\n"))
                     if any(mark in line.lower() for mark in OOM_MARKERS):
                         oom = True
+                    save_s = parse_save_s(line)
+                    if save_s is not None:
+                        saves.append(save_s)
+                        self._saw_save(save_s)
                     m = STEP_LINE.match(line.strip())
                     if not m or diverged:
                         continue
@@ -1363,6 +1410,7 @@ class SubprocessRunner:
             resumed=resumed, skipped=int(skipped) if isinstance(skipped, (int, float)) else None,
             startup_s=None if first_step_at is None else first_step_at - t0,
             overhead_s=(wall - spec.tokens / steady) if steady and not resumed else None,
+            max_save_s=max(saves) if saves else None,
         )
 
 

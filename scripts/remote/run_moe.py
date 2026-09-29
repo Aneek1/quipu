@@ -44,7 +44,8 @@ What it does, in order (everything lands in --out, default results/moe):
    spend + cost of the next eval interval (min(eval_every, steps left) at the slower
    of the planned and the attempt's measured rate) + --reserve-usd; once that is
    above --budget-usd the child is interrupted (SIGINT -> interrupt checkpoint ->
-   up to STOP_GRACE_S, then terminate, then kill) and the launcher exits 4. The
+   up to STOP_GRACE_S, or 3 x the longest checkpoint save the trainer has reported
+   if that is longer, then terminate, then kill) and the launcher exits 4. The
    budget is the box ledger's: what remains is --budget-usd minus everything the box
    has cost so far (setup, shards, the A/B runs, earlier invocations), so a restart
    with a larger --budget-usd resumes where it stopped.
@@ -120,6 +121,15 @@ LAUNCHER_KEYS = {
 }
 
 STEP_LINE = re.compile(r"^step (\d+)/(\d+)\s+loss\s+(\S+)")
+# quipu.train's Trainer.save_checkpoint prints this after every checkpoint.
+SAVE_LINE = re.compile(r"^checkpoint step (\d+) saved in ([\d.]+) s")
+SAVE_GRACE_FACTOR = 3.0     # a stop waits at least this many x the longest save seen
+
+
+def parse_save_s(line: str) -> float | None:
+    """The save time from a trainer `checkpoint step N saved in X.X s` line, else None."""
+    m = SAVE_LINE.match(line.strip())
+    return float(m.group(2)) if m else None
 
 
 def _now_iso() -> str:
@@ -333,6 +343,7 @@ class ChildOutcome:
     stop_reason: str | None                 # set when the launcher interrupted it
     events: list[tuple[float, int]]         # (arrival time, step) of each step line
     started_at: float
+    save_s: list[float] = dataclasses.field(default_factory=list)   # checkpoint save times
 
 
 # should_stop gets the attempt's step events so far and returns a reason to stop, or None.
@@ -360,6 +371,19 @@ class SubprocessChild:
         self.poll_s = poll_s
         self.inductor_cache = inductor_cache
         self.clock = clock
+        self.max_save_s = 0.0          # longest checkpoint save seen, over every attempt
+
+    @property
+    def effective_grace_s(self) -> float:
+        """grace_s, raised to SAVE_GRACE_FACTOR x the longest checkpoint save seen."""
+        return max(self.grace_s, SAVE_GRACE_FACTOR * self.max_save_s)
+
+    def _saw_save(self, save_s: float) -> None:
+        before = self.effective_grace_s
+        self.max_save_s = max(self.max_save_s, save_s)
+        if self.effective_grace_s > before:
+            self.echo(f"[moe] checkpoint save took {save_s:.1f} s: stop grace now "
+                      f"{self.effective_grace_s:.0f} s")
 
     @staticmethod
     def _interrupt(proc: subprocess.Popen) -> bool:
@@ -380,12 +404,13 @@ class SubprocessChild:
             return False
 
     def _stop_child(self, proc: Any, child_got_it: bool) -> None:
+        grace = self.effective_grace_s
         if child_got_it:
-            if self._wait(proc, self.grace_s):
+            if self._wait(proc, grace):
                 return
             if self._interrupt(proc) and self._wait(proc, self.kill_wait_s):
                 return
-        elif self._interrupt(proc) and self._wait(proc, self.grace_s):
+        elif self._interrupt(proc) and self._wait(proc, grace):
             return
         proc.terminate()
         if self._wait(proc, self.kill_wait_s):
@@ -401,6 +426,7 @@ class SubprocessChild:
             self.inductor_cache.mkdir(parents=True, exist_ok=True)
             env["TORCHINDUCTOR_CACHE_DIR"] = str(self.inductor_cache)
         events: list[tuple[float, int]] = []
+        saves: list[float] = []
         stop: list[str] = []
         done = threading.Event()
         started = self.clock()
@@ -421,7 +447,7 @@ class SubprocessChild:
                 if reason:
                     stop.append(reason)
                     self.echo(f"[moe] {reason}: interrupting the trainer (checkpoint, up "
-                              f"to {self.grace_s:.0f} s)")
+                              f"to {self.effective_grace_s:.0f} s)")
                     self._stop_child(proc, child_got_it=False)
                     return
 
@@ -435,6 +461,10 @@ class SubprocessChild:
                     m = STEP_LINE.match(line.strip())
                     if m:
                         events.append((self.clock(), int(m.group(1))))
+                    save_s = parse_save_s(line)
+                    if save_s is not None:
+                        saves.append(save_s)
+                        self._saw_save(save_s)
             code = proc.wait()
         except KeyboardInterrupt:
             done.set()
@@ -450,7 +480,7 @@ class SubprocessChild:
             if watcher.is_alive():
                 watcher.join()
         return ChildOutcome(code=code, stop_reason=stop[0] if stop else None,
-                            events=events, started_at=started)
+                            events=events, started_at=started, save_s=saves)
 
 
 def run_command(cmd: list[str], log_path: Path) -> int:
@@ -570,7 +600,8 @@ class Launcher:
     def _record_attempt(self, phase: str, outcome: ChildOutcome, note: str = "") -> None:
         self.attempts.append({
             "phase": phase, "code": outcome.code, "stop": outcome.stop_reason,
-            "last_step": self._last_logged_step(), "note": note, "at": _now_iso()})
+            "last_step": self._last_logged_step(), "note": note, "at": _now_iso(),
+            "max_save_s": max(outcome.save_s) if outcome.save_s else None})
 
     @property
     def batch_tokens(self) -> int:
@@ -1002,7 +1033,10 @@ class Launcher:
                             f"{evals[-1]['step']}" if evals else "") + ".")
         lines += ["", "## Attempts", ""]
         lines += [f"- {a['phase']}: exit {a['code']}" + (f", stopped ({a['stop']})" if a["stop"] else "")
-                  + f", run log at step {a['last_step']} ({a['at']})" for a in self.attempts] or ["(none)"]
+                  + f", run log at step {a['last_step']}"
+                  + (f", longest checkpoint save {a['max_save_s']:.1f} s"
+                     if a.get("max_save_s") is not None else "")
+                  + f" ({a['at']})" for a in self.attempts] or ["(none)"]
         lines += ["", "## Evaluation", ""]
         lines += [f"- {e['name']}: exit {e['code']}" for e in self.evals] or [
             "(not run: evaluation follows a completed run)"]

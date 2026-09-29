@@ -306,3 +306,126 @@ def test_sigterm_checkpoints_and_exits_130_like_an_interrupt(in_tmp, monkeypatch
     assert record["status"] == "interrupted"
     assert (in_tmp / "ckpt" / "step_000003.pt").exists()
     assert signal.getsignal(sig) == before          # run_main restores the handler
+
+
+def test_every_checkpoint_prints_its_save_time(in_tmp, capsys):
+    # The A/B runner and the box launcher size their stop grace from this line.
+    import re
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_OK
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("checkpoint step")]
+    assert [int(l.split()[2]) for l in lines] == [5, 10, 15, 20]
+    assert all(re.fullmatch(r"checkpoint step \d+ saved in \d+\.\d s \(\d+\.\d GB\)", l)
+               for l in lines)
+
+
+def test_a_second_sigint_during_the_interrupt_checkpoint_is_ignored(in_tmp, monkeypatch, capsys):
+    # Ctrl+C at step 3, then Ctrl+C again while the (slow) interrupt checkpoint is
+    # being written: the save must complete, the run log says interrupted, exit 130.
+    import signal
+    import time as time_mod
+
+    before = signal.getsignal(signal.SIGINT)
+    real_step, real_save = Trainer.train_step, train_mod._atomic_save
+    state = {"interrupted": False, "repeats": 0}
+
+    def step_then_sigint(self):
+        loss = real_step(self)
+        if self.step == 3:
+            state["interrupted"] = True
+            signal.raise_signal(signal.SIGINT)
+        return loss
+
+    def slow_save(obj, path):
+        if state["interrupted"] and path.name.startswith("step_"):
+            time_mod.sleep(0.2)
+            for _ in range(2):          # two more Ctrl+C mid-save
+                state["repeats"] += 1
+                signal.raise_signal(signal.SIGINT)
+        real_save(obj, path)
+
+    monkeypatch.setattr(Trainer, "train_step", step_then_sigint)
+    monkeypatch.setattr(train_mod, "_atomic_save", slow_save)
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_INTERRUPTED
+    assert state["repeats"] == 2
+    ckpt = in_tmp / "ckpt"
+    assert (ckpt / "step_000003.pt").exists() and (ckpt / "latest.pt").exists()
+    assert json.loads(run_log(in_tmp).read_text(encoding="utf-8"))["status"] == "interrupted"
+    out = capsys.readouterr()
+    assert "checkpoint step 3 saved in" in out.out
+    assert out.err.count("again; still saving the interrupt checkpoint") == 2
+    assert signal.getsignal(signal.SIGINT) is before       # restored
+
+
+def test_an_ignored_sigint_is_left_alone(in_tmp, monkeypatch):
+    # A process started with SIGINT ignored (nohup-style) keeps ignoring it.
+    import signal
+
+    before = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        seen = []
+
+        def step(self):
+            seen.append(signal.getsignal(signal.SIGINT))
+            raise KeyboardInterrupt
+        monkeypatch.setattr(Trainer, "train_step", step)
+        assert run_main(args(tiny_config(in_tmp))) == EXIT_INTERRUPTED
+        assert seen == [signal.SIG_IGN]
+        assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGINT, before)
+
+
+SLOW_SAVE_CHILD = r'''
+import os, signal, sys, time
+from pathlib import Path
+import quipu.train as t
+flag = Path(sys.argv[1])
+real_save = t._atomic_save
+def slow_save(obj, path):
+    if path.name.startswith("step_") and t._INTERRUPTED_FOR_TEST:
+        flag.write_text("saving")
+        time.sleep(3.0)
+    real_save(obj, path)
+t._atomic_save = slow_save
+t._INTERRUPTED_FOR_TEST = False
+real_step = t.Trainer.train_step
+def step(self):
+    loss = real_step(self)
+    if self.step == 3:
+        t._INTERRUPTED_FOR_TEST = True
+        os.kill(os.getpid(), signal.SIGINT)
+    return loss
+t.Trainer.train_step = step
+sys.exit(t.run_main(sys.argv[2:]))
+'''
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: a real SIGINT from outside the process")
+def test_the_real_process_survives_a_second_sigint_during_its_checkpoint(tmp_path):
+    import signal
+    import time as time_mod
+
+    config = tiny_config(tmp_path)
+    script = tmp_path / "slow_child.py"
+    script.write_text(SLOW_SAVE_CHILD, encoding="utf-8")
+    flag = tmp_path / "saving.flag"
+    pythonpath = os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")]))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONUTF8="1", PYTHONPATH=pythonpath)
+    proc = subprocess.Popen([sys.executable, str(script), str(flag), *args(config)],
+                            cwd=tmp_path, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time_mod.monotonic() + 240
+        while not flag.exists() and proc.poll() is None and time_mod.monotonic() < deadline:
+            time_mod.sleep(0.05)
+        assert flag.exists(), "the interrupt checkpoint never started"
+        proc.send_signal(signal.SIGINT)          # a second Ctrl+C mid-save
+        out, err = proc.communicate(timeout=120)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == EXIT_INTERRUPTED, err
+    assert "again; still saving the interrupt checkpoint" in err
+    assert "checkpoint step 3 saved in" in out
+    assert (tmp_path / "ckpt" / "step_000003.pt").exists()
