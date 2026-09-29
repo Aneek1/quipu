@@ -8,6 +8,78 @@ ever clones public repos over plain https and never gets any GitHub credential.
 Building the quipu-moe shards needs no GPU: see
 [build_shards_box.md](build_shards_box.md) (a cheap CPU-only box, `setup.sh --cpu-only`).
 
+## The quipu-moe session
+
+The order of a quipu-moe GPU session (the plan's "Session runbook"). The budget
+(`--budget-usd 20`) is the box ledger's, `quipu/spend.py` (`results/spend.json` on the
+box): everything the GPU box costs from the moment it starts, setup included. R is
+the box's $/hour from the Vast instance card.
+
+0. **Shards** on a cheap CPU-only box: [build_shards_box.md](build_shards_box.md),
+   steps 1-5. They are copied to the GPU box in step 3; destroy the CPU box after that.
+1. **Rent the GPU box** (section 1 below: RTX 5090, CUDA >= 12.8, ~100 GB disk) and,
+   **before anything else**, start the spend ledger so the setup counts:
+
+   ```bash
+   ssh -p PORT root@HOST
+   git clone --branch pipeline-114m https://github.com/Aneek1/quipu.git /workspace/quipu
+   cd /workspace/quipu && python3 -m quipu.spend start --usd-per-hour R
+   ```
+
+   (`quipu.spend` is standard library only, so the system python3 runs it before
+   the venv exists; add `--box-start EPOCH` to count from when the box was rented.)
+2. **Setup**: `bash /workspace/quipu/scripts/remote/setup.sh --branch pipeline-114m`
+   (section 2).
+3. **Tokenizer and shards**: copy the tokenizer from the laptop and check its hash
+   (as in build_shards_box.md step 2), copy the shards from the CPU box and verify
+   them (build_shards_box.md step 6: `sha256sum -c SHA256SUMS`, shard sizes against
+   the manifest).
+4. **A/B runs** (~3.5-4 h; FP8 stays off, the owner's decision, so no `--with-fp8`),
+   inside `tmux`:
+
+   ```bash
+   uv run python scripts/ab_runs.py --config configs/quipu-moe-ab.toml --out results/ab \
+       --budget-usd 20 --usd-per-hour R
+   ```
+
+   It writes `results/ab/summary.md` and `results/ab/winners.toml`.
+5. **The full run**, inside `tmux`:
+
+   ```bash
+   uv run python scripts/remote/run_moe.py --config configs/quipu-moe.toml \
+       --winners results/ab/winners.toml --budget-usd 20 --usd-per-hour R
+   ```
+
+   A 15-minute throughput gate (`--gate-minutes`) measures tokens/s on the real
+   model, then `results/moe/plan.md` shows the tokens, hours and cost that fit the
+   budget (spend so far + the run + a `--reserve-usd` 0.50 reserve for the chat SFT
+   and final eval/export), and what was trimmed. Show it to the owner; on approval
+   `touch results/moe/GO`. Waiting costs the box's rate (the launcher prints the
+   per-minute cost while it waits). The long run then resumes from the gate's
+   checkpoint (the gate's 15 minutes of training are kept), retries crashes from the
+   last checkpoint, and stops cleanly (interrupt checkpoint, exit 4) if spend + the
+   next eval interval + the reserve would pass the budget. At the end it runs
+   milestone_eval and writes `results/moe/summary.md`. Run it again after any stop:
+   it reuses `results/moe/plan.json` and resumes (a larger `--budget-usd` continues a
+   run the budget stopped).
+6. **On the laptop, during the long run** (Git Bash, from the repo):
+
+   ```bash
+   bash scripts/remote/sync.sh HOST PORT 3        # --dry-run prints the commands
+   ```
+
+   Every 3 hours it copies `checkpoints/quipu-moe/latest.pt` and the checkpoint it
+   points to, `checkpoints/quipu-moe/milestones/` and `results/` (no inductor caches)
+   into `remote-runs/quipu-moe/`, and stops after the cycle that sees
+   `results/moe/summary.md` on the box. It uses `~/.ssh/id_ed25519` (`SSH_KEY`), never
+   agent forwarding, and never deletes a local file: old `step_*.pt` copies (~12 GB
+   each) stay until you remove them. rsync when installed, else scp (Git Bash).
+7. **After pretraining**: its evaluation, then the chat SFT (M12) in the same session
+   (paid from the reserve), then its evaluation.
+8. **Copy everything back** (sync.sh's final cycle, plus the SFT outputs), verify on
+   the laptop (the checkpoints load; sha256 against the box), get the owner's
+   go-ahead, then destroy the box (section 5).
+
 ## 1. Rent a box (Vast.ai)
 
 1. In the Vast console, **Account → Keys**, add your SSH **public** key
@@ -104,6 +176,7 @@ rsync -avz -e "ssh -p PORT" \
 mine again elsewhere.) Checkpoints and results the same way, for example
 `rsync -avz -e "ssh -p PORT" root@HOST:/workspace/quipu/checkpoints/ checkpoints/`.
 Without rsync on Windows, `scp -P PORT -r root@HOST:/path local/` does the same.
+For the quipu-moe run, `sync.sh` does this on a schedule (see "The quipu-moe session").
 
 ## 5. Stop the instance when done
 
