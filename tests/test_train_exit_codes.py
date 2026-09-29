@@ -278,3 +278,31 @@ def test_the_real_process_exits_3_on_the_non_finite_stop(tmp_path):
     )
     assert proc.returncode == EXIT_NONFINITE, proc.stderr
     assert "non-finite" in proc.stderr
+
+
+STOP_SIGNALS = [s for s in ("SIGTERM", "SIGBREAK") if hasattr(__import__("signal"), s)]
+
+
+@pytest.mark.parametrize("name", STOP_SIGNALS)
+def test_sigterm_checkpoints_and_exits_130_like_an_interrupt(in_tmp, monkeypatch, name):
+    # The A/B orchestrator and the box launcher stop a run with SIGINT and then, if it
+    # is still alive, SIGTERM (Windows: CTRL_BREAK -> SIGBREAK). Either must take the
+    # interrupt path: checkpoint at the current step, log "interrupted", exit 130.
+    import signal
+
+    sig = getattr(signal, name)
+    before = signal.getsignal(sig)
+    real_step = Trainer.train_step
+
+    def step_then_signal(self):
+        loss = real_step(self)
+        if self.step == 3:
+            signal.raise_signal(sig)
+        return loss
+
+    monkeypatch.setattr(Trainer, "train_step", step_then_signal)
+    assert run_main(args(tiny_config(in_tmp))) == EXIT_INTERRUPTED
+    record = json.loads(run_log(in_tmp).read_text(encoding="utf-8"))
+    assert record["status"] == "interrupted"
+    assert (in_tmp / "ckpt" / "step_000003.pt").exists()
+    assert signal.getsignal(sig) == before          # run_main restores the handler

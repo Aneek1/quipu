@@ -12,7 +12,8 @@ post-run evaluation to see how the model changed over the run.
 
 Exit codes of `python -m quipu.train` (the weekend launcher decides whether to retry
 from these; see run_main): 0 completed, 1 any other crash, 2 a usage/config error,
-3 the non-finite stop, 130 an interrupt.
+3 the non-finite stop, 130 an interrupt. SIGTERM (and SIGBREAK on Windows) is
+handled like Ctrl+C: the interrupt checkpoint is written, then it exits 130.
 
 Models and optimizers (quipu-moe, M6): the model comes from build_model (dense
 Quipu or QuipuMoE) and the optimizers from build_optimizers (one AdamW, or Muon +
@@ -55,7 +56,9 @@ import json
 import math
 import re
 import shutil
+import signal
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -831,10 +834,54 @@ def main(argv: list[str] | None = None) -> None:
     trainer.run()
 
 
+STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGBREAK") if hasattr(signal, n))
+
+
+def _install_stop_handlers() -> dict[int, Any]:
+    """SIGTERM (and SIGBREAK, what CTRL_BREAK_EVENT delivers on Windows) take the
+    same path as Ctrl+C: KeyboardInterrupt, so the loop saves its interrupt
+    checkpoint and the process exits 130. Only the first such signal raises; a
+    repeat while that checkpoint is being written is ignored, so it cannot abort
+    the save (a supervisor that wants the process gone kills it). Returns the
+    previous handlers for run_main to restore. Main thread only (signal.signal)."""
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    fired = False
+
+    def stop(signum: int, frame: Any) -> None:
+        nonlocal fired
+        if fired:
+            print(f"signal {signum} again; still saving the interrupt checkpoint",
+                  file=sys.stderr, flush=True)
+            return
+        fired = True
+        print(f"signal {signum}: stopping like an interrupt (checkpoint, exit 130)",
+              file=sys.stderr, flush=True)
+        raise KeyboardInterrupt
+
+    previous = {}
+    for sig in STOP_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, stop)
+        except (OSError, ValueError):       # not settable here
+            pass
+    return previous
+
+
 def run_main(argv: list[str] | None = None) -> int:
     """main() with every outcome mapped to the exit code the launcher relies on:
     0 completed, 1 any other crash, 2 usage/config error, 3 non-finite stop,
-    130 interrupt. Codes 2, 3 and 130 are not worth retrying; 1 may be."""
+    130 interrupt (Ctrl+C, SIGINT, SIGTERM or SIGBREAK: all checkpoint first).
+    Codes 2, 3 and 130 are not worth retrying; 1 may be."""
+    previous = _install_stop_handlers()
+    try:
+        return _run_main(argv)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _run_main(argv: list[str] | None) -> int:
     try:
         main(argv)
     except NonFiniteStop as exc:

@@ -19,6 +19,7 @@ import pytest
 
 from quipu.config import load_config, parse_overrides
 from quipu.data import write_shard
+from quipu.spend import ENV_VAR as LEDGER_ENV, Ledger
 
 ROOT = Path(__file__).resolve().parents[1]
 AB = ROOT / "configs" / "quipu-moe-ab.toml"
@@ -90,10 +91,20 @@ def val_by_settings(spec):
     return res(v, tps=tps)
 
 
-def orch(tmp_path, runner, clock=None, **kw):
+@pytest.fixture(autouse=True)
+def box_ledger(tmp_path, monkeypatch):
+    """Every test's box ledger is in tmp_path, never the repo's results/spend.json."""
+    path = tmp_path / "box" / "spend.json"
+    monkeypatch.setenv(LEDGER_ENV, str(path))
+    return path
+
+
+def orch(tmp_path, runner, clock=None, out="ab", **kw):
+    clock = clock or FakeClock()
     kw.setdefault("budget_usd", 100.0)
     kw.setdefault("usd_per_hour", 0.55)
-    return ab.Orchestrator(AB, tmp_path / "ab", runner, clock=clock or FakeClock(), **kw)
+    kw.setdefault("ledger", Ledger.load(tmp_path / "box" / "spend.json", clock=clock))
+    return ab.Orchestrator(AB, tmp_path / out, runner, clock=clock, **kw)
 
 
 # ---- train.py --override ------------------------------------------------------------
@@ -351,9 +362,265 @@ def test_spend_ledger_carries_over_between_invocations(tmp_path):
     clock = FakeClock()
     o = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, budget_usd=0.40)
     o.run()
-    clock2 = FakeClock()
-    o2 = orch(tmp_path, FakeRunner(clock2, val_by_settings), clock2, budget_usd=0.40)
-    assert o2.guard.spent() == pytest.approx(2000 / 3600 * 0.55)
+    clock.t += 300                                   # the box stays up between invocations
+    o2 = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, budget_usd=0.40)
+    assert o2.guard.spent() == pytest.approx(2300 / 3600 * 0.55)
+    assert o2.run() == ab.EXIT_BUDGET                # nothing more fits
+    assert o2.runner.calls == []
+
+
+def test_separate_out_dirs_share_one_box_ledger(tmp_path):
+    clock = FakeClock()
+    orch(tmp_path, FakeRunner(clock, val_by_settings), clock, out="ab1",
+         skip_sweeps=True, pairs=("attnres",), seed_reruns=False).run()
+    spent = 2 * 2000 / 3600 * 0.55                   # two 200M-token arms
+    o2 = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, out="ab2")
+    assert o2.guard.spent() == pytest.approx(spent)
+    assert not (tmp_path / "ab1" / "spend.json").exists()
+    assert (tmp_path / "box" / "spend.json").exists()
+
+
+def test_spent_usd_is_one_adjustment_however_often_it_is_passed(tmp_path):
+    clock = FakeClock()
+    for _ in range(2):
+        orch(tmp_path, FakeRunner(clock, val_by_settings), clock, spent_usd=1.0,
+             skip_sweeps=True, pairs=("attnres",), seed_reruns=False).run()
+    led = Ledger.load(tmp_path / "box" / "spend.json", clock=clock)
+    assert led.adjustments == {ab.SPENT_KEY: 1.0}
+    assert led.spent_usd() == pytest.approx(1.0 + 2 * 2000 / 3600 * 0.55)
+
+
+def test_a_corrupt_ledger_stops_the_orchestrator(tmp_path, box_ledger, capsys):
+    box_ledger.parent.mkdir(parents=True)
+    box_ledger.write_text("{not json", encoding="utf-8")
+    code = ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"),
+                    "--budget-usd", "3", "--usd-per-hour", "0.55"])
+    assert code == ab.EXIT_USAGE
+    assert "spend ledger" in capsys.readouterr().err
+
+
+def test_usd_per_hour_is_required_to_train_but_not_for_a_dry_run(tmp_path, capsys):
+    assert ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"),
+                    "--budget-usd", "3"]) == ab.EXIT_USAGE
+    assert "--usd-per-hour" in capsys.readouterr().err
+    assert ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"), "--dry-run"]) == 0
+
+
+@pytest.mark.parametrize("key", sorted(ab.RESERVED_OVERRIDES))
+def test_orchestrator_owned_overrides_are_refused(tmp_path, key, capsys):
+    with pytest.raises(ValueError, match="orchestrator"):
+        orch(tmp_path, FakeRunner(FakeClock(), val_by_settings),
+             extra_overrides={key: "1"})
+    assert ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"), "--dry-run",
+                    "--override", f"{key}=1"]) == ab.EXIT_USAGE
+    assert key in capsys.readouterr().err
+
+
+# ---- throughput measurement -----------------------------------------------------------------
+
+def test_a_resumed_attempt_does_not_count_as_measured_throughput(tmp_path):
+    clock = FakeClock()
+
+    def outcome(spec):
+        r = val_by_settings(spec)
+        r.resumed = spec.name == "p1-base"
+        return r
+
+    o = orch(tmp_path, FakeRunner(clock, outcome), clock, skip_sweeps=True,
+             pairs=("attnres",), seed_reruns=False)
+    o.run()
+    assert len(o.guard.measured) == 1                # p2-attnres only
+    by_name = {json.loads(p.read_text())["name"]: json.loads(p.read_text())["result"]
+               for p in (tmp_path / "ab" / "cache").glob("*.json")}
+    assert by_name["p1-base"]["effective_tokens_per_s"] is None
+
+
+def test_a_restarted_orchestrator_starts_from_the_measured_throughput(tmp_path):
+    clock = FakeClock()
+    runner = FakeRunner(clock, val_by_settings, tps=50_000.0)   # 4000 s per 200M arm
+
+    def outcome(spec):
+        r = val_by_settings(spec)
+        if spec.name == "p2-attnres":
+            return [res(None, status="crashed"), dataclasses_replace(r, resumed=True)]
+        return r
+
+    runner.outcome = outcome
+    orch(tmp_path, runner, clock, skip_sweeps=True, pairs=("attnres",),
+         seed_reruns=False).run()
+    again = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, skip_sweeps=True,
+                 pairs=("attnres",), seed_reruns=False)
+    # Only p1-base (first attempt, not resumed) seeds the estimate: 50k tok/s.
+    assert again.guard.measured == [pytest.approx(50_000.0)]
+    assert again.guard.estimate_s(200_000_000) == pytest.approx(4000.0)
+
+
+def dataclasses_replace(r, **kw):
+    import dataclasses
+    return dataclasses.replace(r, **kw)
+
+
+# ---- in-run budget stop -----------------------------------------------------------------------
+
+def test_a_run_stopped_by_the_budget_keeps_its_checkpoint_and_exits_4(tmp_path):
+    clock = FakeClock()
+
+    class StopsSecond(FakeRunner):
+        def __call__(self, spec, ctx):
+            out = super().__call__(spec, ctx)
+            if spec.name == "p2-attnres":
+                ctx.ckpt_dir.mkdir(parents=True, exist_ok=True)
+                (ctx.ckpt_dir / "latest.pt").write_text("x")
+                return res(None, status="stopped_budget")
+            return out
+
+    runner = StopsSecond(clock, val_by_settings)
+    o = orch(tmp_path, runner, clock, skip_sweeps=True, pairs=("attnres", "activation"))
+    assert o.run() == ab.EXIT_BUDGET
+    assert runner.calls == ["p1-base", "p2-attnres"]        # nothing after it starts
+    assert list((tmp_path / "ab" / "ckpt").glob("*/latest.pt"))   # kept for the resume
+    cached = {json.loads(p.read_text())["name"] for p in (tmp_path / "ab" / "cache").glob("*.json")}
+    assert "p2-attnres" not in cached                         # re-run (resumed) next time
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    assert "stopped_budget" in summary
+
+
+def test_the_run_deadline_follows_the_box_ledger(tmp_path):
+    clock = FakeClock()
+    o = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, budget_usd=1.0,
+             usd_per_hour=0.36)                  # $1 = 10,000 s of box time
+    o.begin()
+    spec = one_spec(o)
+    ctx = o.context_for(spec, None)
+    assert ctx.budget_check() is False
+    # The deadline keeps STOP_GRACE_S of budget for the interrupt checkpoint.
+    clock.t = 10_000 - ab.STOP_GRACE_S - 1
+    assert ctx.budget_check() is False
+    clock.t = 10_000 - ab.STOP_GRACE_S + 0.5
+    assert ctx.budget_check() is True
+
+
+# ---- runs that must not be retried, and what the summary reports -----------------------------
+
+def test_an_out_of_memory_run_is_not_retried(tmp_path):
+    clock = FakeClock()
+
+    def outcome(spec):
+        if spec.name == "p2-attnres":
+            return res(None, status="failed_oom")
+        return val_by_settings(spec)
+
+    runner = FakeRunner(clock, outcome)
+    orch(tmp_path, runner, clock, skip_sweeps=True, pairs=("attnres",),
+         seed_reruns=False).run()
+    assert runner.calls.count("p2-attnres") == 1
+    by_name = {json.loads(p.read_text())["name"]: json.loads(p.read_text())["result"]
+               for p in (tmp_path / "ab" / "cache").glob("*.json")}
+    assert by_name["p2-attnres"]["status"] == "failed_oom"
+
+
+def test_eval_every_is_clamped_to_about_twenty_evals():
+    assert ab.aligned_eval_every(1000, 10) == 50          # 20 evals, not 100
+    assert 1000 // ab.aligned_eval_every(1000, 10) <= ab.MAX_EVALS
+    assert ab.aligned_eval_every(381, 50) == 127          # unchanged when already few
+    assert ab.aligned_eval_every(7, 1) == 1               # tiny runs: every step is fine
+    for steps in (190, 381, 953, 1000, 4096):
+        d = ab.aligned_eval_every(steps, 5)
+        assert steps % d == 0 and steps // d <= ab.MAX_EVALS
+
+
+def test_every_run_checkpoints_at_half_way(tmp_path):
+    o = orch(tmp_path, FakeRunner(FakeClock(), val_by_settings))
+    spec = one_spec(o)                                    # 200M tokens = 381 steps
+    flags = dict(f.split("=", 1) for f in o.context_for(spec, None).overrides)
+    assert flags["train.ckpt_every"] == "191"
+    assert 381 // int(flags["train.eval_every"]) <= ab.MAX_EVALS
+
+
+def test_keep_checkpoints_is_refused_when_they_would_not_fit_on_disk(tmp_path, monkeypatch, capsys):
+    import collections
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(ab.shutil, "disk_usage", lambda p: usage(10**12, 0, 20 * 10**9))
+    code = ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"), "--keep-checkpoints",
+                    "--budget-usd", "3", "--usd-per-hour", "0.55"])
+    assert code == ab.EXIT_USAGE
+    assert "disk" in capsys.readouterr().err
+    # Plenty of disk: the check passes (the dry run reports it and trains nothing).
+    monkeypatch.setattr(ab.shutil, "disk_usage", lambda p: usage(10**13, 0, 10**13))
+    assert ab.main(["--config", str(AB), "--out", str(tmp_path / "ab"), "--keep-checkpoints",
+                    "--dry-run"]) == 0
+
+
+def test_summary_reports_skipped_steps_overhead_and_useless_seed_reruns(tmp_path):
+    clock = FakeClock()
+
+    def outcome(spec):
+        r = val_by_settings(spec)
+        r.skipped = 3 if spec.name == "p3-situ_glu" else 0
+        r.startup_s = 40.0
+        r.overhead_s = 200.0
+        return r
+
+    o = orch(tmp_path, FakeRunner(clock, outcome), clock, skip_sweeps=True,
+             pairs=("activation",))
+    o.run()
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    header = next(ln for ln in summary.splitlines() if ln.startswith("| # |"))
+    assert "skipped" in header and "overhead s" in header
+    row = next(ln for ln in summary.splitlines() if "| p3-situ_glu |" in ln)
+    cells = [c.strip() for c in row.strip("|").split("|")]
+    assert cells[header.strip("|").split("|").index(" skipped ")] == "3"
+    assert "median 200 s" in summary and "prior 180 s" in summary
+    # SiTU-GLU lost on loss (prelim simple): the seed re-run cannot change pair 3.
+    assert "cannot change" in summary
+
+
+# ---- subprocess runner: signals, budget, OOM, env ----------------------------------------------
+
+class FakeProc:
+    """Popen stand-in for _stop_child: `alive_for` wait calls time out first."""
+
+    def __init__(self, alive_for):
+        self.alive_for = alive_for
+        self.calls = []
+
+    def wait(self, timeout=None):
+        self.calls.append(("wait", timeout))
+        if self.alive_for:
+            self.alive_for -= 1
+            raise ab.subprocess.TimeoutExpired("x", timeout)
+        return 130
+
+    def poll(self):
+        return None if self.alive_for else 130
+
+    def terminate(self):
+        self.calls.append(("terminate",))
+
+    def kill(self):
+        self.calls.append(("kill",))
+
+
+def test_ctrl_c_waits_for_the_child_then_interrupts_then_terminates_then_kills(monkeypatch):
+    runner = ab.SubprocessRunner(device="cpu", grace_s=300, kill_wait_s=30)
+    sent = []
+    monkeypatch.setattr(runner, "_interrupt", lambda proc: sent.append("int") or True)
+    # The child got Ctrl+C too and finishes its checkpoint in time: nothing else sent.
+    proc = FakeProc(alive_for=0)
+    runner._stop_child(proc, child_got_it=True)
+    assert proc.calls == [("wait", 300)] and sent == []
+    # A child that never exits: wait 300 s, SIGINT, terminate, kill, in that order.
+    proc = FakeProc(alive_for=3)
+    runner._stop_child(proc, child_got_it=True)
+    assert proc.calls == [("wait", 300), ("wait", 30), ("terminate",), ("wait", 30),
+                          ("kill",), ("wait", None)]
+    assert sent == ["int"]
+    # A child that did not get it (its own process group): interrupt first, then wait.
+    sent.clear()
+    proc = FakeProc(alive_for=0)
+    runner._stop_child(proc, child_got_it=False)
+    assert sent == ["int"] and proc.calls == [("wait", 300)]
+
 
 
 def test_crashed_run_is_retried_once_then_marked_failed(tmp_path):
@@ -397,15 +664,28 @@ a = p.parse_args()
 behave = json.loads(Path(os.environ["FAKE_TRAIN_SPEC"]).read_text())
 with open(os.environ["FAKE_TRAIN_CALLS"], "a") as f:
     f.write(a.run_id + (" resume" if a.resume else "") + "\n")
+if behave.get("env_out"):
+    Path(behave["env_out"]).write_text(json.dumps(dict(os.environ)))
+import signal
+def on_stop(signum, frame):
+    Path(behave["marker"]).write_text("interrupt checkpoint")
+    sys.exit(130)
+for name in ("SIGINT", "SIGBREAK"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name),
+                      signal.SIG_IGN if behave.get("ignore_signals") else on_stop)
 losses = behave["losses"]
 log = {"steps": [], "evals": [], "status": "running"}
 path = Path(a.run_dir) / (a.run_id + ".json")
 path.parent.mkdir(parents=True, exist_ok=True)
 for i, loss in enumerate(losses, 1):
-    log["steps"].append({"step": i, "train_loss": loss})
+    log["steps"].append({"step": i, "train_loss": loss, "skipped": behave.get("skipped", 0)})
     path.write_text(json.dumps(log))
     print(f"step {i}/{len(losses)}  loss {loss:.4f}  lr 1.00e-03  grad 1.000  1,000 tok/s", flush=True)
     time.sleep(behave.get("sleep", 0.0))
+if behave.get("oom"):
+    print("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB", flush=True)
+    sys.exit(1)
 log["evals"].append({"step": len(losses), "val_loss": behave.get("val", 3.0)})
 log["status"] = "completed"
 path.write_text(json.dumps(log))
@@ -413,14 +693,14 @@ sys.exit(behave.get("exit", 0))
 '''
 
 
-def fake_subprocess_runner(tmp_path, monkeypatch, behave):
+def fake_subprocess_runner(tmp_path, monkeypatch, behave, **runner_kw):
     script = tmp_path / "fake_train.py"
     script.write_text(FAKE_TRAIN, encoding="utf-8")
     spec_path = tmp_path / "behave.json"
     spec_path.write_text(json.dumps(behave), encoding="utf-8")
     monkeypatch.setenv("FAKE_TRAIN_SPEC", str(spec_path))
     monkeypatch.setenv("FAKE_TRAIN_CALLS", str(tmp_path / "calls.txt"))
-    return ab.SubprocessRunner(cmd=[sys.executable, str(script)], device="cpu")
+    return ab.SubprocessRunner(cmd=[sys.executable, str(script)], device="cpu", **runner_kw)
 
 
 def one_spec(o, name="p2-attnres", tokens=None):
@@ -499,3 +779,71 @@ def test_smoke_end_to_end_two_arms_on_cpu(tmp_path, capsys):
     # way the simpler option is kept.
     assert winners["model"]["attnres_blocks"] == 0
     assert not list((out / "ckpt").glob("*/latest.pt"))           # checkpoints cleaned
+
+
+def test_divergence_is_checked_at_every_printed_step_after_a_quarter(tmp_path, monkeypatch):
+    # Healthy at 25%, diverging from step 60: the old single check at 25% missed it.
+    behave = {"losses": [3.0] * 59 + [7.0] * 41, "sleep": 0.02}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave)
+    o = orch(tmp_path, runner, arm_tokens=100 * 524_288)
+    spec = one_spec(o)
+    r = runner(spec, o.context_for(spec, baseline_losses=[3.0] * 100))
+    assert r.status == "diverged" and "step 60/" in r.reason
+
+
+def test_the_runner_interrupts_the_child_at_the_budget(tmp_path, monkeypatch):
+    marker = tmp_path / "marker"
+    behave = {"losses": [3.0] * 400, "sleep": 0.05, "marker": str(marker)}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave, poll_s=0.05,
+                                    grace_s=20, kill_wait_s=5)
+    o = orch(tmp_path, runner, arm_tokens=400 * 524_288)
+    spec = one_spec(o)
+    ctx = o.context_for(spec, None)
+    polls = []
+    ctx.budget_check = lambda: polls.append(1) or len(polls) >= 5
+    r = runner(spec, ctx)
+    assert r.status == "stopped_budget" and "budget" in r.reason
+    assert marker.read_text() == "interrupt checkpoint"      # it took the SIGINT path
+
+
+def test_a_child_that_ignores_the_interrupt_is_terminated(tmp_path, monkeypatch):
+    behave = {"losses": [3.0] * 400, "sleep": 0.05, "ignore_signals": True,
+              "marker": str(tmp_path / "marker")}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave, poll_s=0.05,
+                                    grace_s=0.5, kill_wait_s=5)
+    o = orch(tmp_path, runner, arm_tokens=400 * 524_288)
+    spec = one_spec(o)
+    ctx = o.context_for(spec, None)
+    ctx.budget_check = lambda: True
+    r = runner(spec, ctx)
+    assert r.status == "stopped_budget"
+    assert r.wall_s < 15                                     # not the whole 20 s run
+
+
+def test_cuda_out_of_memory_is_failed_oom(tmp_path, monkeypatch):
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, {"losses": [3.0] * 3, "oom": True})
+    o = orch(tmp_path, runner, arm_tokens=3 * 524_288)
+    spec = one_spec(o)
+    r = runner(spec, o.context_for(spec, None))
+    assert r.status == "failed_oom" and "out of memory" in r.reason
+
+
+def test_child_env_resume_flag_skipped_steps_and_startup(tmp_path, monkeypatch):
+    env_out = tmp_path / "env.json"
+    behave = {"losses": [3.0] * 12, "val": 2.5, "skipped": 2, "env_out": str(env_out)}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave)
+    o = orch(tmp_path, runner, arm_tokens=12 * 524_288)
+    spec = one_spec(o)
+    ctx = o.context_for(spec, None)
+    r = runner(spec, ctx)
+    env = json.loads(env_out.read_text())
+    assert Path(env["TORCHINDUCTOR_CACHE_DIR"]) == tmp_path / "ab" / "inductor-cache"
+    assert env["TORCHINDUCTOR_FX_GRAPH_CACHE"] == "1"
+    assert env["TORCHINDUCTOR_AUTOGRAD_CACHE"] == "1"
+    assert r.skipped == 2 and r.resumed is False
+    assert r.startup_s is not None and 0 <= r.startup_s <= r.wall_s
+    assert r.overhead_s is not None
+    # A retry that finds the run's checkpoint resumes, and says so.
+    ctx.ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ctx.ckpt_dir / "latest.pt").write_text("x")
+    assert runner(spec, ctx).resumed is True

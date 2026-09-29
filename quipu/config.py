@@ -220,6 +220,17 @@ def _validate_int_fields(instance: Any, allow_zero: frozenset[str] = frozenset()
             raise ValueError(f"{f.name} must be positive, got {value!r}")
 
 
+def _validate_float_fields(instance: Any) -> None:
+    """Every float-annotated field must be a finite number: TOML (and --override)
+    accept inf and nan, and either would pass most range checks or poison training."""
+    for f in dataclasses.fields(instance):
+        if f.type not in (float, "float"):
+            continue
+        value = getattr(instance, f.name)
+        if not _is_number(value) or not math.isfinite(value):
+            raise ValueError(f"{f.name} must be a finite number, got {value!r}")
+
+
 def _check_fraction(name: str, value: Any, *, allow_one: bool) -> None:
     """A share strictly inside (0, 1), or (0, 1] when allow_one."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -417,6 +428,8 @@ def _override_value(key: str, annotation: str, text: str) -> Any:
     }.get(base)
     if not ok:
         raise ValueError(f"override {key}: {text!r} is not a valid {base} value")
+    if base == "float" and not math.isfinite(value):
+        raise ValueError(f"override {key}: {text!r} must be a finite number")
     return float(value) if base == "float" else value
 
 
@@ -491,6 +504,8 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     _validate_int_fields(model, allow_zero=frozenset(MOE_INT_FIELDS))
     _validate_int_fields(data)
     _validate_int_fields(train, allow_zero=frozenset({"seed"}))
+    for section in (model, data, train):
+        _validate_float_fields(section)
 
     _check_fraction("code_share", data.code_share, allow_one=False)
     _check_fraction("html_cap", data.html_cap, allow_one=True)

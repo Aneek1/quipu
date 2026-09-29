@@ -589,3 +589,21 @@ def test_vocab_size_must_match_an_existing_tokenizer(tmp_path):
 def test_gpt2_tokenizer_is_not_checked_against_vocab_size():
     # quipu-114m's own tests build tiny-vocab gpt2 configs; "gpt2" is not a file.
     assert load_config(CONFIG, overrides={"model": {"vocab_size": 1000}}).data.tokenizer == "gpt2"
+
+
+@pytest.mark.parametrize("text", ["inf", "-inf", "nan", "+inf"])
+def test_overrides_refuse_non_finite_floats(text):
+    from quipu.config import parse_overrides
+
+    with pytest.raises(ValueError, match="finite"):
+        parse_overrides([f"train.lr={text}"])
+
+
+@pytest.mark.parametrize("section, field", [
+    ("train", "grad_clip"), ("train", "weight_decay"), ("train", "beta2"),
+    ("model", "rope_base"), ("model", "norm_eps"), ("train", "muon_momentum"),
+])
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_load_config_refuses_non_finite_float_fields(section, field, value):
+    with pytest.raises(ValueError, match=field):
+        load_config(MOE_AB, overrides={section: {field: value}})
