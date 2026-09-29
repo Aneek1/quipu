@@ -12,3 +12,4 @@ stepbuild/harness/template/frontend/node_modules/
 stepbuild/harness/template/frontend/dist/
 node_modules/
 data/stepbuild/
+artifacts/
