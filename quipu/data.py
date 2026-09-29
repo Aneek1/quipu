@@ -35,6 +35,25 @@ def write_shard(path: str | Path, tokens: np.ndarray) -> None:
     replace_with_retry(tmp, path)
 
 
+def write_mask(path: str | Path, mask: np.ndarray) -> None:
+    """The chat fine-tune's loss mask beside a shard (shard_NNN.mask next to
+    shard_NNN.bin): one uint8 per token, 1 where the token is a training target.
+    Written atomically like write_shard."""
+    if mask.dtype != np.uint8:
+        raise ValueError(f"masks are uint8, got {mask.dtype}")
+    if mask.size and int(mask.max()) > 1:
+        raise ValueError("mask values must be 0 or 1")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        mask.tofile(tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    replace_with_retry(tmp, path)
+
+
 def shard_token_count(path: str | Path) -> int:
     """Validate a shard's byte count and return its token count.
 

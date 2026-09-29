@@ -146,10 +146,24 @@ $/hour from the Vast instance card.
    SPENT=$(python3 -m quipu.spend show --usd-only) || exit 1
    LEFT=$(python3 -c "import sys; left = round(20 - $SPENT - 0.10, 4); \
    print(left) if left > 0 else sys.exit('nothing left of the budget')") || exit 1
-   # then the SFT trainer with: --override train.budget_usd=$LEFT --override train.usd_per_hour=R
+   # the chat data (Aya + oasst2 + stepbuild train split; ~10-15 min of CPU, pinned
+   # revisions from the config; writes data/chat-sft/ and its manifest.json):
+   uv run python scripts/build_chat_data.py --config configs/quipu-moe-sft.toml
+   # the SFT, from the final pretraining checkpoint (fresh optimizer, step 0):
+   uv run python -m quipu.train --config configs/quipu-moe-sft.toml --run-id quipu-moe-sft \
+       --init-from checkpoints/quipu-moe --override train.budget_usd=$LEFT \
+       --override train.usd_per_hour=R
    ```
 
-   Never with `train.budget_usd 0` (no backstop at all).
+   `configs/quipu-moe-sft.toml` inherits `quipu-moe.toml` with `results/ab/winners.toml`
+   merged on top (so the model, optimizer and precision are the pretrained run's; the
+   LR is 0.1x its peak) and stops after 3 epochs of the chat data or 100M tokens,
+   whichever is first. If the long run was given `--override train.micro_batch=N`,
+   pass the same here. A crash or a stop: the same command plus
+   `--resume` continues the SFT's own checkpoint (`--init-from` is then ignored). Its
+   config has `budget_usd = 0.5` so a launch without the override is still bounded;
+   never with `train.budget_usd 0` (no backstop at all). Try it:
+   `uv run python scripts/chat.py --config configs/quipu-moe-sft.toml --temperature 0`.
 8. **Copy everything back** (sync.sh's final cycle, plus the SFT outputs), verify on
    the laptop (the checkpoints load; sha256 against the box), get the owner's
    go-ahead, then destroy the box (section 5).

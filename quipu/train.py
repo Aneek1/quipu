@@ -70,6 +70,21 @@ shared-expert linears to FP8 matmuls (quipu.fp8) right after the model is built,
 before the optimizers and the compile trial. The state_dict is bf16's key for key,
 so checkpoints and milestones are unchanged. FP8 on a device without FP8 tensor
 cores (or on CPU) is a usage error, exit 2.
+
+Chat fine-tune (spec 13), train.mode "sft": the data is scripts/build_chat_data.py's
+blocks read by quipu.loader.MaskedBlockStream, whose targets outside assistant turns
+are IGNORE_INDEX, so the loss (cross_entropy with that ignore_index, the mean over a
+micro-batch's assistant targets) is on assistant tokens only; pretraining targets
+never hold IGNORE_INDEX, so its loss is unchanged. train.max_epochs caps the run's
+length at that many passes over the training blocks (total_tokens cut to whole
+steps; warmup must still fit, milestones past the end are dropped); the run log
+notes it under "sft_epoch_cap". `--init-from PATH` loads model weights (a training
+checkpoint, a milestone, a latest.pt pointer or a checkpoint directory) with fresh
+optimizers, step 0 and the stream at its start; it applies only when the run has
+no checkpoint of its own (with --resume and a latest.pt, the run's own checkpoint
+wins, so a retried SFT resumes rather than restarting). Mode "sft" without either
+is a usage error. Budget backstop, orphan and signal handling are the same as for
+pretraining.
 """
 from __future__ import annotations
 
@@ -99,7 +114,7 @@ from quipu.config import Config, ModelConfig, TrainConfig, load_config, parse_ov
 from quipu.eval import estimate_loss
 from quipu.fp8 import Fp8Unsupported, apply_precision
 from quipu.fsio import replace_with_retry
-from quipu.loader import TokenStream
+from quipu.loader import IGNORE_INDEX, MaskedBlockStream, TokenStream
 from quipu.model_factory import build_model
 from quipu.model_moe import QuipuMoE
 from quipu.optim import Muon, apply_config_lrs, build_optimizers
@@ -398,10 +413,16 @@ class Trainer:
         self.forward_model: nn.Module = self.model
         self.compiled = False
         self.is_moe = isinstance(self.model, QuipuMoE)
-        self.stream = TokenStream(shard_dir, train_cfg.micro_batch, model_cfg.context)
+        # "sft": masked chat blocks (loss on assistant tokens only); else plain tokens.
+        stream_cls = MaskedBlockStream if train_cfg.mode == "sft" else TokenStream
+        self.stream = stream_cls(shard_dir, train_cfg.micro_batch, model_cfg.context)
         self.val_stream = (
-            TokenStream(val_dir, train_cfg.micro_batch, model_cfg.context) if val_dir else None
+            stream_cls(val_dir, train_cfg.micro_batch, model_cfg.context) if val_dir else None
         )
+        epoch_cap = None
+        if train_cfg.mode == "sft" and train_cfg.max_epochs > 0:
+            train_cfg, epoch_cap = self._cap_epochs(train_cfg)
+            self.train_cfg = train_cfg
 
         # optimizer "adamw" is quipu-114m's grouping exactly: weight decay on
         # matrices only (the tied embedding included, as GPT-2/nanoGPT), none on
@@ -446,8 +467,35 @@ class Trainer:
             self.log = RunLog(run_dir, run_id, config, resume=resume)
         except ValueError as exc:
             raise RunLogUnreadable(str(exc)) from exc
+        if epoch_cap is not None:
+            self._safe_log(self.log.note, "sft_epoch_cap", epoch_cap)
         if train_cfg.compile:
             self._compile()
+
+    def _cap_epochs(self, cfg: TrainConfig) -> tuple[TrainConfig, dict[str, Any] | None]:
+        """train.max_epochs: at most that many passes over the training blocks. When
+        total_tokens asks for more, it is cut to whole steps (milestones at or past the
+        new end dropped). Returns the config to train with and what was done (None
+        when nothing was cut)."""
+        data_tokens = len(self.stream)
+        max_steps = math.floor(cfg.max_epochs * data_tokens / cfg.batch_tokens)
+        if cfg.steps <= max_steps:
+            return cfg, None
+        if max_steps < 1 or cfg.warmup_steps >= max_steps:
+            raise UsageError(
+                f"max_epochs {cfg.max_epochs} over {data_tokens:,} training tokens allows "
+                f"{max_steps} steps of {cfg.batch_tokens:,} tokens, not more than "
+                f"warmup_steps ({cfg.warmup_steps}); lower batch_tokens or warmup_steps")
+        capped = dataclasses.replace(
+            cfg, total_tokens=max_steps * cfg.batch_tokens,
+            milestones=tuple(m for m in cfg.milestones if m < max_steps))
+        note = {"max_epochs": cfg.max_epochs, "data_tokens": data_tokens,
+                "configured_steps": cfg.steps, "steps": max_steps,
+                "total_tokens": capped.total_tokens}
+        print(f"sft: {cfg.max_epochs:g} epochs of {data_tokens:,} tokens = {max_steps} steps "
+              f"(config asked for {cfg.steps}); total_tokens cut to {capped.total_tokens:,}",
+              flush=True)
+        return capped, note
 
     def _compile(self) -> None:
         """Wrap the forward in torch.compile, or warn and stay eager when it cannot
@@ -595,7 +643,10 @@ class Trainer:
                 x, y = x.to(self.device), y.to(self.device)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                     logits = self.forward_model(x)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1))
+                    # IGNORE_INDEX is cross_entropy's default: pretraining targets
+                    # never hold it; SFT targets outside assistant turns do.
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.reshape(-1),
+                                           ignore_index=IGNORE_INDEX)
                 # Divide before backward so the accumulated gradient is the mean over
                 # the whole batch, not the sum over micro-batches.
                 (loss / cfg.grad_accum).backward()
@@ -867,6 +918,35 @@ class Trainer:
         if state["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
 
+    def init_weights_from(self, path: str | Path) -> Path:
+        """Load model weights only (spec 13: the SFT starts from the final pretraining
+        checkpoint): optimizers, step, stream and RNG stay fresh, so the schedule
+        starts at step 0. `path` is a training checkpoint (its "model"), a bf16
+        milestone (a bare state_dict), a latest.pt pointer, or a checkpoint
+        directory (its latest.pt). Strict: every key must match this model (which
+        also catches an SFT config whose model differs from the pretrained one).
+        Returns the file loaded."""
+        path = Path(path)
+        if path.is_dir():
+            path = path / LATEST
+        if not path.is_file():
+            raise UsageError(f"--init-from {path}: no such checkpoint")
+        obj = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(obj, dict) and set(obj) == {"file"}:       # a latest.pt pointer
+            path = path.parent / obj["file"]
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+        state = obj["model"] if isinstance(obj, dict) and isinstance(obj.get("model"), dict) \
+            else obj
+        try:
+            self.model.load_state_dict(
+                {k.removeprefix("_orig_mod."): v for k, v in state.items()}, strict=True)
+        except RuntimeError as exc:
+            raise UsageError(f"--init-from {path} does not fit this model: "
+                             f"{str(exc).splitlines()[0]}") from exc
+        print(f"initialised weights from {path} (fresh optimizer, step 0)", flush=True)
+        self._safe_log(self.log.note, "init_from", str(path))
+        return path
+
     def resume_from_latest(self) -> None:
         """Load the latest checkpoint and drop log entries past it: those steps are
         about to be re-run and must not appear twice in the run log.
@@ -1011,6 +1091,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--override", action="append", default=[], metavar="SECTION.KEY=VALUE",
                         help="override one config value, typed by its field "
                              "(e.g. train.lr=1.2e-3, model.activation=situ_glu); repeatable")
+    parser.add_argument("--init-from", default=None, metavar="CHECKPOINT",
+                        help="start from these model weights with a fresh optimizer and "
+                             "schedule (train.mode sft); ignored when --resume finds the "
+                             "run's own checkpoint")
     args = parser.parse_args(argv)
 
     try:
@@ -1018,11 +1102,27 @@ def main(argv: list[str] | None = None) -> None:
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise UsageError(f"bad config {args.config!r}: {exc}") from exc
     device = _pick_device(args.device)
+    # Checked before the Trainer (and its run log) exists, so a mistake here leaves
+    # nothing behind and the same command, corrected, can run.
+    has_own_checkpoint = args.resume and (Path(cfg.train.ckpt_dir) / LATEST).exists()
+    if args.init_from and not has_own_checkpoint:
+        start = Path(args.init_from)
+        if not (start.is_file() or (start / LATEST).is_file()):
+            raise UsageError(f"--init-from {start}: no checkpoint file, and no {LATEST} in it")
+    if cfg.train.mode == "sft" and not args.init_from and not has_own_checkpoint:
+        raise UsageError("train.mode 'sft' starts from pretrained weights: pass --init-from "
+                         "CHECKPOINT (e.g. the pretraining ckpt_dir)")
+    val_dir: Path | None = Path(cfg.data.shard_dir) / "val"
+    if cfg.train.mode == "sft" and not any(val_dir.glob("shard_*.bin")):
+        # build_chat_data.py writes no val split at --val-fraction 0.
+        print(f"warning: no validation shards in {val_dir}; training without evaluation",
+              file=sys.stderr, flush=True)
+        val_dir = None
     try:
         trainer = Trainer(
             model_cfg=cfg.model, train_cfg=cfg.train,
             shard_dir=Path(cfg.data.shard_dir) / "train",
-            val_dir=Path(cfg.data.shard_dir) / "val",
+            val_dir=val_dir,
             device=device, run_dir=args.run_dir, run_id=args.run_id,
             resume=args.resume,
         )
@@ -1037,12 +1137,20 @@ def main(argv: list[str] | None = None) -> None:
         ) from exc
     except Fp8Unsupported as exc:
         raise UsageError(f"{exc}; set train.precision = \"bf16\" to train here") from exc
+    if len(cfg.layers) > 1:
+        print(f"config layers: {' <- '.join(cfg.layers)}", flush=True)
+        trainer._safe_log(trainer.log.note, "config_layers", list(cfg.layers))
     if args.resume:
         trainer.resume_from_latest()
         print(
             f"resumed at step {trainer.step}, stream position {trainer.stream.position}",
             flush=True,
         )
+    if args.init_from and has_own_checkpoint:
+        print(f"--init-from {args.init_from} ignored: resuming the run's own checkpoint",
+              flush=True)
+    elif args.init_from:
+        trainer.init_weights_from(args.init_from)
     trainer.run()
 
 

@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 
 TOP_LEVEL_KEYS = {"name", "model", "data", "train"}
+# A config may build on others (load_config): `inherit` names one base config file,
+# `inherit_if_present` a list of files merged on top of it only when they exist (the
+# A/B winners, say). Paths are relative to the config file's own directory.
+INHERIT_KEYS = ("inherit", "inherit_if_present")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +107,12 @@ class DataConfig:
     # "sanitized"); "" = the Hub's current commit (the build prints a warning).
     humaneval_revision: str = ""
     mbpp_revision: str = ""
+    # Chat fine-tune data (spec 13, scripts/build_chat_data.py): the commits of the
+    # Aya dataset and OpenAssistant oasst2 it reads, and the stepbuild dataset
+    # directory (its train split, and its test split for the leakage guard).
+    aya_revision: str = ""
+    oasst2_revision: str = ""
+    stepbuild_dir: str = "data/stepbuild"
 
 
 ENGLISH_TEXT_KEY = "eng_Latn"
@@ -111,6 +121,7 @@ ACTIVATIONS = ("swiglu", "situ_glu")
 MOE_DISPATCHES = ("loop", "padded")
 OPTIMIZERS = ("adamw", "muon")
 PRECISIONS = ("bf16", "fp8")
+TRAIN_MODES = ("pretrain", "sft")
 GPT2_TOKENIZER = "gpt2"
 # ModelConfig int fields that are 0 for a dense model.
 MOE_INT_FIELDS = ("n_experts", "top_k", "expert_hidden", "shared_experts", "shared_hidden",
@@ -168,6 +179,16 @@ class TrainConfig:
     # The box tools set both per launch (the budget left then, less their reserve).
     budget_usd: float = 0.0
     usd_per_hour: float = 0.0
+    # Chat fine-tune (spec 13). "sft": the data is scripts/build_chat_data.py's
+    # blocks with a loss mask (quipu.loader.MaskedBlockStream; loss on assistant
+    # tokens only) and the run starts from pretrained weights (quipu.train
+    # --init-from). max_epochs > 0 (sft only) caps the run at that many passes over
+    # the training blocks: total_tokens is cut to fit when the data is smaller.
+    # base_lr_scale > 0 (a config with `inherit` only) sets lr and muon_lr to that
+    # fraction of the inherited (pretraining) values; see load_config.
+    mode: str = "pretrain"               # "pretrain" | "sft"
+    max_epochs: float = 0.0
+    base_lr_scale: float = 0.0
 
     @property
     def steps(self) -> int:
@@ -184,6 +205,9 @@ class Config:
     model: ModelConfig
     data: DataConfig
     train: TrainConfig
+    # The files merged into this config, base first (inherit, inherit_if_present
+    # that existed, then the file itself); just the file for a config without them.
+    layers: tuple[str, ...] = ()
 
 
 # Tables that are one value, not a section: an override replaces the whole table.
@@ -383,8 +407,9 @@ def _check_data_mix(data: DataConfig) -> None:
     _check_str("lid_model", data.lid_model)
     _check_str("lid_revision", data.lid_revision, allow_empty=True)
     for name in ("code_revision", "text_revision", "fineweb2_revision", "humaneval_revision",
-                 "mbpp_revision"):
+                 "mbpp_revision", "aya_revision", "oasst2_revision"):
         _check_str(name, getattr(data, name), allow_empty=True)
+    _check_str("stepbuild_dir", data.stepbuild_dir)
 
 
 def _check_train_extras(train: TrainConfig) -> None:
@@ -400,6 +425,12 @@ def _check_train_extras(train: TrainConfig) -> None:
     _check_positive("usd_per_hour", train.usd_per_hour, allow_zero=True)
     if train.budget_usd > 0 and train.usd_per_hour == 0:
         raise ValueError("budget_usd needs usd_per_hour > 0 to be enforced")
+    _check_choice("mode", train.mode, TRAIN_MODES)
+    _check_positive("max_epochs", train.max_epochs, allow_zero=True)
+    if train.max_epochs > 0 and train.mode != "sft":
+        raise ValueError(f"max_epochs applies to mode 'sft', got mode {train.mode!r}")
+    if not 0 <= train.base_lr_scale <= 1:
+        raise ValueError(f"base_lr_scale must be in [0, 1], got {train.base_lr_scale!r}")
 
 
 OVERRIDE_SECTIONS = {"model": ModelConfig, "data": DataConfig, "train": TrainConfig}
@@ -465,10 +496,69 @@ def parse_overrides(items: list[str]) -> dict[str, Any]:
     return out
 
 
+MAX_INHERIT_DEPTH = 8
+
+
+def _read_layers(path: Path, depth: int = 0
+                 ) -> tuple[dict[str, Any], dict[str, Any] | None, list[str], dict[str, Any]]:
+    """(merged raw config, the merged base it built on or None, the files merged in
+    order, the file's own table). `inherit` is read first, then each existing
+    `inherit_if_present` file is merged on top, then the file itself; the inherit
+    keys never reach the merged result."""
+    if depth > MAX_INHERIT_DEPTH:
+        raise ValueError(f"{path}: inherit chain deeper than {MAX_INHERIT_DEPTH} (a cycle?)")
+    own = tomllib.loads(path.read_text(encoding="utf-8"))
+    base_name = own.pop("inherit", None)
+    extras = own.pop("inherit_if_present", [])
+    if base_name is None:
+        if extras:
+            raise ValueError(f"{path}: inherit_if_present needs inherit")
+        return own, None, [str(path)], own
+    if not isinstance(base_name, str) or not base_name.strip():
+        raise ValueError(f"{path}: inherit must be a config path, got {base_name!r}")
+    if not isinstance(extras, list) or not all(isinstance(e, str) and e for e in extras):
+        raise ValueError(f"{path}: inherit_if_present must be a list of paths, got {extras!r}")
+    base, _, layers, _ = _read_layers(path.parent / base_name, depth + 1)
+    for extra in extras:
+        p = path.parent / extra
+        if not p.is_file():
+            continue
+        layer = tomllib.loads(p.read_text(encoding="utf-8"))
+        if any(k in layer for k in INHERIT_KEYS):
+            raise ValueError(f"{p}: an inherit_if_present layer cannot inherit itself")
+        base = _merge(base, layer)
+        layers.append(str(p))
+    return _merge(base, own), base, layers + [str(path)], own
+
+
+def _apply_base_lr_scale(raw: dict[str, Any], base: dict[str, Any] | None,
+                         own: dict[str, Any], overrides: dict[str, Any] | None) -> None:
+    """train.base_lr_scale > 0: lr and muon_lr become that fraction of the inherited
+    values (spec 13: the SFT runs at 0.1x the pretraining peak of whichever optimizer
+    won). Setting lr or muon_lr as well is refused: one of the two would be ignored."""
+    train = raw.get("train", {})
+    scale = train.get("base_lr_scale", 0.0)
+    if not _is_number(scale) or not math.isfinite(scale) or scale <= 0:
+        return
+    if base is None:
+        raise ValueError("base_lr_scale needs a config with `inherit` (the base LRs)")
+    for key in ("lr", "muon_lr"):
+        for where, table in (("the config", own), ("--override", overrides or {})):
+            if key in table.get("train", {}):
+                raise ValueError(f"{where} sets train.{key} and base_lr_scale; use one")
+    base_train = base.get("train", {})
+    if "lr" not in base_train:
+        raise ValueError("base_lr_scale: the inherited config has no train.lr")
+    default_muon = next(f.default for f in dataclasses.fields(TrainConfig) if f.name == "muon_lr")
+    train["lr"] = scale * base_train["lr"]
+    train["muon_lr"] = scale * base_train.get("muon_lr", default_muon)
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
-    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    raw, base, layers, own = _read_layers(Path(path))
     if overrides:
         raw = _merge(raw, overrides)
+    _apply_base_lr_scale(raw, base, own, overrides)
 
     unknown = set(raw) - TOP_LEVEL_KEYS
     if unknown:
@@ -553,4 +643,4 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
         )
     _check_milestones(train.milestones, train.steps)
 
-    return Config(name=raw["name"], model=model, data=data, train=train)
+    return Config(name=raw["name"], model=model, data=data, train=train, layers=tuple(layers))

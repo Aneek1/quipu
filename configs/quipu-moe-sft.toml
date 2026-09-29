@@ -1,0 +1,44 @@
+name = "quipu-moe-sft"
+
+# The chat fine-tune (spec section 13, plan Task M12): quipu-moe after pretraining,
+# on human-written conversations (scripts/build_chat_data.py), loss on assistant
+# tokens only.
+#
+# Everything not set here is inherited: the model (every [model] key, so the
+# pretrained weights load strictly), the tokenizer, the precision and the optimizer
+# come from quipu-moe.toml with the A/B winners merged on top when
+# results/ab/winners.toml exists (paths relative to this file). Run on the box with
+# python -m quipu.train --config configs/quipu-moe-sft.toml --init-from
+# checkpoints/quipu-moe --run-id quipu-moe-sft and the budget overrides of
+# scripts/remote/README.md step 7.
+inherit = "quipu-moe.toml"
+inherit_if_present = ["../results/ab/winners.toml"]
+
+[data]
+shard_dir    = "data/chat-sft"
+shard_tokens = 50_003_968        # 24,416 blocks of 2048 tokens per shard file
+stepbuild_dir = "data/stepbuild"
+# The chat sources, pinned (both Apache-2.0).
+aya_revision    = "f9ea04583f02a8f86404ff6c58bf75fe637df8a2"  # CohereForAI/aya_dataset
+oasst2_revision = "179dd21fc55192153d94adb0e0ce8f69e222bf75"  # OpenAssistant/oasst2
+
+[train]
+mode          = "sft"
+# lr and muon_lr = 0.1 x the inherited (pretraining peak) values of whichever
+# optimizer won A/B pair 1; lr and muon_lr must not be set here as well.
+base_lr_scale = 0.1
+lr_min        = 0.0            # cosine to 0
+warmup_steps  = 20             # short warm-up
+total_tokens  = 100_000_000    # the spec's cap, repeats included; max_epochs cuts it to the data
+max_epochs    = 3.0
+batch_tokens  = 131_072        # 64 blocks of 2048 (grad_accum 8 at the inherited micro_batch 8)
+milestones    = []             # the final step is kept as a milestone anyway
+ckpt_dir      = "checkpoints/quipu-moe-sft"
+ckpt_every    = 100
+ckpt_keep     = 2
+eval_every    = 50
+eval_batches  = 10
+# The spend backstop is never 0 for the SFT: the box passes what is left of the $20
+# (README step 7: --override train.budget_usd=$LEFT --override train.usd_per_hour=R);
+# this default only bounds a launch that forgot to (~55 min at the inherited $0.55/h).
+budget_usd    = 0.5
