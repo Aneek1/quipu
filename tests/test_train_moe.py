@@ -541,6 +541,23 @@ def test_compiled_logits_match_eager_on_the_smoke_config(tmp_path):
                                    atol=1e-3, rtol=0)
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(train_mod._compile_unavailable("cuda") is not None,
+                    reason=f"torch.compile unavailable: {train_mod._compile_unavailable('cuda')}")
+def test_compiled_logits_match_eager_on_cuda(tmp_path):
+    # The GPU box's preflight (scripts/remote/preflight.sh --gpu-box): inductor +
+    # Triton on the real card (sm_120 on a 5090), the smoke MoE, fp32.
+    cfg = smoke(tmp_path, compile=True)
+    trainer = Trainer(model_cfg=cfg.model, train_cfg=cfg.train, shard_dir=make_data(tmp_path),
+                      device="cuda", run_dir=tmp_path / "runs", run_id="t")
+    assert trainer.compiled, logged(tmp_path).get("compile")
+    idx = torch.randint(0, cfg.model.vocab_size, (2, 64), device="cuda")
+    with torch.no_grad():
+        torch.testing.assert_close(trainer.forward_model(idx), trainer.model(idx),
+                                   atol=5e-3, rtol=0)
+    assert math.isfinite(trainer.train_step())
+
+
 # ---- expert-load logging and the health alert -----------------------------------------
 
 def test_expert_load_is_logged_every_eval_interval(tmp_path):
