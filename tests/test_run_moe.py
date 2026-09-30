@@ -1019,10 +1019,10 @@ BASH = _bash()
 needs_bash = pytest.mark.skipif(BASH is None, reason="needs bash (Git Bash on Windows)")
 
 
-def _sync(tmp_path, *args, tool="rsync", keep=None):
+def _sync(tmp_path, *args, tool="rsync", keep=None, extra_env=None):
     # A relative LOCAL_DIR reads the same in Git Bash and elsewhere (cygpath keeps it).
     env = {**os.environ, "SYNC_TOOL": tool, "LOCAL_DIR": "local-copy/quipu-moe",
-           "HOME": tmp_path.as_posix()}
+           "HOME": tmp_path.as_posix(), **(extra_env or {})}
     env.pop("KEEP_LOCAL", None)
     if keep is not None:
         env["KEEP_LOCAL"] = keep
@@ -1076,6 +1076,37 @@ def test_sync_dry_run_falls_back_to_scp(tmp_path):
     assert "root@host.example:/workspace/quipu/checkpoints/quipu-moe/step_NNNNNN.pt" in out
     assert "tar -C /workspace/quipu -cf - --exclude=inductor-cache" in out
     assert "every 3 h" in out                         # the default interval
+
+
+def _cycles(out: str) -> list[str]:
+    """The dry-run output split per '--- cycle N' marker (the first chunk is the header)."""
+    return re.split(r"--- cycle \d+", out)[1:]
+
+
+@needs_bash
+def test_sync_copies_the_full_checkpoint_on_cycle_1_every_nth_and_the_final(tmp_path):
+    ckpt = "/checkpoints/quipu-moe/latest.pt"
+    env_cycles = {"DRY_RUN_CYCLES": "6"}
+    proc = _sync(tmp_path, "--dry-run", "--ckpt-every", "4", "h", "22", extra_env=env_cycles)
+    assert proc.returncode == 0, proc.stderr
+    cycles = _cycles(proc.stdout)
+    assert len(cycles) == 6
+    assert [ckpt in c for c in cycles] == [True, False, False, False, True, False]
+    for c in cycles:                          # results and milestones every cycle
+        assert "/results/ " in c and "/milestones/ " in c
+    assert "no full checkpoint this time" in cycles[1]
+    # The default is every 4th; the cycle that sees summary.md always copies it.
+    proc = _sync(tmp_path, "--dry-run", "h", "22",
+                 extra_env={"DRY_RUN_CYCLES": "9", "DRY_RUN_DONE_AT": "3"})
+    cycles = _cycles(proc.stdout)
+    assert [ckpt in c for c in cycles] == [True, False, True]
+    assert "final sync done" in cycles[-1]
+    # --ckpt-every 1 is the old behaviour.
+    proc = _sync(tmp_path, "--dry-run", "--ckpt-every=1", "h", "22",
+                 extra_env={"DRY_RUN_CYCLES": "3"})
+    assert all(ckpt in c for c in _cycles(proc.stdout))
+    assert _sync(tmp_path, "--dry-run", "--ckpt-every", "0", "h", "22").returncode == 2
+    assert _sync(tmp_path, "--dry-run", "--ckpt-every", "x", "h", "22").returncode == 2
 
 
 @needs_bash

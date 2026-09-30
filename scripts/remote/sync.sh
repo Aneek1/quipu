@@ -2,18 +2,22 @@
 # Pull the quipu-moe run from the rented GPU box to the laptop, every few hours,
 # until the run is over (spec 6.4, plan Task M9). Runs on the laptop (Git Bash).
 #
-#   bash scripts/remote/sync.sh [--dry-run] HOST PORT [INTERVAL_HOURS]
+#   bash scripts/remote/sync.sh [--dry-run] [--ckpt-every N] HOST PORT [INTERVAL_HOURS]
 #
 # Each cycle copies, from root@HOST:$REMOTE_DIR (default /workspace/quipu), into
 # $LOCAL_DIR (default <repo>/remote-runs/quipu-moe):
-#   - checkpoints/quipu-moe/latest.pt and the step_NNNNNN.pt it points to (the
-#     pointer is fetched first and put in place only after its checkpoint arrived,
-#     so the local pointer never names a file that is not there);
-#   - checkpoints/quipu-moe/milestones/ (bf16 snapshots);
-#   - results/ (run logs, plan, summary, spend ledger), without the inductor caches,
-#     *.pt and *.tmp files.
+#   - every cycle: checkpoints/quipu-moe/milestones/ (bf16 snapshots, ~2 GB each, each
+#     copied once) and results/ (run logs, plan, summary, spend ledger), without the
+#     inductor caches, *.pt and *.tmp files;
+#   - the first cycle, then every Nth (--ckpt-every N, default 4; SYNC_CKPT_EVERY),
+#     and always the final one: checkpoints/quipu-moe/latest.pt and the step_NNNNNN.pt
+#     it points to (~12 GB: fp32 weights + optimizer states; the pointer is fetched
+#     first and put in place only after its checkpoint arrived, so the local pointer
+#     never names a file that is not there). Vast bills the box's outbound traffic
+#     per GB on many hosts, so a 12 GB copy every cycle is money; the first cycle
+#     proves the copy works, --ckpt-every 1 copies it every cycle as before.
 # It stops after the cycle that sees results/moe/summary.md on the box (run_moe.py
-# writes it only when the run is over). It never mirrors deletions (no rsync delete
+# writes it only when the run is over); that final cycle always copies the checkpoint. It never mirrors deletions (no rsync delete
 # option). Old step_*.pt copies (~12 GB each for quipu-moe) stay unless KEEP_LOCAL=N
 # is set: then, after each checkpoint sync, only the N newest local step_*.pt are
 # kept; the one the local latest.pt points to and everything in milestones/ are never
@@ -29,15 +33,19 @@
 # SSH: your own key only (SSH_KEY, default ~/.ssh/id_ed25519), no agent forwarding
 # (ForwardAgent=no, IdentitiesOnly=yes), new host keys accepted on first use, and
 # BatchMode=yes: a missing key fails the cycle instead of waiting for a password.
-# --dry-run prints the commands of one cycle and runs nothing.
+# --dry-run prints the commands of one cycle and runs nothing (DRY_RUN_CYCLES=K prints
+# K cycles, and DRY_RUN_DONE_AT=K pretends the summary appears at cycle K: for tests).
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-usage: bash scripts/remote/sync.sh [--dry-run] HOST PORT [INTERVAL_HOURS]
+usage: bash scripts/remote/sync.sh [--dry-run] [--ckpt-every N] HOST PORT [INTERVAL_HOURS]
        KEEP_LOCAL=N bash scripts/remote/sync.sh --prune-only
   HOST PORT        the GPU box's SSH address (ssh -p PORT root@HOST)
   INTERVAL_HOURS   hours between syncs (default 3; decimals allowed)
+  --ckpt-every N   copy the full latest checkpoint (~12 GB) on the first cycle, every
+                   Nth cycle after it and the final one (default 4); results/ and
+                   milestones every cycle
 env: REMOTE_USER (root), REMOTE_DIR (/workspace/quipu), LOCAL_DIR (<repo>/remote-runs/quipu-moe),
      SSH_KEY (~/.ssh/id_ed25519), SYNC_TOOL (auto | rsync | scp),
      KEEP_LOCAL (unset = keep every local step_*.pt; N = keep the N newest, never the
@@ -47,16 +55,27 @@ EOF
 
 DRY_RUN=0
 PRUNE_ONLY=0
+CKPT_EVERY=${SYNC_CKPT_EVERY:-4}
 ARGS=()
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --prune-only) PRUNE_ONLY=1 ;;
+        --ckpt-every)
+            [ $# -ge 2 ] || { echo "sync.sh: --ckpt-every needs a number" >&2; exit 2; }
+            CKPT_EVERY=$2; shift ;;
+        --ckpt-every=*) CKPT_EVERY=${1#--ckpt-every=} ;;
         -h|--help) usage; exit 0 ;;
-        -*) echo "sync.sh: unknown option $arg" >&2; usage >&2; exit 2 ;;
-        *) ARGS+=("$arg") ;;
+        -*) echo "sync.sh: unknown option $1" >&2; usage >&2; exit 2 ;;
+        *) ARGS+=("$1") ;;
     esac
+    shift
 done
+case "$CKPT_EVERY" in
+    ''|*[!0-9]*|0) echo "sync.sh: --ckpt-every must be a whole number >= 1, got '$CKPT_EVERY'" >&2; exit 2 ;;
+esac
+DRY_RUN_CYCLES=${DRY_RUN_CYCLES:-1}
+DRY_RUN_DONE_AT=${DRY_RUN_DONE_AT:-0}
 KEEP_LOCAL=${KEEP_LOCAL:-}
 case "$KEEP_LOCAL" in
     '') ;;
@@ -140,6 +159,7 @@ run() {
 remote_done() {
     if [ "$DRY_RUN" -eq 1 ]; then
         show "${SSH[@]}" "$REMOTE" "test -f $SUMMARY"
+        [ "$DRY_RUN_DONE_AT" -gt 0 ] && [ "$CYCLE" -ge "$DRY_RUN_DONE_AT" ] && return 0
         return 1
     fi
     "${SSH[@]}" "$REMOTE" "test -f $SUMMARY"
@@ -241,10 +261,19 @@ prune_local() {
     done
 }
 
+# The full checkpoint on the first cycle, every CKPT_EVERY-th after it, and the final.
+checkpoint_due() {
+    [ "$1" -eq 1 ] || [ $(( (CYCLE - 1) % CKPT_EVERY )) -eq 0 ]
+}
+
 cycle() {
-    local ok=0
+    local ok=0 final=$1
     run mkdir -p "$LOCAL_DIR/$CKPT/milestones" "$LOCAL_DIR/results"
-    if sync_checkpoint; then prune_local; else say "checkpoint sync failed"; ok=1; fi
+    if checkpoint_due "$final"; then
+        if sync_checkpoint; then prune_local; else say "checkpoint sync failed"; ok=1; fi
+    else
+        say "cycle $CYCLE: no full checkpoint this time (every $CKPT_EVERY cycles and the final one)"
+    fi
     sync_milestones || { say "milestone sync failed"; ok=1; }
     sync_results || { say "results sync failed"; ok=1; }
     return $ok
@@ -256,17 +285,22 @@ if [ "$PRUNE_ONLY" -eq 1 ]; then
 fi
 
 say "syncing $REMOTE:$REMOTE_DIR -> $LOCAL_DIR with $TOOL every $INTERVAL_HOURS h" \
-    "(${INTERVAL_S} s)$([ "$DRY_RUN" -eq 1 ] && echo '; dry run: commands only')"
+    "(${INTERVAL_S} s); the full checkpoint on cycle 1, every $CKPT_EVERY cycles and the final" \
+    "$([ "$DRY_RUN" -eq 1 ] && echo '; dry run: commands only')"
+CYCLE=0
 while true; do
+    CYCLE=$((CYCLE + 1))
+    if [ "$DRY_RUN" -eq 1 ] && [ "$DRY_RUN_CYCLES" -gt 1 ]; then say "--- cycle $CYCLE"; fi
     finished=0
     if remote_done; then finished=1; fi
-    if cycle; then say "cycle done"; else say "cycle had failures; trying again next time"; fi
+    if cycle "$finished"; then say "cycle done"; else say "cycle had failures; trying again next time"; fi
     if [ "$finished" -eq 1 ]; then
         say "the run's summary is on the box: final sync done, stopping"
         exit 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        exit 0
+        if [ "$CYCLE" -ge "$DRY_RUN_CYCLES" ]; then exit 0; fi
+        continue
     fi
     sleep "$INTERVAL_S"
 done
