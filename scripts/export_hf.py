@@ -2,7 +2,22 @@
 
     python -m uv run python scripts/export_hf.py [--out hf_export]                  # quipu-114m
     python -m uv run python scripts/export_hf.py --config results/moe/run_config.toml \
-        --ckpt-dir checkpoints-moe --out hf_export_moe [--int4] [--chat] [--card-only]
+        --ckpt-dir checkpoints/quipu-moe --out hf_export_moe [--int4] [--card-only]
+    python -m uv run python scripts/export_hf.py --config configs/quipu-moe-sft.toml \
+        --ckpt-dir checkpoints/quipu-moe-sft --out hf_export_moe_chat --chat [--int4]
+
+--config for the base model is results/moe/run_config.toml, the config the long run
+really trained (run_moe.py writes it: configs/quipu-moe.toml + the A/B winners + the
+plan's trimmed total_tokens and milestones); configs/quipu-moe.toml alone would be
+the untrimmed plan and possibly the wrong A/B options. Its train.ckpt_dir is the
+box's absolute path (/workspace/quipu/checkpoints/quipu-moe), which does not exist on
+the laptop (and configs/quipu-moe.toml's is checkpoints-moe, not where run_moe put
+them), hence --ckpt-dir. The chat model's config is the SFT's (it inherits the same winners from
+results/ab/winners.toml). On the laptop the paths are where scripts/remote/
+copy_back.sh put them (the same relative paths under the repo). Checkpoints are
+memory-mapped (torch.load mmap=True), so the ~12 GB training checkpoint's optimizer
+states are never read into RAM; the export can also run on the box, inside the
+reserve, before the copy-back.
 
 quipu-114m (model.kind "dense"), unchanged: config.json, model.safetensors (fp32,
 final step), milestones/*.safetensors (bf16, as trained), modeling_quipu.py and
@@ -81,7 +96,8 @@ def export_dense(cfg, ckpt_dir: Path, out: Path) -> int:
     (out / "milestones").mkdir(parents=True, exist_ok=True)
 
     pointer = torch.load(ckpt_dir / "latest.pt", map_location="cpu", weights_only=True)
-    final = torch.load(ckpt_dir / pointer["file"], map_location="cpu", weights_only=False)
+    final = torch.load(ckpt_dir / pointer["file"], map_location="cpu", weights_only=False,
+                       mmap=True)
     final_step = int(final["step"])
     print(f"final checkpoint: {pointer['file']} (step {final_step})")
 
@@ -97,7 +113,7 @@ def export_dense(cfg, ckpt_dir: Path, out: Path) -> int:
               metadata={"step": str(final_step), "dtype": "float32"})
 
     for p in sorted((ckpt_dir / "milestones").glob("step_*.pt")):
-        state = torch.load(p, map_location="cpu", weights_only=True)
+        state = torch.load(p, map_location="cpu", weights_only=True, mmap=True)
         save_file(_strip_tied(state, torch.bfloat16), str(out / "milestones" / f"{p.stem}.safetensors"),
                   metadata={"step": str(int(p.stem.split("_")[1])), "dtype": "bfloat16"})
         print(f"milestone {p.stem}")

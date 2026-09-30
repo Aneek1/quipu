@@ -139,13 +139,15 @@ def discover_checkpoints(ckpt_dir: Path) -> list[tuple[str, int, Path, dict | No
         # Read the full checkpoint (model + optimiser state) exactly once here, and
         # hand the model state_dict on to the caller, so load_final_model never has
         # to re-read it.
-        final_full = torch.load(final_path, map_location="cpu", weights_only=False)
+        # Memory-mapped: the optimizer states in the same file are never read.
+        final_full = torch.load(final_path, map_location="cpu", weights_only=False, mmap=True)
         final_state = final_full["model"]
         include = True
         if found and final_step == found[-1][0]:
             # Same step as the last milestone: include only if the weights differ
             # (the final checkpoint is fp32 + optimiser state; compare model weights).
-            last_milestone_state = torch.load(found[-1][1], map_location="cpu", weights_only=True)
+            last_milestone_state = torch.load(found[-1][1], map_location="cpu",
+                                              weights_only=True, mmap=True)
             include = not _state_dicts_equal(last_milestone_state, final_state)
         if include:
             out.append(("final", final_step if final_step is not None else -1, final_path, final_state))
@@ -190,7 +192,7 @@ def load_milestone_model(cfg: Config, path: Path, device: str) -> nn.Module:
     dtype cast bf16 -> fp32 happens for free, since `load_state_dict` copies into
     the destination module's existing fp32 parameters in place.
     """
-    state = torch.load(path, map_location="cpu", weights_only=True)
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     try:
         return evalsets.load_model(cfg.model, device=device, state=state)
     except RuntimeError as exc:
@@ -210,7 +212,7 @@ def load_final_model(cfg: Config, path: Path, device: str, state: dict | None = 
     state_dict directly, so the ~1.4 GB full checkpoint is never read from disk twice.
     """
     if state is None:
-        full = torch.load(path, map_location="cpu", weights_only=False)
+        full = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
         state = full["model"]
     return evalsets.load_model(cfg.model, device=device, state=state)
 

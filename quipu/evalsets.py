@@ -182,8 +182,12 @@ def split_batches(split_dir: str | Path, micro_batch: int, context: int,
 
 
 def checkpoint_state(path: str | Path) -> dict[str, torch.Tensor]:
-    """The model state_dict of a milestone (bare) or a full training checkpoint."""
-    obj = torch.load(path, map_location="cpu", weights_only=False)
+    """The model state_dict of a milestone (bare) or a full training checkpoint.
+    Memory-mapped: a ~12 GB quipu-moe training checkpoint (fp32 weights + optimizer
+    states) is not read into RAM; only the model's pages are touched, when the
+    weights are copied into the model. weights_only=False: a full checkpoint also
+    holds the optimizer and data-stream state."""
+    obj = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
         return obj["model"]
     return obj
