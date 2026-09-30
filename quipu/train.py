@@ -1288,6 +1288,39 @@ def write_val_by_source(trainer: "Trainer", root: Path, out: Path, run_id: str) 
               flush=True)
 
 
+def check_shard_tokenizer(shard_dir: str | Path, tokenizer: str) -> None:
+    """The shards must have been built with the config's tokenizer: when
+    <shard_dir>/manifest.json records a tokenizer sha256 (build_shards.py,
+    build_chat_data.py), the config's tokenizer file must exist and hash to it.
+    UsageError (exit 2) otherwise, before anything is written. Shards whose manifest
+    records no hash (quipu-114m's GPT-2 shards, test fixtures) are not checked."""
+    import hashlib
+
+    manifest = Path(shard_dir) / "manifest.json"
+    if not manifest.is_file():
+        return
+    try:
+        recorded = json.loads(manifest.read_text(encoding="utf-8")).get("tokenizer")
+    except (OSError, ValueError) as exc:
+        raise UsageError(f"{manifest} is unreadable ({exc})") from exc
+    want = recorded.get("sha256") if isinstance(recorded, dict) else None
+    if not want:
+        return
+    path = Path(tokenizer)
+    if not path.is_file():
+        raise UsageError(
+            f"cannot check the shards' tokenizer: {manifest} records tokenizer sha256 "
+            f"{want[:12]}..., but data.tokenizer {tokenizer!r} is not there (copy "
+            "artifacts/tokenizer/tokenizer.json from the laptop and check its hash)")
+    have = hashlib.sha256(path.read_bytes()).hexdigest()
+    if have != want:
+        raise UsageError(
+            f"the shards in {shard_dir} were built with another tokenizer: the manifest "
+            f"records sha256 {want[:12]}..., data.tokenizer {tokenizer!r} is {have[:12]}...; "
+            "training on them would read every token id wrong. Copy the tokenizer the "
+            "shards were built with, or rebuild the shards")
+
+
 def _pick_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -1329,6 +1362,7 @@ def main(argv: list[str] | None = None) -> None:
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise UsageError(f"bad config {args.config!r}: {exc}") from exc
     device = _pick_device(args.device)
+    check_shard_tokenizer(cfg.data.shard_dir, cfg.data.tokenizer)
     # Checked before the Trainer (and its run log) exists, so a mistake here leaves
     # nothing behind and the same command, corrected, can run.
     has_own_checkpoint = args.resume and (Path(cfg.train.ckpt_dir) / LATEST).exists()
