@@ -24,9 +24,13 @@ Ubuntu 22.04/24.04 image, SSH access. Sort by price; this box does nothing a GPU
 
 ```bash
 ssh -p PORT root@HOST
-git clone --branch pipeline-114m https://github.com/Aneek1/quipu.git /workspace/quipu
-bash /workspace/quipu/scripts/remote/setup.sh --cpu-only --branch pipeline-114m
+git clone --branch main https://github.com/Aneek1/quipu.git /workspace/quipu
+bash /workspace/quipu/scripts/remote/setup.sh --cpu-only
 ```
+
+The box clones `main` (setup.sh's default branch): the owner has pushed the local
+branch there first (`git push origin pipeline-114m:main`); there is no
+`pipeline-114m` on GitHub.
 
 `--cpu-only` skips every GPU, driver, CUDA and Node step, checks that fastText (the
 LID filter) imports, and runs the shard builder's tests. Safe to re-run.
@@ -76,8 +80,23 @@ export HF_XET_CHUNK_CACHE_SIZE_BYTES=0
 
 ## 4. Preflight (minutes, metadata only)
 
+First the box itself, in the same shell (it needs HF_TOKEN and the xet setting from
+step 3; ~5 minutes, a cent or two):
+
 ```bash
 cd /workspace/quipu
+bash scripts/remote/preflight.sh --cpu-box
+```
+
+It checks the checkout (main, at origin, clean), python3, free disk (>= 70 GB), the
+tokenizer's sha256, that the spend ticker ticks on its own (a scratch ledger), the
+POSIX-only tests the laptop never ran, one fastText prediction with the LID model at
+its pinned revision, that every pinned dataset revision and the LID model are
+reachable on Hugging Face (metadata only), and that HF_TOKEN and
+HF_XET_CHUNK_CACHE_SIZE_BYTES=0 are set. Every line is PASS / WARN / FAIL; fix any
+FAIL before going on. Then the mix:
+
+```bash
 uv run python scripts/build_shards.py --config configs/quipu-moe.toml \
     --train-tokens 8.3e9 --preflight
 ```
