@@ -325,7 +325,17 @@ def test_quipu_moe_ab_is_the_full_config_at_8_layers_and_200m_tokens():
     assert ab.train == dataclasses.replace(
         full.train, total_tokens=200_000_000, warmup_steps=40,
         ckpt_dir="checkpoints-moe-ab", ckpt_every=100, ckpt_keep=1, eval_every=50,
-        milestones=(), budget_usd=0.0)
+        milestones=(), budget_usd=0.0, micro_batch=8, compile=False)
+
+
+def test_the_full_run_uses_micro_batch_4_and_the_ab_runs_are_eager():
+    full, ab = load_config(MOE), load_config(MOE_AB)
+    sft = load_config(CONFIGS / "quipu-moe-sft.toml")
+    assert (full.train.micro_batch, full.train.grad_accum) == (4, 64)
+    assert full.train.batch_tokens == 524_288          # unchanged: grad_accum doubled
+    assert full.train.compile is True                  # decided by the preflight probe
+    assert (ab.train.micro_batch, ab.train.compile) == (8, False)
+    assert (sft.train.micro_batch, sft.train.grad_accum) == (4, 16)   # inherited
 
 
 def test_quipu_moe_smoke_is_tiny_and_switches_every_new_path_on():

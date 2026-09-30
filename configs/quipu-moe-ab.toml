@@ -15,6 +15,18 @@ name = "quipu-moe-ab"
 #   milestones [] (run management for short throwaway runs)
 #   budget_usd    0 (no in-process guard): the A/B orchestrator guards spend
 #                 across all its runs (Tasks M8/M9)
+#   micro_batch   8 (not 4): half the layers, about half the activations, so the
+#                 A/B model fits 8 where the full model needs 4 (the batch per
+#                 optimizer step, batch_tokens, is the same; only grad_accum differs)
+#   compile       false (not true): a fair A/B. The MoE layers' loop dispatch breaks
+#                 the dynamo graph at bincount / .tolist() (data-dependent expert
+#                 sizes), and the per-layer frames recompile on new expert-size shapes
+#                 until they hit torch._dynamo's recompile_limit, after which some
+#                 layers run eagerly and others compiled. Which ones, and when, depends
+#                 on the routing, so compile would add arm-dependent speed and startup
+#                 noise to a comparison of loss (and of AttnRes's throughput cost).
+#                 Eager for every arm; the full run decides compile on its own
+#                 (scripts/remote/README.md, the preflight probe).
 # The model widths, expert layout, data mix, optimizer settings and batch are the same.
 
 [model]
@@ -121,6 +133,6 @@ muon_momentum = 0.95
 muon_ns_steps = 5
 muon_per_head = true
 muon_weight_decay = 0.01   # Muon groups only; AdamW keeps weight_decay (see TrainConfig)
-compile       = true
+compile       = false         # eager for every arm; see the header
 budget_usd    = 0.0           # the A/B orchestrator guards spend, not each run
 usd_per_hour  = 0.55          # spec 8 estimate, as in quipu-moe.toml

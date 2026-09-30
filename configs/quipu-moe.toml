@@ -104,7 +104,10 @@ urd_Latn = 0.03333333333333333
 [train]
 total_tokens  = 10_200_000_000 # 19,454 steps; the spend guard trims it (~8.3B at $20)
 batch_tokens  = 524_288        # 256 sequences x 2048 tokens
-micro_batch   = 8              # provisional; set by the throughput gate
+micro_batch   = 4              # grad_accum 64. Not set by the gate: settle it with
+                               # scripts/remote/preflight.sh --gpu-box (peak VRAM at 8 vs 4)
+                               # BEFORE run_moe.py; once results/moe/plan.json exists a
+                               # different micro_batch is refused (exit 2). The SFT inherits it.
 lr            = 6e-4
 lr_min        = 6e-5
 warmup_steps  = 500
