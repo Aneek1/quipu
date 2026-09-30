@@ -216,6 +216,7 @@ class CardInputs:
     int4_report: Path | None = None      # int4_report.json from export_hf --int4
     experts_dir: Path | None = None      # results/experts: usage.json
     sft_manifest: Path | None = None     # the chat SFT data manifest (M12)
+    sft_dir: Path | None = None          # results/sft: chat_samples.json, val_by_source.json
     hardware: str | None = None
 
 
@@ -304,8 +305,9 @@ def _training(inp: CardInputs, cfg, run_cfg: dict | None) -> str:
             led = Ledger.load(inp.ledger)
             last_seen = max((s["last_seen"] for s in led.sessions), default=None)
             spent = led.spent_usd(now=last_seen) if last_seen is not None else led.spent_usd()
-            cost = (f"${spent:.2f} for the whole rented-box session (setup, shard build, A/B "
-                    "runs, the full run, evaluation), from the spend ledger")
+            cost = (f"${spent:.2f} from the spend ledger: GPU session (hourly); excludes "
+                    "Vast bandwidth charges. The GPU box's hours (setup, A/B runs, the full "
+                    "run, the chat fine-tune, evaluation) plus the CPU shard-build box")
         except Exception as exc:  # a corrupt ledger must not break the card
             cost = f"{NOT_MEASURED} (ledger unreadable: {type(exc).__name__})"
     rows.append(("Cost", cost))
@@ -581,6 +583,60 @@ def _samples(inp: CardInputs) -> str:
             "unedited: good and bad alike.\n\n" + "\n".join(lines)).strip()
 
 
+def _held_out_table(held: Any) -> str | None:
+    """The SFT's held-out chat loss per source (quipu.train write_val_by_source)."""
+    sources = (held or {}).get("sources") if isinstance(held, dict) else None
+    if not isinstance(sources, dict) or not sources:
+        return None
+    lines = ["| source | held-out loss (nats per assistant token) | assistant tokens |",
+             "|---|---:|---:|"]
+    for name, v in sources.items():
+        if not isinstance(v, dict) or not isinstance(v.get("loss"), (int, float)):
+            continue
+        n = v.get("assistant_tokens")
+        lines.append(f"| {name} | {v['loss']:.4f} | "
+                     f"{f'{n:,}' if isinstance(n, int) else '-'} |")
+    return "\n".join(lines) if len(lines) > 2 else None
+
+
+def _chat_samples(inp: CardInputs) -> str:
+    """The chat card's samples: scripts/chat_eval.py's chat_samples.json (two fixed
+    prompts per language, the chat template, temperature 0, from the CHAT model) and
+    the SFT's held-out loss per source (from that file, else val_by_source.json).
+    Never the base model's pretraining samples; NOT_MEASURED for whatever is missing."""
+    sft = Path(inp.sft_dir) if inp.sft_dir else None
+    data = _json(sft / "chat_samples.json") if sft else None
+    held = (data or {}).get("val_by_source") if isinstance(data, dict) else None
+    if not held and sft:
+        held = _json(sft / "val_by_source.json")
+    table = _held_out_table(held)
+    parts = ["Held-out chat loss per source (the SFT's validation conversations, "
+             "micro-batch 1): " + ("" if table else NOT_MEASURED)]
+    if table:
+        parts[0] = parts[0].rstrip(": ") + ":\n\n" + table
+    samples = (data or {}).get("samples") if isinstance(data, dict) else None
+    if not isinstance(samples, dict) or not samples:
+        parts.append(f"Chat samples: {NOT_MEASURED} (scripts/chat_eval.py writes them).")
+        text = "\n\n".join(parts)
+        return text if table else NOT_MEASURED + " " + text
+    dec = (data or {}).get("decoding") or {}
+    cap = dec.get("max_new_tokens")
+    lines = ["Replies of the chat model to two fixed prompts per language, one user turn in "
+             "the chat template, temperature 0 (greedy), unedited: good and bad alike."
+             + (f" A reply marked (cut) hit the {cap}-token cap." if cap else ""), ""]
+    for lang, rows in samples.items():
+        for r in rows or []:
+            reply = str(r.get("reply", "")).replace("```", "'''")
+            if len(reply) > 600:
+                reply = reply[:600] + " ..."
+            cut = r.get("finish") == "length"
+            lines += [f"**{lang}: {str(r.get('prompt', '')).strip()}**"
+                      + (f" (cut at {cap} tokens)" if cut and cap else " (cut)" if cut else ""),
+                      "", "```", reply, "```", ""]
+    parts.append("\n".join(lines).strip())
+    return "\n\n".join(parts)
+
+
 # The chat fine-tune's sources (spec 13) when the SFT manifest is not there yet:
 # (key, dataset, licence, the config field holding its pinned revision).
 SFT_DEFAULTS = [
@@ -691,7 +747,12 @@ def fields(cfg, inp: CardInputs, *, variant: str = "base", total: int | None = N
         "lid_model": cfg.data.lid_model,
         "bpb": _bpb(inp), "code_eval": _code_eval(inp, [base_name, base_name + "-chat"]
                                                   if variant == "chat" else [base_name], params),
-        "int4": _int4(inp), "experts": _experts(inp), "samples": _samples(inp),
+        "int4": _int4(inp), "experts": _experts(inp),
+        # The chat card shows the chat model's replies, never the base model's
+        # pretraining samples.
+        "samples": _chat_samples(inp) if variant == "chat" else _samples(inp),
+        "samples_title": "Chat samples and held-out chat loss" if variant == "chat"
+        else "Samples",
         "mix_limitation": _mix_limitation(inp),
         "code_limitation": _code_limitation(inp, name),
         "experts_limitation": EXPERTS_LIMITATION,
@@ -704,8 +765,8 @@ def fields(cfg, inp: CardInputs, *, variant: str = "base", total: int | None = N
         f["sft_credits"] = _sft_credits(srcs)
         f["chat_limitation"] = (
             "- This chat model had one short supervised fine-tune (data above). How well it "
-            "follows instructions was not measured separately; only the chat-mode HumanEval "
-            "/ MBPP numbers above measure it.")
+            "follows instructions was not measured beyond the held-out chat loss per source, "
+            "the fixed-prompt replies and the chat-mode HumanEval / MBPP numbers above.")
         f["kind_line"] = (f"This is the **chat model**: {base_name} after a short supervised "
                           "fine-tune on human-written conversations (spec 13).")
         f["base_model_yaml"] = f"base_model: AneekC/{base_name}\n"

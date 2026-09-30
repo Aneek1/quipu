@@ -83,7 +83,7 @@ Project page: <https://quipu-lm.vercel.app> · Code: <https://github.com/Aneek1/
 
 {{experts}}
 
-### Samples
+### {{samples_title}}
 
 {{samples}}
 

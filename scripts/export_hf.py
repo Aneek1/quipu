@@ -497,6 +497,9 @@ def main(argv: list[str] | None = None) -> int:
     moe.add_argument("--code-eval-dir", default="results/code_eval")
     moe.add_argument("--experts-dir", default="results/experts")
     moe.add_argument("--sft-manifest", default=None)
+    moe.add_argument("--sft-dir", default="results/sft",
+                     help="the chat card's chat_samples.json (scripts/chat_eval.py) and "
+                          "val_by_source.json")
     moe.add_argument("--hardware", default=None, help='e.g. "1 x RTX 5090 (rented, Vast.ai)"')
     args = ap.parse_args(argv)
 
@@ -514,7 +517,8 @@ def main(argv: list[str] | None = None) -> int:
                         manifest=p(args.manifest) or shards / "manifest.json",
                         ledger=p(args.ledger), milestones_dir=p(args.milestones_dir),
                         code_eval_dir=p(args.code_eval_dir), experts_dir=p(args.experts_dir),
-                        sft_manifest=p(args.sft_manifest), hardware=args.hardware)
+                        sft_manifest=p(args.sft_manifest), sft_dir=p(args.sft_dir),
+                        hardware=args.hardware)
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() and torch.cuda.device_count() else "cpu"
