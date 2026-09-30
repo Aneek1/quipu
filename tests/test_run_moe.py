@@ -819,7 +819,7 @@ def test_the_plan_uses_the_gates_longest_save_or_the_default(tmp_path):
     assert make_launcher(tmp_path / "a", clock, with_saves, budget=20.0,
                          gate_minutes=5.0).run() == 0
     plan = json.loads((tmp_path / "a" / "results" / "moe" / "plan.json").read_text("utf-8"))
-    assert plan["save_s"] == 40.0 and plan["save_observed"] and plan["eval_s"] == 30.0
+    assert plan["save_s"] == 40.0 and plan["save_observed"] and plan["eval_s"] == rm.EVAL_OVERHEAD_S == 90.0
     md = (tmp_path / "a" / "results" / "moe" / "plan.md").read_text(encoding="utf-8")
     assert "longest save the gate reported" in md
     assert make_launcher(tmp_path / "b", clock, FakeTrainer(clock, tps=BT / 2.0), budget=20.0,

@@ -138,7 +138,11 @@ DEFAULT_CKPT_DIR = "checkpoints/quipu-moe"
 GATE_MINUTES = 15.0
 RESERVE_USD = 1.00          # chat SFT (~$0.25, spec 13) + evals + copy-back
 HEADROOM = 0.05             # plan at 95% of the measured tokens/s
-EVAL_OVERHEAD_S = 30.0      # one eval (eval_batches forwards), per eval_every steps
+# One eval, per eval_every steps: the mix-weighted evaluation (quipu.train) reads
+# eval_batches of English and of code plus a quarter of that for each of the nine
+# languages, ~4x the English-only eval's forwards; the long run's first interval
+# re-fits the plan if this is still short.
+EVAL_OVERHEAD_S = 90.0
 SAVE_OVERHEAD_S = 60.0      # one checkpoint save when the gate saw none, per ckpt_every
 REFIT_TOLERANCE = 0.02      # the long run's first interval this much slower: re-fit
 GO_MAX_WAIT_MIN = 90.0      # the GO wait gives up after this long (exit 5)
