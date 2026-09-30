@@ -63,7 +63,23 @@ where that cannot work (no Triton on CUDA, no C++ compiler for CPU inductor on
 Windows) it warns and trains eagerly. Because torch.compile is lazy, one trial step
 on a synthetic batch runs at startup; a compile that fails there also falls back to
 eager (see Trainer._compile). Evaluation always runs the eager module, and the
-un-compiled module is what is checkpointed.
+un-compiled module is what is checkpointed. The outcome ("on (inductor)", "off",
+"skipped: ...", "fell back: ...") goes to the run log under "compile" and to stdout
+as a "compile: ..." line; a compiled run also logs dynamo's counters (unique graphs,
+graph breaks, recompile_limit hits; compile_stats) every eval_every steps, under
+"compile_stats" and as a "compile stats at step N: ..." line, so a recompile storm
+is visible in the run's own log (scripts/remote/preflight.sh reads it).
+
+Mix-weighted evaluation (pretraining on data v2 shards: code_val and val_lang/*
+beside val, text_language_weights in the config; quipu.evalsets.mix_weights): at
+every eval step, besides the English val loss (estimate_loss, as before), the loss
+over fixed batches of code_val (eval_batches) and of each val_lang bucket
+(eval_batches // MIX_LANG_BATCH_DIVISOR), loop dispatch, eager model; the eval entry
+gets "split_losses" and "weighted_loss" (weights = the data mix: code 0.60, English
+0.28, the nine languages 0.12 split by their text weights), and the run log an
+"eval_mix" note with the weights and batch counts. "val_loss" stays English, so
+quipu-114m (no val_lang) and everything that reads it are unchanged. The A/B runs
+decide on weighted_loss (scripts/ab_runs.py).
 
 train.precision "fp8" (spec section 12) converts attention q/k/v/o and the
 shared-expert linears to FP8 matmuls (quipu.fp8) right after the model is built,
@@ -146,6 +162,10 @@ BALANCE_SAMPLE_TOKENS = 65_536
 # BPE tokenizer (fixed low ids, the same in every tokenizer trained here; the chat
 # data needs that tokenizer). SFT leaves it out of the balance update.
 SFT_PAD_ID = SPECIAL_TOKENS.index(BPE_EOT)
+# The mix-weighted evaluation reads eval_batches batches of English (val) and code
+# (code_val), and eval_batches // this (at least 1) of each other language (each
+# weighs ~1.3% of the mix; nine of them at full size would triple the eval time).
+MIX_LANG_BATCH_DIVISOR = 4
 # torch.compile backend for train.compile. Tests use "eager" to run real dynamo
 # without Triton or a C++ compiler.
 COMPILE_BACKEND = "inductor"
@@ -344,6 +364,24 @@ def _bf16_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return out
 
 
+_RECOMPILE_LIMIT = re.compile(r"recompile.limit", re.IGNORECASE)
+
+
+def compile_stats() -> dict[str, int]:
+    """torch._dynamo's counters so far in this process: unique graphs compiled, graph
+    breaks (all reasons), and recompile_limit hits (dynamo records each as an
+    "unimplemented" entry, "Dynamo recompile limit exceeded"; after one, that frame
+    runs eagerly for good)."""
+    import torch._dynamo.utils as dynamo_utils
+
+    counters = dynamo_utils.counters
+    limit_hits = sum(n for cat in counters.values() for msg, n in cat.items()
+                     if _RECOMPILE_LIMIT.search(str(msg)))
+    return {"unique_graphs": int(counters["stats"].get("unique_graphs", 0)),
+            "graph_breaks": int(sum(counters["graph_break"].values())),
+            "recompile_limit_hits": int(limit_hits)}
+
+
 def _compile_unavailable(device: str) -> str | None:
     """Why torch.compile cannot work here with COMPILE_BACKEND, or None if it can.
     torch.compile itself is lazy (failures surface at the first forward), so the
@@ -398,6 +436,8 @@ class Trainer:
         run_id: str,
         val_dir: str | Path | None = None,
         resume: bool = False,
+        mix_splits: dict[str, Path] | None = None,
+        mix_weights: dict[str, float] | None = None,
     ) -> None:
         # The spend backstop counts from here: model build and compile are box time too.
         self.started_at = _clock()
@@ -429,6 +469,21 @@ class Trainer:
         self.val_stream = (
             stream_cls(val_dir, train_cfg.micro_batch, model_cfg.context) if val_dir else None
         )
+        # The mix-weighted evaluation (quipu.evalsets.mix_weights): besides the English
+        # val stream, fixed batches of every other weighted split, read once here.
+        self.mix_weights: dict[str, float] = {}
+        self.mix_batches: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        if mix_weights and mix_splits and self.val_stream is not None:
+            from quipu.evalsets import ENGLISH, CODE, split_batches
+            self.mix_weights = {k: float(v) for k, v in mix_weights.items()
+                                if k == ENGLISH or k in mix_splits}
+            for label in self.mix_weights:
+                if label == ENGLISH:
+                    continue
+                n = (train_cfg.eval_batches if label == CODE
+                     else max(1, train_cfg.eval_batches // MIX_LANG_BATCH_DIVISOR))
+                self.mix_batches[label] = split_batches(
+                    mix_splits[label], train_cfg.micro_batch, model_cfg.context, n)
         epoch_cap = None
         if train_cfg.mode == "sft" and train_cfg.max_epochs > 0:
             train_cfg, epoch_cap = self._cap_epochs(train_cfg)
@@ -479,8 +534,18 @@ class Trainer:
             raise RunLogUnreadable(str(exc)) from exc
         if epoch_cap is not None:
             self._safe_log(self.log.note, "sft_epoch_cap", epoch_cap)
+        if self.mix_weights:
+            batches = {"eng_Latn": train_cfg.eval_batches,
+                       **{k: len(v) for k, v in self.mix_batches.items()}}
+            self._safe_log(self.log.note, "eval_mix", {
+                "weights": self.mix_weights, "batches": batches,
+                "metric": "weighted_loss = sum(weight x split loss) / sum(weight); "
+                          "val_loss stays the English split's"})
         if train_cfg.compile:
             self._compile()
+        else:
+            print("compile: off (train.compile false)", flush=True)
+            self._safe_log(self.log.note, "compile", "off")
 
     def _cap_epochs(self, cfg: TrainConfig) -> tuple[TrainConfig, dict[str, Any] | None]:
         """train.max_epochs: at most that many passes over the training blocks. When
@@ -528,6 +593,7 @@ class Trainer:
         if reason is not None:
             print(f"warning: torch.compile unavailable ({reason}); training without it",
                   file=sys.stderr, flush=True)
+            print(f"compile: skipped: {reason}", flush=True)
             self._safe_log(self.log.note, "compile", f"skipped: {reason}")
             return
         import torch._dynamo as dynamo        # `as`: a bare import would shadow torch here
@@ -541,10 +607,47 @@ class Trainer:
             failure = f"{type(exc).__name__}: {first}"
             print(f"warning: torch.compile failed at the first forward ({failure}); "
                   "falling back to eager training", file=sys.stderr, flush=True)
+            print(f"compile: fell back: {failure}", flush=True)
             self._safe_log(self.log.note, "compile", f"fell back: {failure}")
             return
         dynamo.config.suppress_errors = True
+        print(f"compile: on ({COMPILE_BACKEND})", flush=True)
         self._safe_log(self.log.note, "compile", f"on ({COMPILE_BACKEND})")
+
+    def _eval_mix(self, loss: float, val: float) -> None:
+        """Every other weighted split's loss (eager model, loop dispatch), and the
+        mix-weighted loss, into the run log's eval entry beside the English val_loss."""
+        from quipu.eval import mean_loss
+        from quipu.evalsets import ENGLISH, weighted_loss
+
+        losses = {ENGLISH: val}
+        for label, batches in self.mix_batches.items():
+            losses[label] = mean_loss(self.model, batches, self.device)
+        if self.is_moe:
+            self.model.clear_balance_scores()     # eval forwards never reach the balancer
+        losses = {k: losses[k] for k in self.mix_weights if k in losses}
+        weighted = weighted_loss(losses, self.mix_weights)
+        self._safe_log(self.log.log_eval, self.step, val, split_losses=losses,
+                       weighted_loss=weighted)
+        print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}  weighted {weighted:.4f}",
+              flush=True)
+        print("  split losses: " + "  ".join(f"{k} {v:.4f}" for k, v in losses.items()),
+              flush=True)
+
+    def _log_compile_stats(self) -> None:
+        """A compiled run: dynamo's counters so far (compile_stats) to the run log
+        ("compile_stats", with the step) and stdout. Never fatal."""
+        if not self.compiled:
+            return
+        try:
+            stats = compile_stats()
+        except Exception as exc:          # counters are a report, never a reason to stop
+            print(f"warning: no compile stats ({exc})", file=sys.stderr, flush=True)
+            return
+        print(f"compile stats at step {self.step}: {stats['unique_graphs']} unique graphs, "
+              f"{stats['graph_breaks']} graph breaks, {stats['recompile_limit_hits']} "
+              "recompile_limit hits", flush=True)
+        self._safe_log(self.log.note, "compile_stats", {"step": self.step, **stats})
 
     def _trial_compiled_step(self) -> None:
         """One forward + backward through forward_model on a synthetic batch (random
@@ -1077,12 +1180,18 @@ class Trainer:
                     # force a recompile (or a compile failure) mid-run.
                     val = estimate_loss(self.model, self.val_stream,
                                         cfg.eval_batches, self.device)
-                    self._safe_log(self.log.log_eval, self.step, val)
-                    print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}", flush=True)
+                    if self.mix_weights:
+                        self._eval_mix(loss, val)
+                    else:
+                        self._safe_log(self.log.log_eval, self.step, val)
+                        print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}",
+                              flush=True)
                 # Milestone before checkpoint: a resume from checkpoint N starts after
                 # step N, so milestone N must already be on disk by then.
                 if self.step in milestones or self.step == cfg.steps:
                     self.save_milestone()
+                if self.step % cfg.eval_every == 0:
+                    self._log_compile_stats()
                 if self.step % cfg.ckpt_every == 0:
                     self.save_checkpoint()
                     saved_at = self.step
@@ -1236,13 +1345,24 @@ def main(argv: list[str] | None = None) -> None:
         print(f"warning: no validation shards in {val_dir}; training without evaluation",
               file=sys.stderr, flush=True)
         val_dir = None
+    # Pretraining on data v2 shards (code_val and val_lang next to val, text weights in
+    # the config): the mix-weighted evaluation. Anything else (quipu-114m, the SFT)
+    # evaluates English val only, as before.
+    mix_splits = mix = None
+    if cfg.train.mode == "pretrain" and val_dir is not None:
+        from quipu import evalsets
+        mix = evalsets.mix_weights(cfg.data, cfg.data.shard_dir) or None
+        if mix:
+            mix_splits = evalsets.eval_splits(cfg.data.shard_dir)
+            print("mix-weighted evaluation: " + ", ".join(
+                f"{k} {v:.4f}" for k, v in mix.items()), flush=True)
     try:
         trainer = Trainer(
             model_cfg=cfg.model, train_cfg=cfg.train,
             shard_dir=Path(cfg.data.shard_dir) / "train",
             val_dir=val_dir,
             device=device, run_dir=args.run_dir, run_id=args.run_id,
-            resume=args.resume,
+            resume=args.resume, mix_splits=mix_splits, mix_weights=mix,
         )
     except FileExistsError as exc:
         raise UsageError(

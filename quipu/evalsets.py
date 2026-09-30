@@ -30,7 +30,9 @@ loudly instead of evaluating half-random weights.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -84,6 +86,66 @@ def eval_splits(shard_dir: str | Path) -> dict[str, Path]:
     if _has_shards(root / "code_val"):
         found[CODE] = root / "code_val"
     return {k: found[k] for k in sorted(found, key=_order)}
+
+
+# val_lang buckets that are one script of a source language (build_shards.py's
+# text_buckets under --lid-filter; quipu.shard_mix.ZH_BUCKETS), for a shard set whose
+# manifest does not name each bucket's source.
+_BUCKET_SOURCE = {"zho_Hans": "cmn_Hani", "zho_Hant": "cmn_Hani"}
+
+
+def mix_weights(data_cfg: Any, shard_dir: str | Path) -> dict[str, float]:
+    """The data mix as weights over the evaluation splits (eval_splits labels, in its
+    order), for the mix-weighted validation loss: code = data.code_share on code_val,
+    English = (1 - code_share) x text_language_weights["eng_Latn"] on val, and each
+    val_lang bucket (1 - code_share) x its source language's text weight, shared
+    equally between the buckets of one source (zho_Hans / zho_Hant split cmn_Hani's).
+    A bucket's source is the manifest's (splits.val_lang.<bucket>.source) when the
+    shard set has one, else the bucket name (zho_Hans / zho_Hant -> cmn_Hani). A
+    bucket whose source has no text weight gets none (left out).
+
+    {} (no mix: the trainer evaluates English only, as before) unless the config has
+    text_language_weights (data v2) AND the shard set has code_val and val_lang:
+    quipu-114m has code_val but neither of the others, so it is unaffected. The
+    weights are not renormalised; weighted_loss divides by those present."""
+    text = dict(getattr(data_cfg, "text_language_weights", None) or {})
+    splits = eval_splits(shard_dir)
+    buckets = [k for k in splits if k not in (ENGLISH, CODE)]
+    if not text or ENGLISH not in text or CODE not in splits or not buckets:
+        return {}
+    sources: dict[str, str] = {}
+    manifest = Path(shard_dir) / "manifest.json"
+    if manifest.is_file():
+        try:
+            lang = json.loads(manifest.read_text(encoding="utf-8"))["splits"]["val_lang"]
+            sources = {b: str(v["source"]) for b, v in lang.items()
+                       if isinstance(v, dict) and "source" in v}
+        except (OSError, ValueError, KeyError, TypeError):
+            sources = {}
+    source_of = {b: sources.get(b, _BUCKET_SOURCE.get(b, b)) for b in buckets}
+    code_share = float(data_cfg.code_share)
+    per_source: dict[str, int] = {}
+    for b, src in source_of.items():
+        per_source[src] = per_source.get(src, 0) + 1
+    out: dict[str, float] = {}
+    for label in splits:
+        if label == CODE:
+            out[label] = code_share
+        elif label == ENGLISH:
+            out[label] = (1 - code_share) * text[ENGLISH]
+        elif source_of[label] in text and source_of[label] != ENGLISH:
+            out[label] = (1 - code_share) * text[source_of[label]] / per_source[source_of[label]]
+    return out
+
+
+def weighted_loss(losses: dict[str, float], weights: dict[str, float]) -> float:
+    """sum(weight x loss) / sum(weight) over the splits in both (the weights of the
+    splits that were evaluated, renormalised)."""
+    keys = [k for k in losses if weights.get(k, 0) > 0]
+    total = sum(weights[k] for k in keys)
+    if total <= 0:
+        raise ValueError("weighted_loss: no split with a weight")
+    return sum(weights[k] * losses[k] for k in keys) / total
 
 
 def read_split(split_dir: str | Path, max_tokens: int) -> np.ndarray:

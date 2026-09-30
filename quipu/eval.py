@@ -79,6 +79,36 @@ def estimate_loss(
 
 
 @torch.no_grad()
+def mean_loss(
+    model: nn.Module, batches: Iterable[tuple[torch.Tensor, torch.Tensor]], device: str,
+    amp: bool = True,
+) -> float:
+    """Mean cross-entropy per target token over fixed (x, y) batches (a short last
+    batch weighs by its tokens), loop dispatch, the training autocast on CUDA as in
+    estimate_loss. The model's training mode is put back. For the trainer's
+    per-split evaluation (quipu.evalsets.split_batches)."""
+    was_training = model.training
+    model.eval()
+    nll = torch.zeros((), dtype=torch.float64, device=device)
+    n = 0
+    try:
+        with loop_dispatch(model), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=amp and str(device).startswith("cuda")
+        ):
+            for x, y in batches:
+                logits = model(x.to(device))
+                nll += F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                       y.to(device).reshape(-1), reduction="sum").double()
+                n += y.numel()
+    finally:
+        if was_training:
+            model.train()
+    if n == 0:
+        raise ValueError("mean_loss: no batches")
+    return float(nll) / n
+
+
+@torch.no_grad()
 def bits_per_byte(
     model: nn.Module,
     batches: Iterable[tuple[torch.Tensor, torch.Tensor]],

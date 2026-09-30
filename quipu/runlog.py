@@ -81,8 +81,10 @@ class RunLog:
         )
         self._flush()
 
-    def log_eval(self, step: int, val_loss: float) -> None:
-        self.record["evals"].append({"step": step, "val_loss": val_loss})
+    def log_eval(self, step: int, val_loss: float, **extra: Any) -> None:
+        """val_loss is the English val split's; extra (the mix-weighted evaluation:
+        split_losses, weighted_loss) is stored beside it."""
+        self.record["evals"].append({"step": step, "val_loss": val_loss, **extra})
         self._flush()
 
     def log_moe(self, step: int, layers: list[dict[str, Any]]) -> None:

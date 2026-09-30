@@ -426,6 +426,60 @@ def test_evaluation_runs_the_eager_model_not_the_compiled_one(tmp_path, stub_com
     assert len(logged(tmp_path)["evals"]) == 2
 
 
+def test_compile_off_is_logged_and_printed(tmp_path, capsys):
+    build(tmp_path, smoke(tmp_path), make_data(tmp_path))
+    assert logged(tmp_path)["compile"] == "off"
+    assert "compile: off (train.compile false)" in capsys.readouterr().out
+
+
+def test_every_compile_outcome_is_printed_on_stdout(tmp_path, monkeypatch, stub_compile,
+                                                    capsys):
+    stub_compile(lambda stub: False)
+    build(tmp_path / "a", smoke(tmp_path / "a", compile=True), make_data(tmp_path))
+    assert "compile: on (inductor)" in capsys.readouterr().out
+    monkeypatch.setattr(train_mod, "_compile_unavailable", lambda device: "no Triton here")
+    build(tmp_path / "b", smoke(tmp_path / "b", compile=True), make_data(tmp_path))
+    assert "compile: skipped: no Triton here" in capsys.readouterr().out
+
+
+def test_compile_stats_count_graph_breaks_and_recompile_limit_hits(monkeypatch):
+    from collections import Counter, defaultdict
+
+    import torch._dynamo.utils as dynamo_utils
+
+    fake = defaultdict(Counter)
+    fake["stats"]["unique_graphs"] = 7
+    fake["graph_break"]["bincount"] = 3
+    fake["graph_break"][".tolist()"] = 2
+    fake["unimplemented"]["Dynamo recompile limit exceeded\n  Explanation: ..."] = 4
+    fake["unimplemented"]["something else"] = 9
+    monkeypatch.setattr(dynamo_utils, "counters", fake)
+    assert train_mod.compile_stats() == {
+        "unique_graphs": 7, "graph_breaks": 5, "recompile_limit_hits": 4}
+
+
+def test_a_compiled_run_logs_its_compile_stats_every_eval_interval(tmp_path, stub_compile,
+                                                                   monkeypatch, capsys):
+    stub_compile(lambda stub: False)
+    stats = {"unique_graphs": 2, "graph_breaks": 1, "recompile_limit_hits": 0}
+    monkeypatch.setattr(train_mod, "compile_stats", lambda: dict(stats))
+    cfg = smoke(tmp_path, compile=True, eval_every=1)
+    trainer = build(tmp_path, cfg, make_data(tmp_path))
+    trainer.train_cfg = dataclasses.replace(cfg.train, total_tokens=2 * cfg.train.batch_tokens)
+    trainer.run()
+    assert logged(tmp_path)["compile_stats"] == {"step": 2, **stats}
+    out = capsys.readouterr().out
+    assert "compile stats at step 1: 2 unique graphs, 1 graph breaks, 0 recompile_limit hits" in out
+
+
+def test_an_eager_run_logs_no_compile_stats(tmp_path):
+    cfg = smoke(tmp_path, eval_every=1)
+    trainer = build(tmp_path, cfg, make_data(tmp_path))
+    trainer.train_cfg = dataclasses.replace(cfg.train, total_tokens=cfg.train.batch_tokens)
+    trainer.run()
+    assert "compile_stats" not in logged(tmp_path)
+
+
 def test_dense_adamw_lr_is_exactly_the_schedule_lr(tmp_path):
     # quipu-114m before M6 set group["lr"] = lr_at(step); base_lr x (lr / cfg.lr) can
     # differ from lr in the last bit.
