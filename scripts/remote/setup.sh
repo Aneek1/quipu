@@ -79,7 +79,8 @@ fi
 
 # ---------------------------------------------------------------- system packages
 missing=()
-for pkg in git curl ca-certificates build-essential; do
+# python3: the system python runs `python3 -m quipu.spend` (stdlib only) outside the venv.
+for pkg in git curl ca-certificates build-essential python3; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -87,7 +88,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
     $SUDO apt-get update -y
     $SUDO apt-get install -y --no-install-recommends "${missing[@]}"
 else
-    log "git, curl, ca-certificates, build-essential already installed"
+    log "git, curl, ca-certificates, build-essential, python3 already installed"
 fi
 
 # ---------------------------------------------------------------- Node

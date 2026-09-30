@@ -35,7 +35,7 @@ batch_tokens  = 131_072        # 64 blocks of 2048 (grad_accum 16 at the inherit
 milestones    = []             # the final step is kept as a milestone anyway
 ckpt_dir      = "checkpoints/quipu-moe-sft"
 ckpt_every    = 100
-ckpt_keep     = 2
+ckpt_keep     = 1              # ~12 GB each; the pretraining checkpoints share the disk
 eval_every    = 50
 eval_batches  = 10
 # The spend backstop is never 0 for the SFT: the box passes what is left of the $20
