@@ -860,7 +860,14 @@ for s in behave.get("saves", []):
 if behave.get("oom"):
     print("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB", flush=True)
     sys.exit(1)
-log["evals"].append({"step": len(losses), "val_loss": behave.get("val", 3.0)})
+entry = {"step": len(losses), "val_loss": behave.get("val", 3.0)}
+if "weighted" in behave:
+    entry.update(split_losses=behave["splits"], weighted_loss=behave["weighted"])
+log["evals"].append(entry)
+if "compile" in behave:
+    log["compile"] = behave["compile"]
+if "compile_stats" in behave:
+    log["compile_stats"] = behave["compile_stats"]
 log["status"] = "completed"
 path.write_text(json.dumps(log))
 sys.exit(behave.get("exit", 0))
@@ -922,6 +929,91 @@ def test_healthy_fake_run_reports_val_loss_and_throughput(tmp_path, monkeypatch)
     assert r.status == "completed" and r.final_val_loss == 2.5
     assert r.tokens_per_s == 1000.0 and r.spikes == 0 and len(r.train_losses) == 12
     assert r.max_save_s is None
+
+
+def test_the_runner_decides_on_the_weighted_loss_when_the_trainer_logged_one(
+        tmp_path, monkeypatch):
+    splits = {"eng_Latn": 2.5, "ind_Latn": 3.1, "code": 1.2}
+    behave = {"losses": [3.0] * 3, "val": 2.5, "weighted": 1.7, "splits": splits,
+              "compile": "off"}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave)
+    o = orch(tmp_path, runner, arm_tokens=3 * 524_288)
+    spec = one_spec(o)
+    r = runner(spec, o.context_for(spec, None))
+    assert (r.status, r.final_val_loss, r.metric) == ("completed", 1.7, "weighted")
+    assert r.english_val_loss == 2.5 and r.split_losses == splits
+    assert r.compile == "off" and r.compile_stats is None
+
+
+def test_the_runner_falls_back_to_english_val_loss_without_a_mix(tmp_path, monkeypatch):
+    stats = {"step": 3, "unique_graphs": 40, "graph_breaks": 96, "recompile_limit_hits": 8}
+    behave = {"losses": [3.0] * 3, "val": 2.5, "compile": "on (inductor)",
+              "compile_stats": stats}
+    runner = fake_subprocess_runner(tmp_path, monkeypatch, behave)
+    o = orch(tmp_path, runner, arm_tokens=3 * 524_288)
+    spec = one_spec(o)
+    r = runner(spec, o.context_for(spec, None))
+    assert (r.final_val_loss, r.metric, r.english_val_loss) == (2.5, "val", 2.5)
+    assert r.split_losses is None
+    assert r.compile == "on (inductor)" and r.compile_stats == stats
+
+
+def _mixed(spec):
+    r = val_by_settings(spec)
+    w = r.final_val_loss
+    return dataclasses.replace(
+        r, metric="weighted", english_val_loss=w + 1.0,
+        split_losses={"eng_Latn": w + 1.0, "zho_Hans": w + 2.0, "code": w - 0.5},
+        compile="off")
+
+
+def test_summary_names_the_weighted_metric_and_prints_every_split(tmp_path):
+    clock = FakeClock()
+    o = orch(tmp_path, FakeRunner(clock, _mixed), clock, skip_sweeps=True,
+             pairs=("attnres",), bytes_per_token=4.0)
+    o.run()
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    assert "Decision metric: **mix-weighted validation loss**" in summary
+    assert "## Per-split validation loss" in summary
+    header = next(ln for ln in summary.splitlines() if ln.startswith("| run | weighted"))
+    assert "eng_Latn" in header and "zho_Hans" in header and "code" in header
+    row = next(ln for ln in summary.splitlines() if ln.startswith("| p2-attnres | "))
+    assert "2.4500" in row                      # val_by_settings: 3.0 - 0.05 + ... code
+    runs_header = next(ln for ln in summary.splitlines() if ln.startswith("| # |"))
+    assert "compile" in runs_header and "english val" in runs_header
+    p2 = next(ln for ln in summary.splitlines() if "| p2-attnres |" in ln and ln.startswith("| 2"))
+    assert "| off |" in p2
+    # bits per byte comes from the English loss, not the weighted one.
+    r = o.results[o.key(next(rec["spec"] for rec in o.records if rec["spec"].name == "p1-base"))]
+    assert r.bpb == pytest.approx(r.english_val_loss / (math.log(2) * 4.0))
+
+
+def test_summary_says_when_it_decided_on_english_only(tmp_path):
+    clock = FakeClock()
+    o = orch(tmp_path, FakeRunner(clock, val_by_settings), clock, skip_sweeps=True,
+             pairs=("attnres",), bytes_per_token=None)
+    o.run()
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    assert "Decision metric: English validation loss" in summary
+    assert "## Per-split validation loss" not in summary
+
+
+def test_summary_flags_runs_decided_on_different_metrics(tmp_path):
+    clock = FakeClock()
+    outcome = lambda spec: _mixed(spec) if spec.name == "p1-base" else val_by_settings(spec)
+    o = orch(tmp_path, FakeRunner(clock, outcome), clock, skip_sweeps=True,
+             pairs=("attnres",), bytes_per_token=None)
+    o.run()
+    summary = (tmp_path / "ab" / "summary.md").read_text(encoding="utf-8")
+    assert "MIXED" in summary
+
+
+def test_the_cache_key_changes_with_the_eval_metric_version(tmp_path, monkeypatch):
+    o = orch(tmp_path, FakeRunner(FakeClock(), val_by_settings), skip_sweeps=True)
+    spec = one_spec(o)
+    before = o.key(spec)
+    monkeypatch.setattr(ab, "EVAL_METRIC", "something-else")
+    assert o.key(spec) != before
 
 
 def test_parse_save_s_reads_the_trainers_checkpoint_line():

@@ -38,6 +38,16 @@ What runs, in order (every run is `python -m quipu.train` with --override flags)
    tokens/s, spikes, decision) and results/ab/winners.toml (the overrides for the
    full run; load_config(path, tomllib.load(winners)) takes it as is).
 
+"Final val loss" above is the DECISION loss: the trainer's mix-weighted validation
+loss at the last eval step (quipu.train, quipu.evalsets.mix_weights: code 0.60 on
+code_val, English 0.28 on val, the nine languages 0.12 on val_lang/* split by their
+text weights) when the shard set has code_val and val_lang (data v2), else the
+English val loss. summary.md says which (a mix of the two is flagged MIXED), prints
+every run's per-split losses, and bpb stays English. EVAL_METRIC is part of the
+cache key, so a result on the old English-only metric is never reused. Each run's
+compile outcome (the trainer's "compile" note and its recompile_limit hits) is a
+summary column; configs/quipu-moe-ab.toml runs every arm eagerly.
+
 Money (the box is billed per hour; the credit is not refundable):
 - Spend is the BOX's, from the shared ledger quipu/spend.py (results/spend.json, or
   $QUIPU_SPEND_LEDGER; outside every --out dir, shared with the M9 launcher): box
@@ -149,6 +159,9 @@ SWEEP_TOKENS = 100_000_000
 ARM_TOKENS = 200_000_000
 ATTNRES_ON = 4                  # four blocks of two layers on the 8-layer scale-down
 DEFAULT_PAIRS = ("optimizer", "attnres", "activation")
+# Part of every run's cache key: results measured on another metric (the English-only
+# val loss before the mix-weighted evaluation) are never compared with these.
+EVAL_METRIC = "weighted-v1"
 
 SPIKE_FACTOR = 1.5
 SPIKE_EMA_BETA = 0.98
@@ -282,6 +295,13 @@ class RunResult:
     startup_s: float | None = None  # process start to the first step line
     overhead_s: float | None = None # wall - tokens / steady tokens/s
     max_save_s: float | None = None # longest checkpoint save the trainer reported
+    # What final_val_loss is: "weighted" (the trainer's mix-weighted loss over code_val,
+    # val and val_lang/*) or "val" (English val only: no mix in this shard set).
+    metric: str = "val"
+    english_val_loss: float | None = None       # the English val split's, always
+    split_losses: dict[str, float] | None = None  # every split's, with the mix
+    compile: str | None = None      # the trainer's "compile" note: on / off / fell back
+    compile_stats: dict[str, Any] | None = None   # its last "compile_stats" note
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -658,7 +678,8 @@ class Orchestrator:
 
     def key(self, spec: RunSpec) -> str:
         blob = json.dumps({"config": self.config_sha, "extra": self.extra,
-                           "settings": spec.settings, "tokens": spec.tokens}, sort_keys=True)
+                           "settings": spec.settings, "tokens": spec.tokens,
+                           "metric": EVAL_METRIC}, sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def steps_for(self, tokens: int) -> int:
@@ -826,8 +847,11 @@ class Orchestrator:
                 ctx: RunContext) -> RunResult:
         if usable(result) and result.bpb is None:
             bpt = self.bytes_per_token()
-            if bpt:
-                result.bpb = result.final_val_loss / (math.log(2) * bpt)
+            english = (result.english_val_loss if result.english_val_loss is not None
+                       else result.final_val_loss)
+            if bpt and english is not None:
+                # bytes per token of the English val batches: English bits per byte.
+                result.bpb = english / (math.log(2) * bpt)
         self._save_cache(key, spec, result)
         self.results[key] = result
         if not self.keep_checkpoints and ctx.ckpt_dir.exists():
@@ -1127,10 +1151,12 @@ class Orchestrator:
         if self.stopped:
             lines.append(f"- **Stopped early ({self.stopped})**: runs after the refused or "
                          "stopped one were not started; missing arms keep the simpler option.")
+        lines.append(self._metric_note())
         lines += ["", "## Runs", "",
-                  "| # | run | config diff | tokens | status | final val loss | bpb | "
-                  "tokens/s | spikes | skipped | startup s | overhead s | decision |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "| # | run | config diff | tokens | status | final loss (decision) | "
+                  "english val | bpb | tokens/s | spikes | skipped | startup s | overhead s "
+                  "| compile | decision |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         seen: set[tuple[str, str]] = set()
         n = 0
         for rec in self.records:
@@ -1147,13 +1173,16 @@ class Orchestrator:
                 status += f"; {rec['note']}"
             lines.append("| " + " | ".join([
                 str(n), spec.name, self.config_diff(spec), f"{spec.tokens:,}", status,
-                _f(r.final_val_loss if r else None), _f(r.bpb if r else None, 4),
+                _f(r.final_val_loss if r else None), _f(r.english_val_loss if r else None),
+                _f(r.bpb if r else None, 4),
                 "-" if r is None or not _tps(r) else f"{_tps(r):,.0f}",
                 "-" if r is None else str(r.spikes),
                 "-" if r is None or r.skipped is None else str(r.skipped),
                 _f(r.startup_s if r else None, 0), _f(r.overhead_s if r else None, 0),
+                _compile_cell(r),
                 "; ".join(self.labels.get(key, [])) or "-",
             ]) + " |")
+        lines += self._split_table()
         lines += ["", "## Overhead", "", self._overhead_note()]
         lines += ["", "## Checkpoint saves", "", self._save_note()]
         lines += ["", "## Learning rates", ""] + [f"- {n_}" for n_ in self.lr_notes]
@@ -1165,13 +1194,75 @@ class Orchestrator:
             lines.append(f"| {pair.number} {pair.name} | {names['simple']} | {names['other']} "
                          f"| {pair.key.split('.', 1)[1]}={names['kept']} ({run}) "
                          f"| {_f(d.noise)} | {reason} |")
-        lines += ["", "Rules: the other option needs lower final val loss by more than the "
-                  "seed noise; AttnRes <= 10% tokens/s cost; SiTU-GLU no more spikes "
+        lines += ["", "Rules (on the decision loss above): the other option needs lower final "
+                  "loss by more than the seed noise; AttnRes <= 10% tokens/s cost; SiTU-GLU no more spikes "
                   f"(step loss > {SPIKE_FACTOR} x EMA, beta {SPIKE_EMA_BETA}); FP8 >= "
                   f"{FP8_MIN_SPEEDUP}x tokens/s, loss within noise, no more spikes. A missing "
                   "arm keeps the simpler option (AdamW, no AttnRes, SwiGLU, bf16).",
                   "", "## winners.toml", "", "```toml", self._winners_toml().rstrip(), "```", ""]
         return "\n".join(lines)
+
+    def _metric_note(self) -> str:
+        """Which loss the decisions compared (every finished run's metric)."""
+        metrics = {r.metric for r in self.results.values()
+                   if r is not None and r.final_val_loss is not None}
+        weights = ""
+        w = self.eval_weights()
+        if w:
+            weights = " (weights " + ", ".join(f"{k} {v:.4f}" for k, v in w.items()) + ")"
+        if metrics == {"weighted"}:
+            return ("- Decision metric: **mix-weighted validation loss**: the trainer's "
+                    "weighted_loss = sum(weight x split loss) / sum(weight) over code_val "
+                    "(code 0.60), val (English 0.28) and val_lang/* (the nine languages "
+                    f"0.12, split by their text weights){weights}, at the last eval step. "
+                    "Per-split losses below; bpb is English.")
+        if metrics == {"val"}:
+            return ("- Decision metric: English validation loss (val/ only): this shard set "
+                    "has no code_val / val_lang, or the config no text_language_weights, so "
+                    "the trainer logged no mix-weighted loss.")
+        if not metrics:
+            return "- Decision metric: none yet (no run finished)."
+        return ("- Decision metric: **MIXED**: some runs logged the mix-weighted loss and "
+                "others only the English val loss; their decision losses are not comparable "
+                "(check the shard set: code_val and val_lang/* must be there for every run).")
+
+    def eval_weights(self) -> dict[str, float]:
+        """The mix weights the trainer uses for this config's shard set ({} = none)."""
+        try:
+            from quipu import evalsets
+
+            shard_dir = Path(self.cfg.data.shard_dir)
+            if not shard_dir.is_absolute():
+                shard_dir = ROOT / shard_dir
+            return evalsets.mix_weights(self.cfg.data, shard_dir)
+        except Exception:          # a report detail, never a reason to stop
+            return {}
+
+    def _split_table(self) -> list[str]:
+        """Per-split validation losses of every run that logged them."""
+        rows = []
+        labels: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for rec in self.records:
+            spec, key = rec["spec"], rec["key"]
+            r = self.results.get(key)
+            if (spec.name, key) in seen or r is None or not r.split_losses:
+                continue
+            seen.add((spec.name, key))
+            rows.append((spec.name, r))
+            labels += [k for k in r.split_losses if k not in labels]
+        if not rows:
+            return []
+        out = ["", "## Per-split validation loss", "",
+               "The last eval of each run (loss per token, nats; weighted = the decision "
+               "loss).", "",
+               "| run | weighted | " + " | ".join(labels) + " |",
+               "|---|---|" + "---|" * len(labels)]
+        for name, r in rows:
+            weighted = r.final_val_loss if r.metric == "weighted" else None
+            out.append(f"| {name} | {_f(weighted)} | "
+                       + " | ".join(_f(r.split_losses.get(k)) for k in labels) + " |")
+        return out
 
     def _overhead_note(self) -> str:
         """The measured per-run overhead against the prior the first estimates used."""
@@ -1225,6 +1316,17 @@ def _checkpoint_step(ckpt_dir: Path) -> int:
         return 0
     steps = [int(m.group(1)) for p in ckpt_dir.iterdir() if (m := _STEP_CKPT.match(p.name))]
     return max(steps, default=0)
+
+
+def _compile_cell(r: RunResult | None) -> str:
+    """The run's compile outcome and, when compiled, dynamo's recompile_limit hits."""
+    if r is None or not r.compile:
+        return "-"
+    text = r.compile
+    if r.compile_stats:
+        text += (f"; {r.compile_stats.get('recompile_limit_hits', '?')} recompile_limit hits, "
+                 f"{r.compile_stats.get('graph_breaks', '?')} graph breaks")
+    return text.replace("|", "/")
 
 
 def _f(x: float | None, digits: int = 4) -> str:
@@ -1496,7 +1598,18 @@ class SubprocessRunner:
         losses = [float(x) for x in losses if x is not None]
         skipped = steps[-1].get("skipped") if steps else None
         evals = record.get("evals") or []
-        val = float(evals[-1]["val_loss"]) if evals else None
+        last = evals[-1] if evals else {}
+        english = float(last["val_loss"]) if "val_loss" in last else None
+        # The decision metric: the mix-weighted loss when the trainer logged one (data
+        # v2 shards), else the English val loss.
+        weighted = last.get("weighted_loss")
+        if isinstance(weighted, (int, float)) and math.isfinite(weighted):
+            val, metric = float(weighted), "weighted"
+            split_losses = {k: float(v) for k, v in (last.get("split_losses") or {}).items()}
+        else:
+            val, metric, split_losses = english, "val", None
+        compile_note = record.get("compile")
+        compile_stats = record.get("compile_stats")
         steady = (statistics.median(tok_s[1:]) if len(tok_s) > 1
                   else (tok_s[0] if tok_s else None))
         eff = spec.tokens / wall if wall > 0 and not resumed else None
@@ -1533,6 +1646,9 @@ class SubprocessRunner:
             startup_s=None if first_step_at is None else first_step_at - t0,
             overhead_s=(wall - spec.tokens / steady) if steady and not resumed else None,
             max_save_s=max(saves) if saves else None,
+            metric=metric, english_val_loss=english, split_losses=split_losses,
+            compile=compile_note if isinstance(compile_note, str) else None,
+            compile_stats=compile_stats if isinstance(compile_stats, dict) else None,
         )
 
 
