@@ -2,6 +2,7 @@
 
     python -m uv run python scripts/build_chat_data.py --config configs/quipu-moe-sft.toml
         [--out DIR] [--limit N] [--sources aya,oasst2,stepbuild] [--no-pack]
+        [--distill-prompts FILE] [--distill-dir DIR]
 
 Sources (human-written, permissive; the revisions are pinned in the config's [data]):
 - aya: CohereForAI/aya_dataset (Apache-2.0), train split, one user turn (inputs) and
@@ -27,6 +28,20 @@ Sources (human-written, permissive; the revisions are pinned in the config's [da
   when its reply alone leaves no room ("reply_too_long") or not even the STEP line
   fits beside it ("prompt_too_long"). The manifest counts the cut prompts under
   "prompts_fitted".
+- distill (only when named in --sources; the default list is the three above): the
+  distillation prompt set (--distill-prompts, default data/distill-prompts/prompts.jsonl;
+  OpenCodeInstruct problems CC-BY-4.0, APPS problems MIT, the row's licence field)
+  with a teacher's answers (--distill-dir, default data/distill-cuda: generations.jsonl
+  and verified.jsonl from scripts/distill_generate.py and distill_verify.py; another
+  arm's directory holds the same file names). An answer is used only when
+  verified.jsonl marks it kept (every assert passed): one user turn (the prompt) and
+  one assistant turn (the teacher's reply, verbatim), language "code". A distill
+  example's split is the prompt set's ("train" / "val"), not the hash below. The
+  manifest records the teacher and its revision (from generations.jsonl; Apache-2.0),
+  the prompt set's manifest sha256 (output.sha256, checked against prompts.jsonl; a
+  verified.jsonl older than generations.jsonl is refused as stale), the
+  problems' licences and the verified rows; verified rows not kept are dropped as
+  "not_kept".
 
 Every example, whatever its source, then goes through, in order (each drop counted
 per source in the manifest):
@@ -43,7 +58,8 @@ per source in the manifest):
   when not even its first assistant turn fits ("too_long").
 
 A kept conversation goes to validation when a hash of its source and id falls below
---val-fraction, else to training. Training conversations are shuffled (--seed) and
+--val-fraction (a distill conversation: when its prompt-set split is "val"), else to
+training. Training conversations are shuffled (--seed) and
 packed greedily into blocks of exactly model.context tokens, each conversation
 followed by <|endoftext|> when there is room and a block padded with <|endoftext|>;
 --no-pack puts one conversation per block. Blocks go to <out>/train/shard_NNN.bin
@@ -83,7 +99,9 @@ MANIFEST_VERSION = 1
 AYA = "aya"
 OASST2 = "oasst2"
 STEPBUILD = "stepbuild"
-SOURCES = (AYA, OASST2, STEPBUILD)
+DISTILL = "distill"
+SOURCES = (AYA, OASST2, STEPBUILD, DISTILL)
+DEFAULT_SOURCES = (AYA, OASST2, STEPBUILD)      # distill only when asked for
 
 AYA_DATASET = "CohereForAI/aya_dataset"
 AYA_FILES = ("data/train-00000-of-00001.parquet",)
@@ -91,8 +109,12 @@ AYA_COLUMNS = ["inputs", "targets", "language", "language_code"]
 OASST2_DATASET = "OpenAssistant/oasst2"
 OASST2_COLUMNS = ["message_id", "parent_id", "message_tree_id", "text", "role", "lang",
                   "deleted", "review_result", "rank", "synthetic", "created_date"]
+DISTILL_PROBLEM_LICENSES = {"opencodeinstruct": "CC-BY-4.0", "apps": "MIT"}
+DISTILL_TEACHER_LICENSE = "Apache-2.0"
 LICENSES = {AYA: "Apache-2.0", OASST2: "Apache-2.0",
-            STEPBUILD: "per repository (permissive; the row's licence field)"}
+            STEPBUILD: "per repository (permissive; the row's licence field)",
+            DISTILL: ("problems per row (OpenCodeInstruct CC-BY-4.0, APPS MIT); "
+                      f"teacher answers {DISTILL_TEACHER_LICENSE}")}
 
 # Spec 11's ten languages, as the rest of the build labels them (cmn_Hani split into
 # Simplified and Traditional; Hindi in Devanagari and romanised; Urdu romanised only).
@@ -204,7 +226,8 @@ def language_map_doc() -> dict[str, Any]:
                 out[code] = ("by dominant script: " + ", ".join(
                     f"{s} -> {lab}" for s, lab in rule[1].items()) + "; other scripts dropped")
         return out
-    return {AYA: doc(AYA_LANGUAGES), OASST2: doc(OASST2_LANGUAGES), STEPBUILD: {"*": CODE}}
+    return {AYA: doc(AYA_LANGUAGES), OASST2: doc(OASST2_LANGUAGES), STEPBUILD: {"*": CODE},
+            DISTILL: {"*": CODE}}
 
 
 # ---- examples ------------------------------------------------------------------------------
@@ -216,6 +239,7 @@ class Example:
     language: str
     messages: list[dict[str, str]]
     licence: str = ""
+    split: str | None = None      # a fixed split ("train" / "val"); None: is_val decides
 
 
 @dataclass
@@ -559,6 +583,96 @@ def stepbuild_examples(rows: Iterable[dict[str, Any]], stats: SourceStats, *,
                       licence=str(r.get("licence") or ""))
 
 
+def distill_examples(prompts: dict[str, dict[str, Any]], generations: dict[str, dict[str, Any]],
+                     verified: Iterable[dict[str, Any]], stats: SourceStats
+                     ) -> Iterator[Example]:
+    """One user turn (the prompt) and one assistant turn (the teacher's reply,
+    verbatim) per verified row marked kept, in the prompt set's split."""
+    for v in verified:
+        stats.rows_read += 1
+        if v.get("kept") is not True:
+            stats.drops["not_kept"] += 1
+            continue
+        p = prompts.get(v.get("id"))
+        if p is None:
+            stats.drops["unknown_id"] += 1
+            continue
+        g = generations.get(v["id"])
+        if g is None or not isinstance(g.get("response"), str):
+            stats.drops["no_generation"] += 1
+            continue
+        if p.get("split") not in ("train", "val"):
+            stats.drops["bad_split"] += 1
+            continue
+        yield Example(DISTILL, v["id"], CODE,
+                      [{"role": "user", "content": p["prompt"]},
+                       {"role": "assistant", "content": g["response"]}],
+                      licence=str(p.get("licence") or ""), split=p["split"])
+
+
+def load_distill(prompts_path: Path, distill_dir: Path
+                 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+                            list[dict[str, Any]], dict[str, Any]]:
+    """(prompts by id, generations by id, verified rows, provenance) for the distill
+    source. prompts.jsonl must match its manifest's output.sha256, verified.jsonl must
+    be newer than generations.jsonl, and the kept answers must come from one teacher
+    and revision. A generations line that does not
+    parse (the tail of a file still being written) is skipped, as distill_verify does."""
+    prompts_path, distill_dir = Path(prompts_path), Path(distill_dir)
+    gen_path, ver_path = distill_dir / "generations.jsonl", distill_dir / "verified.jsonl"
+    for f in (prompts_path, gen_path, ver_path):
+        if not f.is_file():
+            raise FileNotFoundError(f"distill: no {f}")
+    if gen_path.stat().st_mtime > ver_path.stat().st_mtime:
+        # verified.jsonl names no reply text: a verdict older than the replies may be
+        # about another reply to the same id (a smoke run, an earlier pass)
+        raise ValueError(f"distill: {gen_path} is newer than {ver_path}; run "
+                         "scripts/distill_verify.py on the finished generations first")
+    prompt_sha = hashlib.sha256(prompts_path.read_bytes()).hexdigest()
+    pm_path = prompts_path.parent / "manifest.json"
+    pm = json.loads(pm_path.read_text(encoding="utf-8")) if pm_path.is_file() else {}
+    pm_sha = (pm.get("output") or {}).get("sha256")
+    if pm_sha is not None and pm_sha != prompt_sha:
+        raise ValueError(f"distill: {prompts_path} has sha256 {prompt_sha}, not the "
+                         f"{pm_sha} its manifest records")
+    prompts = {r["id"]: r for r in _jsonl_rows([prompts_path])}
+    generations: dict[str, dict[str, Any]] = {}
+    gen_bytes = gen_path.read_bytes()      # one read: the file may still be growing
+    for line in gen_bytes.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            g = json.loads(line)
+        except ValueError:
+            continue
+        generations[g["id"]] = g
+    verified = list(_jsonl_rows([ver_path]))
+    kept = [v for v in verified if v.get("kept") is True]
+    teachers = sorted({(generations[v["id"]].get("teacher"),
+                        generations[v["id"]].get("revision"))
+                       for v in kept if v["id"] in generations}, key=str)
+    if len(teachers) > 1:
+        raise ValueError(f"distill: the kept answers come from more than one teacher: {teachers}")
+    teacher, revision = teachers[0] if teachers else (None, None)
+    used = sorted({str(prompts[v["id"]].get("source")) for v in kept if v["id"] in prompts})
+    problem_licenses = {src: ((pm.get("sources") or {}).get(src, {}).get("license")
+                              or DISTILL_PROBLEM_LICENSES.get(src, "")) for src in used}
+    provenance = {
+        "dataset": str(distill_dir),
+        "teacher": {"name": teacher, "revision": revision,
+                    "license": DISTILL_TEACHER_LICENSE},
+        "prompt_set": {"file": str(prompts_path), "sha256": prompt_sha,
+                       "manifest_sha256": pm_sha, "problems": len(prompts),
+                       "split": dict(sorted(Counter(str(r.get("split"))
+                                                    for r in prompts.values()).items()))},
+        "problem_licenses": problem_licenses,
+        "verified": len(verified), "verified_kept": len(kept),
+        "sha256": {gen_path.name: hashlib.sha256(gen_bytes).hexdigest(),
+                   ver_path.name: hashlib.sha256(ver_path.read_bytes()).hexdigest()},
+    }
+    return prompts, generations, verified, provenance
+
+
 # ---- screening, splitting, packing ------------------------------------------------------------
 
 def is_val(ex: Example, fraction: float) -> bool:
@@ -622,7 +736,7 @@ def screen(examples: Iterable[Example], stats: dict[str, SourceStats], *, tok: A
             continue
         if fitted.truncated or len(messages) < len(ex.messages):
             st.truncated += 1
-        split = "val" if is_val(ex, val_fraction) else "train"
+        split = ex.split or ("val" if is_val(ex, val_fraction) else "train")
         st.keep(ex, fitted.ids, fitted.mask, split)
         (val if split == "val" else train).append(Kept(ex.source, fitted.ids, fitted.mask))
     return train, val, hits
@@ -786,8 +900,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--config", default="configs/quipu-moe-sft.toml")
     ap.add_argument("--out", default=None, help="default: the config's data.shard_dir")
-    ap.add_argument("--sources", default=",".join(SOURCES))
+    ap.add_argument("--sources", default=",".join(DEFAULT_SOURCES),
+                    help=f"comma-separated, of {','.join(SOURCES)}")
     ap.add_argument("--stepbuild-dir", default=None, help="default: data.stepbuild_dir")
+    ap.add_argument("--distill-prompts", default="data/distill-prompts/prompts.jsonl")
+    ap.add_argument("--distill-dir", default="data/distill-cuda",
+                    help="holds generations.jsonl and verified.jsonl")
     ap.add_argument("--limit", type=int, default=None, help="first N rows per source (trials)")
     ap.add_argument("--val-fraction", type=float, default=VAL_FRACTION)
     ap.add_argument("--seed", type=int, default=SEED)
@@ -858,6 +976,16 @@ def main(argv: list[str] | None = None) -> int:
             return stepbuild_examples(rows, st, bench_guard=bench, test_guard=test_guard,
                                       tok=tok, context=context)
         sources[STEPBUILD] = stepbuild_source
+    if DISTILL in wanted:
+        try:
+            d_prompts, d_gens, d_verified, provenance[DISTILL] = load_distill(
+                Path(args.distill_prompts), Path(args.distill_dir))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if args.limit is not None:
+            d_verified = d_verified[:args.limit]
+        sources[DISTILL] = lambda st: distill_examples(d_prompts, d_gens, d_verified, st)
 
     decontam = None
     if not args.no_decontam:

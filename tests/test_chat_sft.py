@@ -870,6 +870,128 @@ def test_no_pack_puts_one_conversation_per_block(tmp_path, tok):
     assert packed["splits"]["train"]["blocks"] < 8
 
 
+# ---- the distill source ----------------------------------------------------------------------
+
+DISTILL_SOLUTION = ("def is_palindrome_number(value):\n    text = str(value)\n"
+                    "    return text == text[::-1] and len(text) > 0\n")
+
+
+def _distill_files(tmp_path: Path) -> tuple[Path, Path]:
+    """A prompt set (with its manifest) and a teacher's directory: d0 train kept, d1 val
+    kept, d2 train not kept, d3 train kept (reply with surrounding whitespace), d4 train
+    kept but contaminated, d5 train kept duplicating d0, d6 val kept."""
+    def prompt(i, split, text, source="opencodeinstruct", licence="CC-BY-4.0"):
+        return {"id": f"d{i}", "split": split, "source": source, "source_id": str(i),
+                "licence": licence, "kind": "function", "prompt": text,
+                "entry_point": "f", "tests": ["assert f() == 1"]}
+    prompts = [prompt(0, "train", "Write f returning one."),
+               prompt(1, "val", "Write g returning two.", "apps", "MIT"),
+               prompt(2, "train", "Write h returning three."),
+               prompt(3, "train", "Write k returning four."),
+               prompt(4, "train", "Check whether a number reads the same backwards."),
+               prompt(5, "train", "Write f returning one."),
+               prompt(6, "val", "Write m returning five.")]
+    replies = {"d0": "```python\ndef f():\n    return 1\n```",
+               "d1": "```python\ndef g():\n    return 2\n```",
+               "d2": "```python\ndef h():\n    return 0\n```",
+               "d3": "  Sure:\n```python\ndef k():\n    return 4\n```\n\n",
+               "d4": "```python\n" + DISTILL_SOLUTION + "```",
+               "d5": "```python\ndef f():\n    return 1\n```",
+               "d6": "```python\ndef m():\n    return 5\n```"}
+    pdir = tmp_path / "distill-prompts"
+    pdir.mkdir()
+    pfile = pdir / "prompts.jsonl"
+    pfile.write_text("".join(json.dumps(p) + "\n" for p in prompts), encoding="utf-8")
+    import hashlib
+    (pdir / "manifest.json").write_text(json.dumps({
+        "sources": {"opencodeinstruct": {"license": "CC-BY-4.0"}, "apps": {"license": "MIT"}},
+        "output": {"file": "prompts.jsonl",
+                   "sha256": hashlib.sha256(pfile.read_bytes()).hexdigest()}}), encoding="utf-8")
+    ddir = tmp_path / "distill-cuda"
+    ddir.mkdir()
+    gens = "".join(json.dumps({"id": k, "teacher": "T/teacher", "revision": "a" * 40,
+                               "response": v, "finish": "eos", "new_tokens": 9}) + "\n"
+                   for k, v in replies.items())
+    (ddir / "generations.jsonl").write_text(gens + '{"id": "d7", "resp', encoding="utf-8")
+    (ddir / "verified.jsonl").write_text("".join(
+        json.dumps({"id": p["id"], "split": p["split"], "source": p["source"], "passed": 1,
+                    "total": 1, "error": "", "kept": p["id"] != "d2"}) + "\n"
+        for p in prompts), encoding="utf-8")
+    return pfile, ddir
+
+
+def test_distill_examples_keep_only_verified_answers_verbatim_in_their_split(tmp_path):
+    pfile, ddir = _distill_files(tmp_path)
+    prompts, gens, verified, prov = bcd.load_distill(pfile, ddir)
+    assert "d7" not in gens                     # a half-written tail line is skipped
+    st = bcd.SourceStats()
+    ex = list(bcd.distill_examples(prompts, gens, verified, st))
+    assert [e.key for e in ex] == ["d0", "d1", "d3", "d4", "d5", "d6"]
+    assert st.rows_read == 7 and st.drops == {"not_kept": 1}
+    by = {e.key: e for e in ex}
+    assert by["d3"].messages == [{"role": "user", "content": "Write k returning four."},
+                                 {"role": "assistant", "content":
+                                  "  Sure:\n```python\ndef k():\n    return 4\n```\n\n"}]
+    assert {e.key: e.split for e in ex} == {"d0": "train", "d1": "val", "d3": "train",
+                                            "d4": "train", "d5": "train", "d6": "val"}
+    assert all(e.language == bcd.CODE and e.source == bcd.DISTILL for e in ex)
+    assert by["d1"].licence == "MIT" and by["d0"].licence == "CC-BY-4.0"
+    assert prov["teacher"] == {"name": "T/teacher", "revision": "a" * 40,
+                               "license": "Apache-2.0"}
+    assert prov["prompt_set"]["manifest_sha256"] == prov["prompt_set"]["sha256"]
+    assert prov["verified"] == 7 and prov["verified_kept"] == 6
+    assert prov["problem_licenses"] == {"apps": "MIT", "opencodeinstruct": "CC-BY-4.0"}
+
+
+def test_distill_refuses_a_prompt_set_its_manifest_does_not_match(tmp_path):
+    pfile, ddir = _distill_files(tmp_path)
+    pfile.write_text(pfile.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sha256"):
+        bcd.load_distill(pfile, ddir)
+
+
+def test_distill_refuses_verdicts_older_than_the_generations(tmp_path):
+    import os
+    pfile, ddir = _distill_files(tmp_path)
+    ver = ddir / "verified.jsonl"
+    t = ver.stat().st_mtime
+    os.utime(ver, (t - 60, t - 60))
+    with pytest.raises(ValueError, match="distill_verify"):
+        bcd.load_distill(pfile, ddir)
+
+
+def test_build_with_distill_respects_its_split_and_screens_it(tmp_path, tok):
+    pfile, ddir = _distill_files(tmp_path)
+    prompts, gens, verified, prov = bcd.load_distill(pfile, ddir)
+    decontam = Decontaminator([Problem("humaneval", "HumanEval/999",
+                                       ("Check whether a number reads the same backwards.",
+                                        DISTILL_SOLUTION), DISTILL_SOLUTION)])
+    # val_fraction=1.0 would send every hashed example to val: distill keeps its own split
+    manifest = bcd.build(
+        {bcd.AYA: lambda st: bcd.aya_examples(qa_rows(4), st),
+         bcd.DISTILL: lambda st: bcd.distill_examples(prompts, gens, verified, st)},
+        tmp_path / "chat", tok=tok, context=CONTEXT, decontam=decontam, val_fraction=1.0,
+        shard_tokens=10_000, provenance={bcd.DISTILL: prov})
+    d = manifest["sources"]["distill"]
+    assert d["drops"] == {"decontam_humaneval": 1, "duplicate": 1, "not_kept": 1}
+    assert d["kept"]["train_conversations"] == 2 and d["kept"]["val_conversations"] == 2
+    assert d["kept"]["train_tokens"] > 0 and d["kept"]["val_assistant_tokens"] > 0
+    assert d["languages"] == {"code": d["kept"]}
+    assert d["licences"] == {"CC-BY-4.0": 3, "MIT": 1}
+    assert d["teacher"]["name"] == "T/teacher" and d["teacher"]["license"] == "Apache-2.0"
+    assert d["prompt_set"]["manifest_sha256"] and d["verified"] == 7
+    assert "CC-BY-4.0" in d["license"] and "Apache-2.0" in d["license"]
+    assert manifest["sources"]["aya"]["kept"].get("train_conversations", 0) == 0
+    assert manifest["language_map"]["distill"] == {"*": "code"}
+    assert manifest["splits"]["val_by_source"]["distill"]["conversations"] == 2
+    assert manifest["splits"]["train"]["conversations"] == 2
+
+
+def test_distill_is_a_known_source_but_not_a_default_one():
+    assert bcd.DISTILL in bcd.SOURCES and bcd.DISTILL not in bcd.DEFAULT_SOURCES
+    assert set(bcd.DEFAULT_SOURCES) == {bcd.AYA, bcd.OASST2, bcd.STEPBUILD}
+
+
 # ---- the terminal chat ------------------------------------------------------------------------
 
 class ScriptedModel(nn.Module):
