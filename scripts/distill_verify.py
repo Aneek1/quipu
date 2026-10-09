@@ -58,8 +58,13 @@ def main(argv: list[str] | None = None) -> int:
             continue
     gens = [g for g in gens if g["id"] in problems]
 
+    results = []
     with ThreadPoolExecutor(args.workers) as ex:
-        results = list(ex.map(lambda g: check(problems[g["id"]], g, args.timeout), gens))
+        for r in ex.map(lambda g: check(problems[g["id"]], g, args.timeout), gens):
+            results.append(r)
+            if len(results) % 250 == 0 or len(results) == len(gens):
+                print(f"{len(results)}/{len(gens)} checked, "
+                      f"{sum(x['kept'] for x in results)} kept", flush=True)
 
     out = (ROOT / args.generations).parent
     with open(out / "verified.jsonl", "w", encoding="utf-8", newline="\n") as f:

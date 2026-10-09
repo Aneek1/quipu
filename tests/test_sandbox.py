@@ -28,8 +28,15 @@ def test_run_tests_all_pass_and_partial():
 def test_run_tests_solution_error_and_timeout():
     r = run_tests("def add(a, b):\n    return a +\n", ["assert add(1, 2) == 3"])
     assert r.passed == 0 and r.error == "solution:SyntaxError"
+    import time
+    t0 = time.time()
     r = run_tests("while True:\n    pass\n", ["assert True"], timeout=2)
     assert r.error == "timeout"
+    assert time.time() - t0 < 15  # the loop is killed, not waited on
+    r = run_tests("import subprocess, sys\n"
+                  "subprocess.Popen([sys.executable, '-c', 'while True: pass'])\n"
+                  "while True:\n    pass\n", ["assert True"], timeout=2)
+    assert r.error == "timeout" and time.time() - t0 < 30  # a grandchild cannot hold it open
 
 
 def test_child_sees_no_secrets(monkeypatch):

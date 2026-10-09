@@ -71,11 +71,26 @@ def extract_code(response: str, entry_point: str | None = None) -> str | None:
     return blocks[0] if blocks else None
 
 
+def base_python() -> str:
+    """The real interpreter, not a virtual environment's launcher: on Windows a venv's
+    python.exe starts the base python.exe as a child, so killing the launcher on a
+    timeout would leave the child (and the open output pipes) running."""
+    return getattr(sys, "_base_executable", None) or sys.executable
+
+
 def child_env() -> dict[str, str]:
     env = {k: os.environ[k] for k in KEEP_ENV if k in os.environ}
-    env["PATH"] = str(Path(sys.executable).parent)
+    env["PATH"] = str(Path(base_python()).parent)
     env["PYTHONIOENCODING"] = "utf-8"
     return env
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the process and everything it started."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, stdin=subprocess.DEVNULL)
+    proc.kill()
 
 
 def run_tests(code: str, tests: list[str], timeout: float = 10.0,
@@ -87,14 +102,20 @@ def run_tests(code: str, tests: list[str], timeout: float = 10.0,
         Path(tmp, "tests.json").write_text(json.dumps(tests), encoding="utf-8")
         env = child_env()
         env["TEMP"] = env["TMP"] = tmp
+        proc = subprocess.Popen([python or base_python(), "-I", "harness.py"],
+                                cwd=tmp, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace")
         try:
-            proc = subprocess.run([python or sys.executable, "-I", "harness.py"],
-                                  cwd=tmp, env=env, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=timeout,
-                                  stdin=subprocess.DEVNULL)
+            out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             return Result(0, len(tests), "timeout")
-        for line in reversed(proc.stdout.splitlines()):
+        for line in reversed(out.splitlines()):
             if line.startswith(RESULT_TAG):
                 d = json.loads(line[len(RESULT_TAG):])
                 return Result(int(d["passed"]), int(d["total"]), d.get("error") or "")
