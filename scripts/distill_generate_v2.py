@@ -236,13 +236,17 @@ def make_chat(endpoint: str, model: str = "teacher", timeout: float = 600.0,
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     d = json.loads(r.read())
                 c = d["choices"][0]
-                return (c["message"]["content"] or "", c.get("finish_reason") or "stop",
+                reason = c.get("finish_reason")
+                if reason not in ("stop", "length", None):
+                    raise RuntimeError(f"finish_reason={reason}")  # e.g. vLLM "abort"
+                return (c["message"]["content"] or "", reason or "stop",
                         int(d.get("usage", {}).get("completion_tokens", 0)))
             except urllib.error.HTTPError as e:
+                e.close()
                 if e.code < 500 or attempt == retries - 1:
                     raise
             except (urllib.error.URLError, TimeoutError, ConnectionError,
-                    http.client.RemoteDisconnected):
+                    http.client.HTTPException, json.JSONDecodeError):
                 if attempt == retries - 1:
                     raise
             time.sleep(backoff * (attempt + 1))
@@ -256,12 +260,16 @@ def spend_over(budget: float) -> Callable[[], bool]:
     import subprocess
 
     def check() -> bool:
-        r = subprocess.run([sys.executable, "-m", "quipu.spend", "show", "--usd-only"],
-                           cwd=ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
-            print("spend ledger unreadable: stopping", flush=True)
+        try:
+            r = subprocess.run([sys.executable, "-m", "quipu.spend", "show", "--usd-only"],
+                               cwd=ROOT, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                print("spend ledger unreadable: stopping", flush=True)
+                return True
+            return float(r.stdout.strip()) >= budget
+        except (subprocess.TimeoutExpired, ValueError) as e:
+            print(f"spend check failed ({e!r}): stopping", flush=True)
             return True
-        return float(r.stdout.strip()) >= budget
 
     return check
 
@@ -284,11 +292,14 @@ def main(argv: list[str] | None = None) -> int:
     root = ROOT / args.root
     chat = make_chat(args.endpoint)
     over = spend_over(args.budget_usd) if args.budget_usd is not None else (lambda: False)
+    ran = 0
     for part in part_order(args.parts, args.direction):
         if is_done(root, part):
             continue
         if not (root / "prompts" / f"part-{part:04d}.jsonl").exists():
+            print(f"part {part}: no prompt file, skipping", flush=True)
             continue
+        ran += 1
         print(f"part {part}: start", flush=True)
         status = run_part(root, part, args.teacher_tag, chat, concurrency=args.concurrency,
                           max_new_tokens=args.max_new_tokens, teacher=TEACHER,
@@ -300,6 +311,9 @@ def main(argv: list[str] | None = None) -> int:
             return 3  # rerun to retry the failed requests
         if status == "error":
             return 4  # server looks down; do not move on to the next part
+    if not ran and not any(is_done(root, q) for q in part_order(args.parts, args.direction)):
+        print("error: no prompt file for any part in the range", flush=True)
+        return 2
     print("all parts in range done", flush=True)
     return 0
 

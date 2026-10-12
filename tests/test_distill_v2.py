@@ -318,7 +318,7 @@ import pytest
 from scripts.distill_generate_v2 import make_chat
 
 
-def _serve(statuses):
+def _serve(statuses, finish="length"):
     """Fake OpenAI server: answers with each status in turn (200 = a real reply)."""
     seen = {"calls": 0}
 
@@ -329,7 +329,7 @@ def _serve(statuses):
             code = statuses[min(seen["calls"], len(statuses) - 1)]
             seen["calls"] += 1
             body = json.dumps({"choices": [{"message": {"content": "hi"},
-                                            "finish_reason": "length"}],
+                                            "finish_reason": finish}],
                                "usage": {"completion_tokens": 9}}).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -372,3 +372,20 @@ def test_make_chat_does_not_retry_4xx():
         chat("S", "U", 8)
     assert seen["calls"] == 1
     srv.shutdown()
+
+
+def test_make_chat_abort_finish_reason_raises_without_retry():
+    srv, seen = _serve([200], finish="abort")
+    chat = make_chat(f"http://127.0.0.1:{srv.server_port}", backoff=0)
+    with pytest.raises(RuntimeError, match="finish_reason=abort"):
+        chat("S", "U", 8)
+    assert seen["calls"] == 1
+    srv.shutdown()
+
+
+def test_main_empty_range_returns_2(tmp_path, capsys):
+    from scripts.distill_generate_v2 import main
+    rc = main(["--root", str(tmp_path), "--parts", "0:2", "--teacher-tag", "t",
+               "--revision", "r"])
+    assert rc == 2
+    assert "no prompt file, skipping" in capsys.readouterr().out
