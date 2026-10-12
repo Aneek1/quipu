@@ -11,11 +11,16 @@ box 0:4 up, laptop 5:19 down), skips parts that have a .done sidecar and works t
 first unfinished one. Every answer is appended and flushed as it arrives, so
 stopping at any point loses only in-flight requests; rerunning resumes. Creating
 data/distill-v2/PAUSE makes it finish in-flight requests and exit. On the box,
---budget-usd stops it when quipu.spend reports the cap reached.
+--budget-usd stops it when quipu.spend reports the cap reached (or when the spend
+check itself fails: the box is billing, so it fails closed). If the server stops
+answering (max(20, 2 * concurrency) failures in a row) it stops with "error".
 
 Output: generations/part-NNNN.<tag>.jsonl rows: id, part, teacher, revision,
 teacher_tag, response, finish ("eos" | "length"), new_tokens; and, when every
-prompt of the part is answered, part-NNNN.<tag>.done: {"rows", "sha256"}.
+prompt id of the part is answered, part-NNNN.<tag>.done: {"rows", "sha256"}.
+"rows" is the part's prompt count, not the line count of the jsonl: a resumed file
+can hold a duplicate row for an id (a request in flight at a hard stop whose row
+landed anyway), so the verifier dedups by id.
 """
 from __future__ import annotations
 
@@ -42,6 +47,10 @@ SYSTEM_PROMPT = (
     "yourself, and no filler like \"Great question!\"."
 )
 
+WAIT_TIMEOUT = 5.0   # s; PAUSE and budget are re-checked at least this often
+BUDGET_EVERY = 60.0  # s between over_budget() calls
+SHOW_FAILURES = 5    # failure messages printed per part; the rest are counted
+
 Chat = Callable[[str, str, int], "tuple[str, str, int]"]  # -> (text, finish_reason, tokens)
 
 
@@ -63,7 +72,7 @@ def is_done(root: Path, part: int) -> bool:
 def done_ids(path: Path) -> set[str]:
     out: set[str] = set()
     if path.exists():
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     out.add(json.loads(line)["id"])
@@ -91,23 +100,33 @@ def _drop_torn_tail(path: Path) -> None:
         if f.read(1) == b"\n":
             return
         size = f.seek(0, 2)
-        pos = size
+        pos, cut = size, 0
         while pos > 0:  # scan back to the last newline
             step = min(1 << 16, pos)
             pos -= step
             f.seek(pos)
             nl = f.read(step).rfind(b"\n")
             if nl != -1:
-                f.truncate(pos + nl + 1)
-                return
-        f.truncate(0)  # the only line was torn
+                cut = pos + nl + 1
+                break
+        f.seek(cut)
+        try:  # a whole row that only lacks its newline is kept
+            whole = "id" in json.loads(f.read().decode("utf-8"))
+        except (ValueError, TypeError):
+            whole = False
+        if whole:
+            f.seek(0, 2)
+            f.write(b"\n")
+        else:
+            f.truncate(cut)
 
 
 def run_part(root: Path, part: int, tag: str, chat: Chat, *, concurrency: int,
              max_new_tokens: int, teacher: str, revision: str,
              over_budget: Callable[[], bool] = lambda: False) -> str:
     """Answer every unanswered prompt of one part.
-    Returns "done" | "paused" | "budget" | "incomplete" (some requests failed)."""
+    Returns "done" | "paused" | "budget" | "error" (server stopped answering) |
+    "incomplete" (some requests failed; a rerun retries them)."""
     root = Path(root)
     with open(root / "prompts" / f"part-{part:04d}.jsonl", encoding="utf-8") as pf:
         prompts = [json.loads(l) for l in pf if l.strip()]
@@ -118,7 +137,8 @@ def run_part(root: Path, part: int, tag: str, chat: Chat, *, concurrency: int,
     todo = [p for p in prompts if p["id"] not in have]
     pause = root / "PAUSE"
     lock = threading.Lock()
-    failed = 0
+    failed = streak = 0
+    max_streak = max(20, 2 * concurrency)
     stop = ""
     t0, n_tok, n_new = time.monotonic(), 0, 0
 
@@ -151,9 +171,14 @@ def run_part(root: Path, part: int, tag: str, chat: Chat, *, concurrency: int,
             if not stop and pause.exists():
                 stop = "paused"
             if not stop and (last_budget_check is None
-                             or time.monotonic() - last_budget_check > 60):
+                             or time.monotonic() - last_budget_check >= BUDGET_EVERY):
                 last_budget_check = time.monotonic()
-                if over_budget():
+                try:
+                    over = over_budget()
+                except Exception as e:  # fail closed: the box is billing
+                    print(f"budget check failed, stopping: {e!r}", flush=True)
+                    over = True
+                if over:
                     stop = "budget"
             while not stop and len(running) < concurrency:
                 p = next(it, None)
@@ -162,15 +187,28 @@ def run_part(root: Path, part: int, tag: str, chat: Chat, *, concurrency: int,
                 running.add(ex.submit(one, p))
             if not running:
                 break
-            finished, running = wait(running, return_when=FIRST_COMPLETED)
+            finished, running = wait(running, timeout=WAIT_TIMEOUT,
+                                     return_when=FIRST_COMPLETED)
             for fut in finished:
-                if fut.exception() is not None:
-                    failed += 1
-                    print(f"request failed: {fut.exception()!r}", flush=True)
+                err = fut.exception()
+                if err is None:
+                    streak = 0
+                    continue
+                failed += 1
+                streak += 1
+                if failed <= SHOW_FAILURES:
+                    print(f"request failed: {err!r}", flush=True)
+            if not stop and streak >= max_streak:
+                print(f"part {part}: {streak} requests failed in a row; "
+                      f"server looks down, stopping", flush=True)
+                stop = "error"
 
+    if failed:
+        print(f"part {part}: {failed} request(s) failed in total", flush=True)
     if stop:
         return stop
-    if failed or len(done_ids(out)) < len(prompts):
+    missing = {p["id"] for p in prompts} - done_ids(out)
+    if failed or missing:
         return "incomplete"
     done_file.write_text(json.dumps({"rows": len(prompts), "sha256": _sha256(out)}) + "\n",
                          encoding="utf-8")

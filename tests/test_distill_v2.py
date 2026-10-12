@@ -190,3 +190,121 @@ def test_pause_writes_in_flight_answers(tmp_path):
     rows = [json.loads(l) for l in
             open(tmp_path / "generations" / "part-0000.q4.jsonl", encoding="utf-8")]
     assert len(calls) == 4 and len(rows) == 4
+
+
+def test_dead_server_stops_with_error(tmp_path):
+    import threading
+    _prompts(tmp_path, n=100)
+    calls = []
+    lock = threading.Lock()
+
+    def dead(system, user, max_tokens):
+        with lock:
+            calls.append(user)
+        raise OSError("connection refused")
+
+    assert run_part(tmp_path, 0, "q4", dead, concurrency=2, max_new_tokens=8,
+                    teacher="T", revision="R") == "error"
+    assert len(calls) < 40
+    assert not (tmp_path / "generations" / "part-0000.q4.done").exists()
+
+
+def test_failures_interleaved_with_successes_do_not_trip_error(tmp_path):
+    _prompts(tmp_path, n=60)
+
+    def half(system, user, max_tokens):
+        if int(user[1:]) % 2:
+            raise OSError("flaky")
+        return "x", "stop", 1
+
+    assert run_part(tmp_path, 0, "q4", half, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R") == "incomplete"
+
+
+def test_budget_checked_while_requests_hang(tmp_path, monkeypatch):
+    import threading
+    import time as _time
+    import scripts.distill_generate_v2 as g
+    monkeypatch.setattr(g, "WAIT_TIMEOUT", 0.01)
+    monkeypatch.setattr(g, "BUDGET_EVERY", 0.0)
+    _prompts(tmp_path, n=5)
+    release = threading.Event()
+    checks = []
+
+    def hang(system, user, max_tokens):
+        release.wait(3)
+        return "x", "stop", 1
+
+    def over():
+        checks.append(1)
+        if len(checks) >= 3:
+            release.set()
+            return True
+        return False
+
+    t = _time.monotonic()
+    assert run_part(tmp_path, 0, "q4", hang, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R", over_budget=over) == "budget"
+    assert _time.monotonic() - t < 1.5  # checked during the hang, not after it
+
+
+def test_budget_callback_error_fails_closed(tmp_path):
+    _prompts(tmp_path, n=5)
+
+    def broken():
+        raise RuntimeError("spend api down")
+
+    assert run_part(tmp_path, 0, "q4", fake_chat_any, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R", over_budget=broken) == "budget"
+
+
+def test_complete_unterminated_last_row_is_kept(tmp_path):
+    _prompts(tmp_path, n=3)
+    gen = tmp_path / "generations"
+    gen.mkdir()
+    (gen / "part-0000.q4.jsonl").write_text(
+        json.dumps({"id": "dv2-0000000", "response": "old"}), encoding="utf-8")
+    asked = []
+
+    def chat(system, user, max_tokens):
+        asked.append(user)
+        return "x", "stop", 1
+
+    assert run_part(tmp_path, 0, "q4", chat, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R") == "done"
+    assert sorted(asked) == ["p1", "p2"]
+    rows = [json.loads(l) for l in open(gen / "part-0000.q4.jsonl", encoding="utf-8")]
+    assert [r["id"] for r in rows][0] == "dv2-0000000" and len(rows) == 3
+
+
+def test_resume_survives_bad_utf8_mid_file(tmp_path):
+    _prompts(tmp_path, n=3)
+    gen = tmp_path / "generations"
+    gen.mkdir()
+    (gen / "part-0000.q4.jsonl").write_bytes(
+        b'{"id": "dv2-0000000", "response": "a"}\n\xff\xfe junk\n'
+        b'{"id": "dv2-0000001", "response": "b"}\n')
+    asked = []
+
+    def chat(system, user, max_tokens):
+        asked.append(user)
+        return "x", "stop", 1
+
+    assert run_part(tmp_path, 0, "q4", chat, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R") == "done"
+    assert asked == ["p2"]
+
+
+def test_completeness_is_by_id_not_count(tmp_path):
+    # a duplicated prompt id must not leave the part "incomplete" forever
+    d = tmp_path / "prompts"
+    d.mkdir()
+    rows = [{"id": "dv2-0000000", "prompt": "p0"}, {"id": "dv2-0000001", "prompt": "p1"},
+            {"id": "dv2-0000001", "prompt": "p1"}]
+    (d / "part-0000.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows),
+                                       encoding="utf-8")
+    assert run_part(tmp_path, 0, "q4", fake_chat_any, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R") == "done"
+    assert (tmp_path / "generations" / "part-0000.q4.done").exists()
+    assert run_part(tmp_path, 0, "q4", fake_chat_any, concurrency=1, max_new_tokens=8,
+                    teacher="T", revision="R") == "done"
