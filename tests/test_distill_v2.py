@@ -389,3 +389,75 @@ def test_main_empty_range_returns_2(tmp_path, capsys):
                "--revision", "r"])
     assert rc == 2
     assert "no prompt file, skipping" in capsys.readouterr().out
+
+
+from scripts.distill_verify import TAG_PRIORITY, verify_part, verify_parts
+
+
+def _setup_part(tmp_path, gens_by_tag):
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "generations").mkdir()
+    with open(tmp_path / "prompts" / "part-0000.jsonl", "w", encoding="utf-8") as f:
+        for i in range(2):
+            f.write(json.dumps({"id": f"dv2-{i:07d}", "part": 0, "split": "train",
+                                "source": "opencodeinstruct", "prompt": f"add two numbers {i}",
+                                "entry_point": "add",
+                                "tests": ["assert add(1, 2) == 3", "assert add(0, 0) == 0"]}) + "\n")
+    for tag, responses in gens_by_tag.items():
+        p = tmp_path / "generations" / f"part-0000.{tag}.jsonl"
+        with open(p, "w", encoding="utf-8") as f:
+            for i, resp in enumerate(responses):
+                f.write(json.dumps({"id": f"dv2-{i:07d}", "teacher_tag": tag, "teacher": "T",
+                                    "response": resp, "finish": "eos"}) + "\n")
+        (tmp_path / "generations" / f"part-0000.{tag}.done").write_text(
+            json.dumps({"rows": 2, "sha256": "x"}))
+
+
+GOOD = "Plan.\n```python\ndef add(a, b):\n    return a + b\n```\nEdge cases: none."
+BAD = "```python\ndef add(a, b):\n    return a - b\n```"
+
+
+def test_verify_part_keeps_passing_answers(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, BAD]})
+    s = verify_part(tmp_path, 0, workers=2, timeout=10)
+    assert s == {"answers": 2, "kept": 1}
+    kept = [json.loads(l) for l in open(tmp_path / "kept" / "part-0000.jsonl", encoding="utf-8")]
+    assert [k["id"] for k in kept] == ["dv2-0000000"]
+    assert kept[0]["response"] == GOOD and kept[0]["prompt"] == "add two numbers 0"
+    assert (tmp_path / "verified" / "part-0000.meta.json").exists()
+
+
+def test_verify_part_prefers_bf16_over_laptop(tmp_path):
+    assert TAG_PRIORITY[0] == "bf16-vllm"
+    _setup_part(tmp_path, {"q4km-llamacpp": [BAD, GOOD], "bf16-vllm": [GOOD, BAD]})
+    verify_part(tmp_path, 0, workers=2, timeout=10)
+    rows = [json.loads(l) for l in open(tmp_path / "verified" / "part-0000.jsonl", encoding="utf-8")]
+    assert [r["teacher_tag"] for r in rows] == ["bf16-vllm", "bf16-vllm"]
+
+
+def test_verify_part_skips_when_up_to_date(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD]})
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) == {"answers": 2, "kept": 2}
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) is None  # nothing changed
+
+
+def test_verify_part_ignores_parts_without_done(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD]})
+    (tmp_path / "generations" / "part-0000.bf16-vllm.done").unlink()
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) is None
+
+
+def test_verify_part_duplicate_ids_first_wins(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD]})
+    with open(tmp_path / "generations" / "part-0000.bf16-vllm.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"id": "dv2-0000000", "teacher_tag": "bf16-vllm", "teacher": "T",
+                            "response": BAD, "finish": "eos"}) + "\n")
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) == {"answers": 2, "kept": 2}
+
+
+def test_verify_parts_without_done_parts_does_not_crash(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD]})
+    (tmp_path / "generations" / "part-0000.bf16-vllm.done").unlink()
+    s = verify_parts(tmp_path, workers=1, timeout=10)
+    assert s["answers"] == 0 and s["kept"] == 0
+    assert (tmp_path / "verify_summary.json").exists()

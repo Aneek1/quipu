@@ -11,7 +11,7 @@ Writes, beside the generations:
 - verify_summary.json: counts kept and rejected, per source, split and reason.
 The kept answers are the CUDA arm's training data.
 
-Run:  uv run python scripts/distill_verify.py [--workers 4] [--timeout 10]
+Run:  uv run python scripts/distill_verify.py [--workers 4] [--timeout 10] [--parts-dir data/distill-v2]
 """
 from __future__ import annotations
 
@@ -40,13 +40,101 @@ def check(problem: dict, gen: dict, timeout: float) -> dict:
     return rec | {"passed": r.passed, "error": r.error, "kept": r.all_passed}
 
 
+TAG_PRIORITY = ["bf16-vllm", "q4km-llamacpp"]  # first answer per id wins, in this order
+
+
+def _tag_rank(tag: str) -> int:
+    return TAG_PRIORITY.index(tag) if tag in TAG_PRIORITY else len(TAG_PRIORITY)
+
+
+def verify_part(root: Path, part: int, workers: int, timeout: float) -> dict | None:
+    """Verify one part's finished generations; None when not done or already up to date."""
+    root = Path(root)
+    gdir = root / "generations"
+    done = sorted(gdir.glob(f"part-{part:04d}.*.done"))
+    if not done:
+        return None
+    srcs = sorted(gdir.glob(f"part-{part:04d}.*.jsonl"),
+                  key=lambda p: _tag_rank(p.name.split(".")[1]))
+    stamp = {p.name: [p.stat().st_size, p.stat().st_mtime_ns] for p in srcs}
+    meta_path = root / "verified" / f"part-{part:04d}.meta.json"
+    if meta_path.exists() and json.loads(meta_path.read_text(encoding="utf-8")) == stamp:
+        return None
+    problems: dict[str, dict] = {}
+    with open(root / "prompts" / f"part-{part:04d}.jsonl", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                row = json.loads(line)
+                problems[row["id"]] = row
+    chosen: dict[str, dict] = {}
+    for src in srcs:
+        with open(src, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    g = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(g, dict) and g.get("id") in problems and g["id"] not in chosen:
+                    chosen[g["id"]] = g
+    gens = [chosen[i] for i in sorted(chosen)]
+    with ThreadPoolExecutor(workers) as ex:
+        results = list(ex.map(lambda g: check(problems[g["id"]], g, timeout), gens))
+    (root / "verified").mkdir(exist_ok=True)
+    (root / "kept").mkdir(exist_ok=True)
+    with open(root / "verified" / f"part-{part:04d}.jsonl", "w", encoding="utf-8",
+              newline="\n") as fv, \
+            open(root / "kept" / f"part-{part:04d}.jsonl", "w", encoding="utf-8",
+                 newline="\n") as fk:
+        for g, r in zip(gens, results):
+            fv.write(json.dumps(r | {"teacher_tag": g.get("teacher_tag")}) + "\n")
+            if r["kept"]:
+                p = problems[g["id"]]
+                fk.write(json.dumps({"id": g["id"], "split": p["split"], "prompt": p["prompt"],
+                                     "response": g["response"], "entry_point": p["entry_point"],
+                                     "teacher": g.get("teacher"),
+                                     "teacher_tag": g.get("teacher_tag")},
+                                    ensure_ascii=False) + "\n")
+    meta_path.write_text(json.dumps(stamp), encoding="utf-8")
+    return {"answers": len(results), "kept": sum(r["kept"] for r in results)}
+
+
+def verify_parts(root: Path, workers: int, timeout: float) -> dict:
+    root = Path(root)
+    for p in sorted((root / "prompts").glob("part-*.jsonl")):
+        part = int(p.stem.split("-")[1])
+        s = verify_part(root, part, workers, timeout)
+        if s:
+            print(f"part {part}: {s['kept']}/{s['answers']} kept", flush=True)
+    rows = []
+    for f in sorted((root / "verified").glob("part-*.jsonl")):  # empty if dir is missing
+        with open(f, encoding="utf-8") as fh:
+            rows += [json.loads(l) for l in fh if l.strip()]
+    by_tag: dict[str, list[dict]] = {}
+    for r in rows:
+        by_tag.setdefault(r.get("teacher_tag") or "?", []).append(r)
+    kept = sum(r["kept"] for r in rows)
+    summary = {"answers": len(rows), "kept": kept,
+               "kept_pct": round(100 * kept / len(rows), 1) if rows else 0.0,
+               "by_teacher_tag": {t: {"answers": len(v), "kept": sum(x["kept"] for x in v)}
+                                  for t, v in sorted(by_tag.items())},
+               "rule": "kept = the reply ended on its own (eos), has a code block defining "
+                       "the entry point, and every assert passed in quipu.sandbox"}
+    (root / "verify_summary.json").write_text(json.dumps(summary, indent=1) + "\n",
+                                              encoding="utf-8")
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--prompts", default="data/distill-prompts/prompts.jsonl")
     ap.add_argument("--generations", default="data/distill-cuda/generations.jsonl")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--timeout", type=float, default=10.0)
+    ap.add_argument("--parts-dir", default=None, help="v2: verify part files under this dir")
     args = ap.parse_args(argv)
+    if args.parts_dir:
+        print(json.dumps(verify_parts(ROOT / args.parts_dir, args.workers, args.timeout)))
+        return 0
 
     problems = {json.loads(l)["id"]: json.loads(l)
                 for l in open(ROOT / args.prompts, encoding="utf-8") if l.strip()}
