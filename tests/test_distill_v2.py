@@ -53,3 +53,19 @@ def test_take_unique_drops_seen_and_contaminated():
     assert [p["problem"] for p in kept] == ["a  b", "c"]
     assert drops["opencodeinstruct:duplicate"] == 1 and hits["mbpp"] == 1
     assert len(seen) == 2 and all(isinstance(k, bytes) for k in seen)  # hashes, not text
+
+
+def test_publish_replaces_old_out_wholesale(tmp_path):
+    from scripts.build_distill_prompts_v2 import publish
+    out, tmp = tmp_path / "prompts", tmp_path / "prompts.tmp"
+    out.mkdir()
+    (out / "part-0009.jsonl").write_text("old")
+    (out / "part-0000.jsonl").write_text("old")
+    (out / "manifest.json").write_text("old")
+    tmp.mkdir()
+    (tmp / "part-0000.jsonl").write_text("new")
+    (tmp / "manifest.json").write_text("new")
+    publish(tmp, out)
+    assert sorted(p.name for p in out.iterdir()) == ["manifest.json", "part-0000.jsonl"]
+    assert (out / "part-0000.jsonl").read_text() == "new"
+    assert not tmp.exists()

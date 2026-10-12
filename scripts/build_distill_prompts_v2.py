@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import random
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -95,6 +96,14 @@ def take_unique(problems: Iterable[dict], decontam, seen: set[bytes], drops: Cou
         yield p
 
 
+def publish(tmp: Path, out: Path) -> None:
+    """Replace out with tmp wholesale, so out never holds a mix of old and new files."""
+    tmp, out = Path(tmp), Path(out)
+    if out.exists():
+        shutil.rmtree(out)
+    tmp.rename(out)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--max-prompts", type=int, default=1_000_000)
@@ -105,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cache", default="data/distill-src")
     ap.add_argument("--no-decontam", action="store_true", help="tests only")
     args = ap.parse_args(argv)
+    if args.part_size < 1:
+        ap.error("--part-size must be >= 1")
+    if args.max_prompts < 1:
+        ap.error("--max-prompts must be >= 1")
+    if not 1 <= args.files <= len(OCI_FILES):
+        ap.error(f"--files must be between 1 and {len(OCI_FILES)}")
 
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
@@ -114,39 +129,58 @@ def main(argv: list[str] | None = None) -> int:
     rng.shuffle(files)
     decontam, bench = (None, {}) if args.no_decontam else load_benchmarks(
         {"humaneval": HUMANEVAL_REV, "mbpp": MBPP_REV})
-    writer = PartWriter(ROOT / args.out, args.part_size)
+    out = ROOT / args.out
+    tmp = out.with_name(out.name + ".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    writer = PartWriter(tmp, args.part_size)
     seen: set[bytes] = set()
     drops: Counter = Counter()
     hits: Counter = Counter()
     shas, rows_read = {}, 0
-    for f in files:
-        if writer.n >= args.max_prompts:
-            break
-        p = Path(hf_hub_download(OCI["dataset"], f, repo_type="dataset", revision=OCI["revision"],
-                                 local_dir=str(ROOT / args.cache / "oci")))
-        shas[f] = sha256(p)
-        rows = pq.read_table(p, columns=["id", "input", "unit_tests",
-                                         "average_test_score"]).to_pylist()
-        rows_read += len(rows)
-        cands = []
-        for r in rows:
-            prob, why = function_problem(r)
-            if prob is None:
-                drops[f"opencodeinstruct:{why}"] += 1
-            else:
-                cands.append(prob)
-        del rows
-        rng.shuffle(cands)
-        for prob in take_unique(cands, decontam, seen, drops, hits):
-            writer.add(prob)
+    try:
+        for f in files:
             if writer.n >= args.max_prompts:
                 break
-        print(f"{f}: {writer.n} prompts so far", flush=True)
+            p = Path(hf_hub_download(OCI["dataset"], f, repo_type="dataset",
+                                     revision=OCI["revision"],
+                                     local_dir=str(ROOT / args.cache / "oci")))
+            shas[f] = sha256(p)
+            rows = pq.read_table(p, columns=["id", "input", "unit_tests",
+                                             "average_test_score"]).to_pylist()
+            rows_read += len(rows)
+            cands = []
+            for r in rows:
+                prob, why = function_problem(r)
+                if prob is None:
+                    drops[f"opencodeinstruct:{why}"] += 1
+                else:
+                    cands.append(prob)
+            del rows
+            rng.shuffle(cands)
+            pulled = 0
+
+            def counted():
+                nonlocal pulled
+                for c in cands:
+                    pulled += 1
+                    yield c
+
+            for prob in take_unique(counted(), decontam, seen, drops, hits):
+                writer.add(prob)
+                if writer.n >= args.max_prompts:
+                    break
+            if pulled < len(cands):
+                drops["opencodeinstruct:over_cap"] += len(cands) - pulled
+            print(f"{f}: {writer.n} prompts so far", flush=True)
+    finally:
+        if writer.f:
+            writer.f.close()
     parts = writer.close()
 
     manifest = {
         "version": 2, "seed": args.seed,
-        "source": {**OCI, "files": sorted(shas), "sha256": shas, "rows_read": rows_read},
+        "source": {**OCI, "files": list(shas), "sha256": shas, "rows_read": rows_read},
         "benchmarks_decontaminated": ({k: {"dataset": v["dataset"], "revision": v["revision"],
                                            "problems": v["problems"]} for k, v in bench.items()}
                                       if bench else "skipped (--no-decontam)"),
@@ -159,8 +193,9 @@ def main(argv: list[str] | None = None) -> int:
         "total": writer.n, "parts": parts,
         "drops": dict(sorted(drops.items())), "decontam_hits": dict(hits),
     }
-    (ROOT / args.out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n",
-                                                  encoding="utf-8")
+    (tmp / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n",
+                                       encoding="utf-8")
+    publish(tmp, out)
     print(json.dumps({"total": writer.n, "parts": len(parts), "decontam_hits": dict(hits)}))
     return 0
 
