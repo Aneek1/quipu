@@ -308,3 +308,67 @@ def test_completeness_is_by_id_not_count(tmp_path):
     assert (tmp_path / "generations" / "part-0000.q4.done").exists()
     assert run_part(tmp_path, 0, "q4", fake_chat_any, concurrency=1, max_new_tokens=8,
                     teacher="T", revision="R") == "done"
+
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pytest
+
+from scripts.distill_generate_v2 import make_chat
+
+
+def _serve(statuses):
+    """Fake OpenAI server: answers with each status in turn (200 = a real reply)."""
+    seen = {"calls": 0}
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers["Content-Length"])
+            seen["body"] = json.loads(self.rfile.read(n))
+            code = statuses[min(seen["calls"], len(statuses) - 1)]
+            seen["calls"] += 1
+            body = json.dumps({"choices": [{"message": {"content": "hi"},
+                                            "finish_reason": "length"}],
+                               "usage": {"completion_tokens": 9}}).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+def test_make_chat_against_fake_openai_server():
+    srv, seen = _serve([200])
+    chat = make_chat(f"http://127.0.0.1:{srv.server_port}")
+    assert chat("SYS", "USER", 32) == ("hi", "length", 9)
+    b = seen["body"]
+    assert b["temperature"] == 0 and b["max_tokens"] == 32 and b["model"] == "teacher"
+    assert b["messages"] == [{"role": "system", "content": "SYS"},
+                             {"role": "user", "content": "USER"}]
+    srv.shutdown()
+
+
+def test_make_chat_retries_503_then_succeeds():
+    srv, seen = _serve([503, 200])
+    chat = make_chat(f"http://127.0.0.1:{srv.server_port}", backoff=0)
+    assert chat("S", "U", 8) == ("hi", "length", 9)
+    assert seen["calls"] == 2
+    srv.shutdown()
+
+
+def test_make_chat_does_not_retry_4xx():
+    import urllib.error
+    srv, seen = _serve([400, 200])
+    chat = make_chat(f"http://127.0.0.1:{srv.server_port}", backoff=0)
+    with pytest.raises(urllib.error.HTTPError):
+        chat("S", "U", 8)
+    assert seen["calls"] == 1
+    srv.shutdown()

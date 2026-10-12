@@ -213,3 +213,96 @@ def run_part(root: Path, part: int, tag: str, chat: Chat, *, concurrency: int,
     done_file.write_text(json.dumps({"rows": len(prompts), "sha256": _sha256(out)}) + "\n",
                          encoding="utf-8")
     return "done"
+
+
+def make_chat(endpoint: str, model: str = "teacher", timeout: float = 600.0,
+              retries: int = 3, backoff: float = 5.0) -> Chat:
+    """A chat() for an OpenAI-compatible server (vLLM, llama-server).
+    Retries connection trouble, timeouts and HTTP 5xx; a 4xx is raised at once."""
+    import http.client
+    import urllib.error
+    import urllib.request
+
+    url = endpoint.rstrip("/") + "/v1/chat/completions"
+
+    def chat(system: str, user: str, max_tokens: int) -> tuple[str, str, int]:
+        body = json.dumps({"model": model, "temperature": 0, "max_tokens": max_tokens,
+                           "messages": [{"role": "system", "content": system},
+                                        {"role": "user", "content": user}]}).encode()
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, data=body,
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    d = json.loads(r.read())
+                c = d["choices"][0]
+                return (c["message"]["content"] or "", c.get("finish_reason") or "stop",
+                        int(d.get("usage", {}).get("completion_tokens", 0)))
+            except urllib.error.HTTPError as e:
+                if e.code < 500 or attempt == retries - 1:
+                    raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError,
+                    http.client.RemoteDisconnected):
+                if attempt == retries - 1:
+                    raise
+            time.sleep(backoff * (attempt + 1))
+        raise RuntimeError("unreachable")
+
+    return chat
+
+
+def spend_over(budget: float) -> Callable[[], bool]:
+    """True when quipu.spend says the cap is reached; fails closed."""
+    import subprocess
+
+    def check() -> bool:
+        r = subprocess.run([sys.executable, "-m", "quipu.spend", "show", "--usd-only"],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            print("spend ledger unreadable: stopping", flush=True)
+            return True
+        return float(r.stdout.strip()) >= budget
+
+    return check
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--root", default="data/distill-v2")
+    ap.add_argument("--parts", required=True, help="START:END inclusive, e.g. 0:4")
+    ap.add_argument("--direction", choices=("up", "down"), default="up")
+    ap.add_argument("--endpoint", default="http://127.0.0.1:8000")
+    ap.add_argument("--teacher-tag", required=True, help="e.g. bf16-vllm, q4km-llamacpp")
+    ap.add_argument("--revision", required=True, help="teacher weights revision (sha)")
+    ap.add_argument("--concurrency", type=int, default=128)
+    ap.add_argument("--max-new-tokens", type=int, default=1024)
+    ap.add_argument("--budget-usd", type=float, default=None, help="box only")
+    args = ap.parse_args(argv)
+
+    root = ROOT / args.root
+    chat = make_chat(args.endpoint)
+    over = spend_over(args.budget_usd) if args.budget_usd is not None else (lambda: False)
+    for part in part_order(args.parts, args.direction):
+        if is_done(root, part):
+            continue
+        if not (root / "prompts" / f"part-{part:04d}.jsonl").exists():
+            continue
+        print(f"part {part}: start", flush=True)
+        status = run_part(root, part, args.teacher_tag, chat, concurrency=args.concurrency,
+                          max_new_tokens=args.max_new_tokens, teacher=TEACHER,
+                          revision=args.revision, over_budget=over)
+        print(f"part {part}: {status}", flush=True)
+        if status in ("paused", "budget"):
+            return 0
+        if status == "incomplete":
+            return 3  # rerun to retry the failed requests
+        if status == "error":
+            return 4  # server looks down; do not move on to the next part
+    print("all parts in range done", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
