@@ -41,8 +41,10 @@ problems at ~1,024-token answers); laptop ~15-25M tokens per overnight session.
 - Output: `part-0000.jsonl` ... `part-NNNN.jsonl` (same row schema as v1, plus
   `part`), deterministic order (seed 1337), and `manifest.json` (sources, sha256,
   counts per drop reason, sha256 of every part).
-- v1 `data/distill-prompts/` stays untouched; a v2 prompt that equals a v1 prompt
-  keeps the same id so v1 answers are not regenerated.
+- v1 `data/distill-prompts/` stays untouched. v2 ids are `dv2-0000000`; v1
+  answers (old teacher, old style) are not reused.
+- Implemented as a new script, `scripts/build_distill_prompts_v2.py`, that imports
+  v1's per-row rules, so v1 stays reproducible.
 
 ### 2. Generator (`scripts/distill_generate_v2.py`, new)
 - An HTTP client for an OpenAI-compatible `/v1/chat/completions` endpoint. The
@@ -64,11 +66,10 @@ problems at ~1,024-token answers); laptop ~15-25M tokens per overnight session.
 - Output: `data/distill-v2/generations/part-NNNN.<teacher-tag>.jsonl`, one row per
   prompt: id, part, teacher, revision, teacher_tag, response, finish (eos|length),
   new_tokens. Each row appended and flushed when it completes.
-- **Claiming without coordination:** a part is "taken" by a worker when its
-  generations file exists. Box walks up, laptop walks down; each skips parts that
-  already have a complete file (sidecar `part-NNNN.done` with row count + sha256)
-  or a file from the other worker. They meet in the middle; at most one part is
-  ever worked twice (if both start it at once), which verification dedups by id.
+- **Part ranges (no shared disk):** each worker gets an explicit range,
+  `--parts START:END` (inclusive) and `--direction up|down`. Box: `0:4 up`;
+  laptop: `5:19 down`. Within its range a worker skips parts that have a `.done`
+  sidecar and works the first unfinished one (resuming its own file).
 - **Resume:** on start, ids already in a part's file are skipped. Stopping at any
   point (Ctrl+C, window closed, lid shut, power) loses at most the in-flight
   requests.
