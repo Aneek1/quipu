@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,15 @@ def _tag_rank(tag: str) -> int:
     return TAG_PRIORITY.index(tag) if tag in TAG_PRIORITY else len(TAG_PRIORITY)
 
 
+def _safe_check(problem: dict, gen: dict, timeout: float) -> dict:
+    try:
+        return check(problem, gen, timeout)
+    except Exception as e:  # e.g. OSError spawning the subprocess
+        return {"id": problem["id"], "split": problem["split"], "source": problem["source"],
+                "total": len(problem["tests"]), "passed": 0,
+                "error": f"verifier:{type(e).__name__}", "kept": False}
+
+
 def verify_part(root: Path, part: int, workers: int, timeout: float) -> dict | None:
     """Verify one part's finished generations; None when not done or already up to date."""
     root = Path(root)
@@ -54,12 +64,17 @@ def verify_part(root: Path, part: int, workers: int, timeout: float) -> dict | N
     done = sorted(gdir.glob(f"part-{part:04d}.*.done"))
     if not done:
         return None
-    srcs = sorted(gdir.glob(f"part-{part:04d}.*.jsonl"),
+    finished = {d.name.split(".")[1] for d in done}  # partial files of other tags are ignored
+    srcs = sorted((p for p in gdir.glob(f"part-{part:04d}.*.jsonl")
+                   if p.name.split(".")[1] in finished),
                   key=lambda p: _tag_rank(p.name.split(".")[1]))
     stamp = {p.name: [p.stat().st_size, p.stat().st_mtime_ns] for p in srcs}
     meta_path = root / "verified" / f"part-{part:04d}.meta.json"
-    if meta_path.exists() and json.loads(meta_path.read_text(encoding="utf-8")) == stamp:
-        return None
+    try:
+        if json.loads(meta_path.read_text(encoding="utf-8")) == stamp:
+            return None
+    except (OSError, ValueError):
+        pass  # missing or corrupt meta: treat as stale
     problems: dict[str, dict] = {}
     with open(root / "prompts" / f"part-{part:04d}.jsonl", encoding="utf-8") as f:
         for line in f:
@@ -78,13 +93,14 @@ def verify_part(root: Path, part: int, workers: int, timeout: float) -> dict | N
                     chosen[g["id"]] = g
     gens = [chosen[i] for i in sorted(chosen)]
     with ThreadPoolExecutor(workers) as ex:
-        results = list(ex.map(lambda g: check(problems[g["id"]], g, timeout), gens))
+        results = list(ex.map(lambda g: _safe_check(problems[g["id"]], g, timeout), gens))
     (root / "verified").mkdir(exist_ok=True)
     (root / "kept").mkdir(exist_ok=True)
-    with open(root / "verified" / f"part-{part:04d}.jsonl", "w", encoding="utf-8",
-              newline="\n") as fv, \
-            open(root / "kept" / f"part-{part:04d}.jsonl", "w", encoding="utf-8",
-                 newline="\n") as fk:
+    vfinal = root / "verified" / f"part-{part:04d}.jsonl"
+    kfinal = root / "kept" / f"part-{part:04d}.jsonl"
+    vtmp, ktmp = vfinal.with_suffix(".jsonl.tmp"), kfinal.with_suffix(".jsonl.tmp")
+    with open(vtmp, "w", encoding="utf-8", newline="\n") as fv, \
+            open(ktmp, "w", encoding="utf-8", newline="\n") as fk:
         for g, r in zip(gens, results):
             fv.write(json.dumps(r | {"teacher_tag": g.get("teacher_tag")}) + "\n")
             if r["kept"]:
@@ -92,8 +108,11 @@ def verify_part(root: Path, part: int, workers: int, timeout: float) -> dict | N
                 fk.write(json.dumps({"id": g["id"], "split": p["split"], "prompt": p["prompt"],
                                      "response": g["response"], "entry_point": p["entry_point"],
                                      "teacher": g.get("teacher"),
-                                     "teacher_tag": g.get("teacher_tag")},
+                                     "teacher_tag": g.get("teacher_tag"),
+                                     "revision": g.get("revision")},
                                     ensure_ascii=False) + "\n")
+    os.replace(vtmp, vfinal)
+    os.replace(ktmp, kfinal)
     meta_path.write_text(json.dumps(stamp), encoding="utf-8")
     return {"answers": len(results), "kept": sum(r["kept"] for r in results)}
 
@@ -105,18 +124,26 @@ def verify_parts(root: Path, workers: int, timeout: float) -> dict:
         s = verify_part(root, part, workers, timeout)
         if s:
             print(f"part {part}: {s['kept']}/{s['answers']} kept", flush=True)
-    rows = []
+    answers = kept = 0
+    by_tag: dict[str, dict[str, int]] = {}
+    outcomes: Counter = Counter()
     for f in sorted((root / "verified").glob("part-*.jsonl")):  # empty if dir is missing
         with open(f, encoding="utf-8") as fh:
-            rows += [json.loads(l) for l in fh if l.strip()]
-    by_tag: dict[str, list[dict]] = {}
-    for r in rows:
-        by_tag.setdefault(r.get("teacher_tag") or "?", []).append(r)
-    kept = sum(r["kept"] for r in rows)
-    summary = {"answers": len(rows), "kept": kept,
-               "kept_pct": round(100 * kept / len(rows), 1) if rows else 0.0,
-               "by_teacher_tag": {t: {"answers": len(v), "kept": sum(x["kept"] for x in v)}
-                                  for t, v in sorted(by_tag.items())},
+            for line in fh:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                t = by_tag.setdefault(r.get("teacher_tag") or "?", {"answers": 0, "kept": 0})
+                t["answers"] += 1
+                t["kept"] += bool(r["kept"])
+                answers += 1
+                kept += bool(r["kept"])
+                outcomes["passed" if r["kept"] else
+                         ((r.get("error") or "").split(":")[0] or "some_tests_failed")] += 1
+    summary = {"answers": answers, "kept": kept,
+               "kept_pct": round(100 * kept / answers, 1) if answers else 0.0,
+               "by_teacher_tag": dict(sorted(by_tag.items())),
+               "outcomes": dict(outcomes.most_common()),
                "rule": "kept = the reply ended on its own (eos), has a code block defining "
                        "the entry point, and every assert passed in quipu.sandbox"}
     (root / "verify_summary.json").write_text(json.dumps(summary, indent=1) + "\n",

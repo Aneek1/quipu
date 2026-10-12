@@ -461,3 +461,45 @@ def test_verify_parts_without_done_parts_does_not_crash(tmp_path):
     s = verify_parts(tmp_path, workers=1, timeout=10)
     assert s["answers"] == 0 and s["kept"] == 0
     assert (tmp_path / "verify_summary.json").exists()
+
+
+def test_verify_part_ignores_unfinished_tags(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD], "q4km-llamacpp": [BAD, BAD]})
+    (tmp_path / "generations" / "part-0000.q4km-llamacpp.done").unlink()
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) == {"answers": 2, "kept": 2}
+    with open(tmp_path / "generations" / "part-0000.q4km-llamacpp.jsonl", "a") as f:
+        f.write("{}\n")  # partial file keeps growing
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) is None
+
+
+def test_verify_part_corrupt_meta_is_stale(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD]})
+    verify_part(tmp_path, 0, workers=1, timeout=10)
+    (tmp_path / "verified" / "part-0000.meta.json").write_text("")
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) == {"answers": 2, "kept": 2}
+
+
+def test_verify_part_worker_exception_becomes_rejection(tmp_path, monkeypatch):
+    import scripts.distill_verify as dv
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, GOOD]})
+
+    def boom(*a, **k):
+        raise OSError("spawn failed")
+    monkeypatch.setattr(dv, "run_tests", boom)
+    assert verify_part(tmp_path, 0, workers=1, timeout=10) == {"answers": 2, "kept": 0}
+    rows = [json.loads(l) for l in open(tmp_path / "verified" / "part-0000.jsonl", encoding="utf-8")]
+    assert {r["error"] for r in rows} == {"verifier:OSError"}
+
+
+def test_verify_parts_summary_has_outcomes_and_revision(tmp_path):
+    _setup_part(tmp_path, {"bf16-vllm": [GOOD, BAD]})
+    p = tmp_path / "generations" / "part-0000.bf16-vllm.jsonl"
+    rows = [json.loads(l) for l in open(p, encoding="utf-8")]
+    with open(p, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r | {"revision": "rev1"}) + "\n")
+    s = verify_parts(tmp_path, workers=1, timeout=10)
+    assert s["by_teacher_tag"] == {"bf16-vllm": {"answers": 2, "kept": 1}}
+    assert s["outcomes"]["passed"] == 1 and sum(s["outcomes"].values()) == 2
+    kept = json.loads(open(tmp_path / "kept" / "part-0000.jsonl", encoding="utf-8").readline())
+    assert kept["revision"] == "rev1"
