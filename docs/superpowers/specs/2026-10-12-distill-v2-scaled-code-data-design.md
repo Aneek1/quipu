@@ -49,8 +49,8 @@ problems at ~1,024-token answers); laptop ~15-25M tokens per overnight session.
 ### 2. Generator (`scripts/distill_generate_v2.py`, new)
 - An HTTP client for an OpenAI-compatible `/v1/chat/completions` endpoint. The
   same script drives vLLM (box) and llama.cpp `llama-server` (laptop).
-- Flags: `--endpoint`, `--direction up|down` (box takes parts from the first
-  upward, laptop from the last downward), `--concurrency` (box ~128, laptop ~4-8),
+- Flags: `--endpoint`, `--parts START:END` and `--direction up|down` (box
+  `0:4 up`, laptop `5:19 down`), `--concurrency` (box ~128, laptop ~4-8),
   `--max-new-tokens 1024`, `--teacher-tag` (e.g. `bf16-vllm`, `q4km-llamacpp`).
 - Decoding: greedy (temperature 0), the system prompt below, the problem as the
   user turn.
@@ -115,8 +115,8 @@ problems at ~1,024-token answers); laptop ~15-25M tokens per overnight session.
 
 Unit tests (`tests/test_distill_v2.py`):
 - extract_code on plan + code + edge-case replies (and replies with two blocks);
-- part claiming: up and down walkers over 6 parts never take the same part
-  unless started together; complete parts are skipped;
+- part ranges: `--parts` with up/down order walks only its own range;
+  parts with a `.done` sidecar are skipped;
 - resume skips done ids; a PAUSE file stops cleanly with everything flushed;
 - verifier dedup prefers bf16 over q4 for the same id.
 
