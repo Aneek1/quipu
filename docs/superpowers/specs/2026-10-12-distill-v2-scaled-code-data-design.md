@@ -20,15 +20,15 @@ pretraining, at hundreds of millions of tokens, not thousands.
 |---|---|
 | Scope | Code only. Multilingual (in-language explanations + checkable maths) next. |
 | Teacher | `Qwen/Qwen2.5-Coder-7B-Instruct`, Apache-2.0, pinned revision. Never Claude. |
-| Answer style | Short plan in plain English, then one ```python block with the function, then one line on edge cases / complexity. |
+| Answer style | Explain-first, structured (see "Teacher system prompt"). Style is described in words only; no Claude-written example answers in the prompt, and the data/model are never labelled "Claude-style". |
 | Prompt source | nvidia/OpenCodeInstruct only (v1 pass rate 74%); APPS dropped (31%). |
 | Cloud budget | Existing Vast credit only ($3.57); hard cap **$3.00**, $0.57 left as reserve. No top-up. |
 | Cloud GPU | One RTX 3090 (~$0.17/h, ~17 h), teacher in **bf16**, vLLM. No 3090-vs-5090 benchmark. |
 | Laptop | Does the rest: RTX 5060 Laptop 8 GB, 4-bit teacher via llama.cpp server, pause/resume any time. |
 | Verification | On the laptop CPU (free), resumable, per part file. |
 
-Expected yield: cloud ~90-150M generated tokens (~65-105M kept, ~150-200k solved
-problems); laptop ~15-25M tokens per overnight session.
+Expected yield: cloud ~90-150M generated tokens (~65-105M kept, ~120-170k solved
+problems at ~1,024-token answers); laptop ~15-25M tokens per overnight session.
 
 ## Components
 
@@ -49,9 +49,18 @@ problems); laptop ~15-25M tokens per overnight session.
   same script drives vLLM (box) and llama.cpp `llama-server` (laptop).
 - Flags: `--endpoint`, `--direction up|down` (box takes parts from the first
   upward, laptop from the last downward), `--concurrency` (box ~128, laptop ~4-8),
-  `--max-new-tokens 768`, `--teacher-tag` (e.g. `bf16-vllm`, `q4km-llamacpp`).
-- Decoding: greedy (temperature 0), one system prompt fixing the answer style,
-  the problem as the user turn.
+  `--max-new-tokens 1024`, `--teacher-tag` (e.g. `bf16-vllm`, `q4km-llamacpp`).
+- Decoding: greedy (temperature 0), the system prompt below, the problem as the
+  user turn.
+- **Teacher system prompt** (fixed, stored in the script and in every manifest):
+  > Start with one or two sentences restating what the problem asks and the
+  > approach you'll take. Then give a short numbered plan (2-4 steps). Then the
+  > complete function in one ```python block, with clear names and a brief
+  > docstring, and comments only where the logic isn't obvious. End with a short
+  > "Edge cases" line covering empty input, boundaries, and time complexity. Be
+  > direct and friendly, don't repeat yourself, and no filler like "Great question!".
+  It describes the style only; it contains no example answers, so no
+  Claude-written text can reach the training data.
 - Output: `data/distill-v2/generations/part-NNNN.<teacher-tag>.jsonl`, one row per
   prompt: id, part, teacher, revision, teacher_tag, response, finish (eos|length),
   new_tokens. Each row appended and flushed when it completes.
@@ -112,7 +121,8 @@ Unit tests (`tests/test_distill_v2.py`):
 
 Smoke run: build prompts with `--limit` to one small part, run 50 prompts on the
 laptop through llama-server, verify, read 5 answers by eye, check pass rate is
-in the v1 range (~65-75%). Only then rent the box.
+in the v1 range (~65-75%) and that answers follow the style (restate, plan,
+code, edge cases); adjust the system prompt wording if not. Only then rent the box.
 
 ## Out of scope
 - Multilingual data (next spec).
