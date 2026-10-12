@@ -2,13 +2,16 @@
 # Copy distill v2 generations back from the box: bash scripts/remote/pull_distill_v2.sh HOST PORT
 # Copies every part-*.bf16-vllm.* file (finished and partial). Finished parts (.done present)
 # are sha256-checked against the .done sidecar; prints OK <file>, PARTIAL <file> <rows>,
-# or HASH MISMATCH <file>. Exit 1 on any mismatch.
+# or HASH MISMATCH <file>. Exit 1 on any mismatch, 2 if scp fails.
+# A PARTIAL file may end in a torn (incomplete) last line; consumers must tolerate that.
 set -euo pipefail
+cd "$(dirname "$0")/../.."
 HOST=$1; PORT=$2
 DEST=data/distill-v2/generations
 mkdir -p "$DEST"
 scp -P "$PORT" -o StrictHostKeyChecking=no \
-  "root@$HOST:/workspace/quipu/data/distill-v2/generations/part-*.bf16-vllm.*" "$DEST/"
+  "root@$HOST:/workspace/quipu/data/distill-v2/generations/part-*.bf16-vllm.*" "$DEST/" \
+  || { echo "scp failed (no generations yet, or connection)"; exit 2; }
 bad=0
 for f in "$DEST"/part-*.bf16-vllm.jsonl; do
   [ -e "$f" ] || continue
