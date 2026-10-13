@@ -1,7 +1,8 @@
 """Quipu chat demo: quipu-moe-1B-A149M-chat-distill on a free CPU Space.
 
 Uses the model repo's own standalone loader (modeling_quipu_moe.py), so the demo runs
-exactly the published weights and code. Replies stream token by token."""
+exactly the published weights, with a KV cache added in kv_generate.py (same tokens as the
+loader's own generation, about 6x faster). Replies stream token by token."""
 import importlib.util
 import os
 import sys
@@ -9,12 +10,13 @@ import threading
 
 import gradio as gr
 import torch
-import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
+
+import kv_generate as kv
 
 REPO = os.environ.get("QUIPU_REPO", "AneekC/quipu-moe-1B-A149M-chat-distill")
 MAX_NEW = 256
-MAX_PROMPT = 1024          # keep the most recent turns; the loader has no KV cache
+MAX_PROMPT = 1024          # keep the most recent turns (context is 2,048 tokens)
 
 def usable_cpus() -> int:
     # Spaces report the host's CPU count; the container only gets its share.
@@ -33,6 +35,7 @@ spec = importlib.util.spec_from_file_location("modeling_quipu_moe", path)
 mq = importlib.util.module_from_spec(spec)
 sys.modules["modeling_quipu_moe"] = mq
 spec.loader.exec_module(mq)
+kv.bind(mq)
 
 model = mq.load(REPO).eval()
 tok = mq.load_tokenizer(REPO)
@@ -71,28 +74,11 @@ def respond(message, history, temperature, repetition_penalty, max_new_tokens):
         ids = encode(msgs)
     ids = ids[-MAX_PROMPT:]
 
-    with lock, torch.no_grad():
-        idx = torch.tensor([ids])
+    with lock:
         new: list[int] = []
-        for _ in range(int(max_new_tokens)):
-            logits = model(idx[:, -model.cfg.context:])[:, -1, :].float()
-            if repetition_penalty > 1.0 and new:
-                # CTRL-style penalty on tokens already in the reply: stops greedy loops.
-                seen = torch.tensor(sorted(set(new)))
-                vals = logits[0, seen]
-                logits[0, seen] = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
-            if temperature <= 0:
-                nxt = logits.argmax(-1, keepdim=True)
-            else:
-                logits = logits / float(temperature)
-                v, _ = torch.topk(logits, 50)
-                logits[logits < v[:, [-1]]] = -float("inf")
-                nxt = torch.multinomial(F.softmax(logits, -1), 1)
-            t = int(nxt)
-            if t in (END, EOT):
-                break
+        for t in kv.stream(model, ids, int(max_new_tokens), {END, EOT},
+                           temperature=float(temperature), repetition_penalty=float(repetition_penalty)):
             new.append(t)
-            idx = torch.cat([idx, nxt], dim=1)
             yield tok.decode(new)
         if not new:
             yield "(no reply)"
@@ -101,7 +87,7 @@ def respond(message, history, temperature, repetition_penalty, max_new_tokens):
 DESCRIPTION = """**quipu-moe-1B-A149M-chat-distill**: a 1B-parameter mixture of experts (149M active per token),
 trained from scratch for under $20, then fine-tuned on human-written chats plus coding answers that passed
 their unit tests. It solves 7.4% of MBPP. **It is small and often wrong**: don't trust its facts or its code.
-Runs on a free 2-vCPU machine, so replies take a little while.
+Runs on a small CPU machine.
 [Model card](https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill) ·
 [Project page](https://quipu-lm.vercel.app) · [Code](https://github.com/Aneek1/quipu)"""
 
