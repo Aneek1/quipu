@@ -145,6 +145,7 @@
       <a href="#distill">Distillation</a>
       <a href="#model">114M</a>
       <a href="#next">Next</a>
+      <a href="https://aneek1--quipu-chat-ui.us-east.modal.run">Demo</a>
       <a href="https://huggingface.co/AneekC">Hugging Face</a>
       <a href="https://github.com/Aneek1/quipu">GitHub</a>
     </div>
@@ -157,7 +158,8 @@
       <p class="lede">Small language models, trained from scratch on a tight budget.</p>
       <p class="sub">Own weights, own tokenizer, own data pipeline, no fine-tuned base. It started on an 8&nbsp;GB laptop GPU; the current model is a 1B mixture of experts that cost under $20 to train on one rented GPU.</p>
       <div class="cta">
-        <a class="btn primary" href="#distill">See the latest result</a>
+        <a class="btn primary" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Try the chat demo</a>
+        <a class="btn ghost" href="#distill">See the latest result</a>
         <a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Download the weights</a>
       </div>
     </div>
@@ -206,7 +208,8 @@
       <div class="card"><span class="n">honest scale</span><h3>About 4x better, and still low.</h3><p>SantaCoder (1.1B) reports around 35% on MBPP and Qwen2.5-Coder-1.5B about 69%, with different settings. Quipu uses 149M parameters per token and saw 4.26B tokens. It is not competing with them yet.</p></div>
       <div class="card"><span class="n">in progress · v2</span><h3>The same idea, about 60 times bigger.</h3><p>A 7B teacher (Qwen2.5-Coder-7B-Instruct) is working through 1M problems: most on a rented RTX 3090 capped at $3, the rest on the laptop. In the first finished part, 84% of answers pass their tests. Next: test whether this data helps more in pretraining than in fine-tuning.</p></div>
     </div>
-    <p style="margin-top:22px"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Distilled model and model card on Hugging Face →</a></p>
+    <p style="margin-top:22px;display:flex;gap:12px;flex-wrap:wrap"><a class="btn primary" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Try it in the chat demo →</a><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Distilled model and model card on Hugging Face →</a></p>
+    <p class="muted" style="font-size:14px">The demo runs on a small CPU machine that sleeps when idle: the first visit can take about 15 seconds to wake it.</p>
   </section>
 
   <section id="model">
