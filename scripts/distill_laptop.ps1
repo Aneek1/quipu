@@ -144,7 +144,8 @@ switch ($Cmd) {
         if (Test-Path (Join-Path $Root 'PAUSE')) { 'PAUSE file present' }
         if (Test-Path $PidFile) {
             $id = Get-Content $PidFile
-            if (Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue) { 'llama-server running: pid {0}' -f $id } else { 'server.pid is stale (pid {0} gone)' -f $id }
+            $sp = Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue
+            if ($sp -and $sp.ProcessName -eq 'llama-server') { 'llama-server running: pid {0}' -f $id } else { 'server.pid is stale (pid {0} gone)' -f $id }
         }
     }
 }
