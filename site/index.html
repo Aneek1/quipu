@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Quipu</title>
-<meta name="description" content="A small language model trained from scratch on one 8 GB laptop GPU.">
+<meta name="description" content="Small language models trained from scratch on a tight budget: a 1B mixture of experts for under $20, and execution-verified distillation.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -141,33 +141,76 @@
   <nav>
     <a class="brand" href="#">quipu</a>
     <div class="links">
-      <a href="#model">Model</a>
-      <a href="#data">Data</a>
+      <a href="#latest">Latest</a>
+      <a href="#distill">Distillation</a>
+      <a href="#model">114M</a>
       <a href="#next">Next</a>
-      <a href="https://huggingface.co/AneekC/quipu-114m">Hugging Face</a>
+      <a href="https://huggingface.co/AneekC">Hugging Face</a>
       <a href="https://github.com/Aneek1/quipu">GitHub</a>
     </div>
   </nav>
 
   <header class="hero">
     <div>
-      <span class="status"><span class="dot"></span>quipu-114m trained · 25–27 Sep 2026</span>
+      <span class="status"><span class="dot"></span>distilled chat model released · 13 Oct 2026</span>
       <h1>Quipu</h1>
-      <p class="lede">A small language model, trained from scratch on a single 8&nbsp;GB laptop GPU.</p>
-      <p class="sub">Own weights, own data pipeline, no fine-tuned base. The goal is a small model that pulls well above its size by remembering instead of memorising.</p>
+      <p class="lede">Small language models, trained from scratch on a tight budget.</p>
+      <p class="sub">Own weights, own tokenizer, own data pipeline, no fine-tuned base. It started on an 8&nbsp;GB laptop GPU; the current model is a 1B mixture of experts that cost under $20 to train on one rented GPU.</p>
       <div class="cta">
-        <a class="btn primary" href="#results">See the results</a>
-        <a class="btn ghost" href="https://huggingface.co/AneekC/quipu-114m">Download the weights</a>
+        <a class="btn primary" href="#distill">See the latest result</a>
+        <a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Download the weights</a>
       </div>
     </div>
     <figure class="quipu-fig" style="margin:0">
       <svg id="quipu" viewBox="0 0 440 300" role="img" aria-label="A quipu whose cords record the share of each programming language in the code data"></svg>
-      <figcaption>The code mix, recorded the Incan way: one cord per language, clusters of knots for tens (upper) and units (lower). Java's cord reads 3 and 5, for 35%.</figcaption>
+      <figcaption>quipu-114m's code mix, recorded the Incan way: one cord per language, clusters of knots for tens (upper) and units (lower). Java's cord reads 3 and 5, for 35%.</figcaption>
     </figure>
   </header>
 
+  <section id="latest">
+    <p class="kicker">Latest · quipu-moe-1B-A149M</p>
+    <h2>A 1B mixture of experts that uses 149M parameters per token.</h2>
+    <p class="muted">Pretrained from scratch on one rented RTX 5090. Cost from the spend ledger, including the A/B tests, the chat fine-tune and evaluation.</p>
+    <div class="stats">
+      <div class="stat"><b>998M / 149M</b><span>parameters, total / active</span></div>
+      <div class="stat"><b>4.26B</b><span>training tokens</span></div>
+      <div class="stat"><b>44.3k</b><span>tokens / second, bf16</span></div>
+      <div class="stat"><b>$18.75</b><span>total compute cost</span></div>
+    </div>
+
+    <div class="two" style="margin-top:40px">
+      <div>
+        <h2 style="font-size:26px">What changed from 114M</h2>
+        <p>16 layers, each with one shared expert and 64 small routed experts, of which every token uses 4. Routing is balanced without an auxiliary loss (Quantile Balancing). A new 49,152-token tokenizer, trained for this model, keeps code indentation intact and covers ten languages.</p>
+        <p>Every design switch was A/B tested at 200M tokens before the full run, and the losers are published too. Muon beat AdamW clearly: <span class="mono">3.32</span> vs <span class="mono">4.06</span> loss, against seed noise of <span class="mono">0.03</span>.</p>
+        <p class="muted">Data: 60% permissively licensed code, 28% English, 12% Indonesian, Malay, Chinese, Japanese, Korean, Tamil, Hindi and Urdu, each document checked with my own language-ID model. HumanEval and MBPP were filtered out of the training data.</p>
+      </div>
+      <div>
+        <h3 class="sub-h" style="margin-top:0">Bits per byte at the end of pretraining</h3>
+        <p class="muted" style="font-size:14px">Lower is better, comparable across tokenizers. Held-out text per language, and held-out code.</p>
+        <div class="langs" id="bpb" aria-label="Bits per byte per language at the final pretraining step"></div>
+      </div>
+    </div>
+    <p style="margin-top:22px"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M">Base model and full model card on Hugging Face →</a></p>
+  </section>
+
+  <section id="distill">
+    <p class="kicker">Distillation</p>
+    <h2>Keep only the answers that pass their tests.</h2>
+    <p>The chat model could barely write code: greedy decoding solved 5 of MBPP's 257 problems. So an open-weight teacher, <a href="https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct">Qwen2.5-Coder-1.5B-Instruct</a> (Apache-2.0), answered 5,000 coding problems, and every answer was run against the problem's unit tests in a sandbox. Only the 3,277 that passed were kept. The chat fine-tune was then repeated with those added.</p>
+    <div class="stats" style="grid-template-columns:repeat(2,1fr)">
+      <div class="stat"><b>1.9% → 7.4%</b><span>MBPP pass@1, greedy (5 → 19 of 257)</span></div>
+      <div class="stat"><b>0% → 0.6%</b><span>HumanEval pass@1, greedy (0 → 1 of 164)</span></div>
+    </div>
+    <div class="cards" style="margin-top:22px">
+      <div class="card"><span class="n">honest scale</span><h3>About 4x better, and still low.</h3><p>SantaCoder (1.1B) reports around 35% on MBPP and Qwen2.5-Coder-1.5B about 69%, with different settings. Quipu uses 149M parameters per token and saw 4.26B tokens. It is not competing with them yet.</p></div>
+      <div class="card"><span class="n">in progress · v2</span><h3>The same idea, about 60 times bigger.</h3><p>A 7B teacher (Qwen2.5-Coder-7B-Instruct) is working through 1M problems: most on a rented RTX 3090 capped at $3, the rest on the laptop. In the first finished part, 84% of answers pass their tests. Next: test whether this data helps more in pretraining than in fine-tuning.</p></div>
+    </div>
+    <p style="margin-top:22px"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Distilled model and model card on Hugging Face →</a></p>
+  </section>
+
   <section id="model">
-    <p class="kicker">quipu-114m</p>
+    <p class="kicker">First model · quipu-114m</p>
     <h2>A 114M-parameter decoder, sized for one laptop.</h2>
     <p class="muted">Every number here was measured on the machine that trained it, an RTX 5060 Laptop GPU with 8 GB.</p>
     <div class="stats">
@@ -246,15 +289,17 @@
     <h2>Where it goes from here.</h2>
     <ol class="roadmap">
       <li class="done"><span class="k"></span><div><b>Pretraining at 114M · done</b><span>3B tokens in 45 hours on one laptop GPU. Weights are public.</span></div></li>
-      <li class="now"><span class="k"></span><div><b>Memory for a 1M-token effective context · next</b><span>A short attention window plus a retrievable map of everything before it, on the same 8 GB card.</span></div></li>
-      <li><span class="k"></span><div><b>Instruction tuning</b><span>So it answers rather than continues.</span></div></li>
-      <li><span class="k"></span><div><b>350M with a code tokenizer and tool calling</b><span>Aimed at driving coding agents. The whitespace result above is the measured reason for the new tokenizer.</span></div></li>
+      <li class="done"><span class="k"></span><div><b>1B mixture of experts with a code-aware tokenizer · done</b><span>4.26B tokens, ten languages and code, $18.75 in total. The whitespace result above is why the tokenizer changed.</span></div></li>
+      <li class="done"><span class="k"></span><div><b>Chat fine-tune and execution-verified distillation · done</b><span>Human-written conversations, then teacher answers that pass their tests: MBPP 1.9% → 7.4%.</span></div></li>
+      <li class="now"><span class="k"></span><div><b>Distillation v2 · running</b><span>A 7B teacher, 1M problems, every answer tested; about 200k verified answers expected for $3.</span></div></li>
+      <li><span class="k"></span><div><b>Teacher data in pretraining</b><span>Does mixing verified answers into pretraining beat the normal mix at the same compute? A small-scale test first.</span></div></li>
+      <li><span class="k"></span><div><b>A ~7B-total, ~1B-active model</b><span>If the test says yes, and once there is compute for it.</span></div></li>
     </ol>
   </section>
 
   <footer>
     <span>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands.</span>
-    <span>Code: <a href="https://github.com/Aneek1/quipu">github.com/Aneek1/quipu</a> · Weights: <a href="https://huggingface.co/AneekC/quipu-114m">huggingface.co/AneekC/quipu-114m</a></span>
+    <span>Code: <a href="https://github.com/Aneek1/quipu">github.com/Aneek1/quipu</a> · Weights: <a href="https://huggingface.co/AneekC">huggingface.co/AneekC</a></span>
   </footer>
 </div>
 
@@ -294,6 +339,24 @@
     const t = el("text", { x, y: 284, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": "Inter, sans-serif" });
     t.textContent = name.replace(" (capped)", "").replace("JavaScript", "JS").replace("TypeScript", "TS");
   });
+
+  // Bits per byte at step 8,129, from the quipu-moe-1B-A149M model card.
+  const BPB = [["Code", 0.448], ["Tamil", 0.491], ["Hindi (Devanagari)", 0.568], ["English", 0.959],
+    ["Indonesian", 1.157], ["Malay", 1.162], ["Korean", 1.199], ["Japanese", 1.234],
+    ["Hindi (romanised)", 1.255], ["Urdu (romanised)", 1.582], ["Chinese (Trad.)", 1.728], ["Chinese (Simp.)", 1.768]];
+  const bpbEl = document.getElementById("bpb");
+  for (const [name, v] of BPB) {
+    const row = document.createElement("div");
+    row.className = "lang";
+    const label = document.createElement("span"); label.textContent = name;
+    const track = document.createElement("span"); track.className = "track";
+    const fill = document.createElement("span"); fill.className = "fill";
+    fill.style.cssText = "display:block;background:var(--accent2);width:" + (v / 2 * 100).toFixed(1) + "%";
+    track.appendChild(fill);
+    const pct = document.createElement("span"); pct.className = "pct"; pct.textContent = v.toFixed(2);
+    row.append(label, track, pct);
+    bpbEl.appendChild(row);
+  }
 
   // Validation loss every 100 steps, from results/runs/quipu-114m-weekend.json.
   const VAL = [[100, 6.378], [200, 5.471], [300, 4.926], [400, 4.612], [500, 4.364], [600, 4.17], [700, 4.047], [800, 3.959], [900, 3.879], [1000, 3.819], [1100, 3.774], [1200, 3.744], [1300, 3.708], [1400, 3.676], [1500, 3.648], [1600, 3.63], [1700, 3.601], [1800, 3.579], [1900, 3.567], [2000, 3.55], [2100, 3.529], [2200, 3.514], [2300, 3.509], [2400, 3.485], [2500, 3.472], [2600, 3.468], [2700, 3.452], [2800, 3.441], [2900, 3.441], [3000, 3.424], [3100, 3.41], [3200, 3.402], [3300, 3.393], [3400, 3.385], [3500, 3.376], [3600, 3.369], [3700, 3.362], [3800, 3.353], [3900, 3.348], [4000, 3.346], [4100, 3.332], [4200, 3.326], [4300, 3.323], [4400, 3.317], [4500, 3.312], [4600, 3.308], [4700, 3.303], [4800, 3.299], [4900, 3.293], [5000, 3.29], [5100, 3.286], [5200, 3.281], [5300, 3.282], [5400, 3.281], [5500, 3.276], [5600, 3.274], [5700, 3.275]];
