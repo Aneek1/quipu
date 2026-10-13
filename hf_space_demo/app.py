@@ -4,8 +4,8 @@ Uses the model repo's own standalone loader (modeling_quipu_moe.py), so the demo
 exactly the published weights, with a KV cache added in kv_generate.py (same tokens as the
 loader's own generation, about 6x faster). Replies stream token by token."""
 import importlib.util
-import html
 import os
+import re
 import sys
 import threading
 
@@ -55,12 +55,17 @@ def encode(messages: list[dict]) -> list[int]:
     return ids
 
 
+TAG = re.compile(r"</?[A-Za-z!][^>]*>")
+
+
 def show(reply: str) -> str:
-    """Markdown for the chat window that shows code as code: text outside ``` fences has
-    < and > escaped, so HTML the model writes is displayed, not rendered (and hidden)."""
+    """Markdown for the chat window that shows code as code. Text outside ``` fences that
+    contains HTML tags is put in an ```html fence: rendered as-is the tags would vanish,
+    and escaping them breaks inside Markdown's indented code blocks."""
     parts = reply.split("```")
     for i in range(0, len(parts), 2):          # even pieces are outside fences
-        parts[i] = parts[i].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if TAG.search(parts[i]):
+            parts[i] = "\n```html\n" + parts[i].strip("\n") + "\n```\n"
     return "```".join(parts)
 
 
@@ -76,10 +81,7 @@ def respond(message, history, temperature, repetition_penalty, max_new_tokens):
     msgs = []
     for h in history or []:
         if isinstance(h, dict) and h.get("role") in ("user", "assistant"):
-            text = text_of(h.get("content"))
-            if h["role"] == "assistant":
-                text = html.unescape(text)      # undo show()'s escaping before re-encoding
-            msgs.append({"role": h["role"], "content": text})
+            msgs.append({"role": h["role"], "content": text_of(h.get("content"))})
     msgs.append({"role": "user", "content": text_of(message)})
     ids = encode(msgs)
     ctx = model.cfg.context
