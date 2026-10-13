@@ -7,7 +7,7 @@ SYSTEM_PROMPT below (a description of the answer style only; no example answers)
 the problem as the user turn.
 
 Each worker gets an explicit part range (--parts START:END, --direction up|down;
-box 0:4 up, laptop 5:19 down), skips parts that have a .done sidecar and works the
+box 0:11 up, laptop 12:19 down), skips parts that have a .done sidecar and works the
 first unfinished one. Every answer is appended and flushed as it arrives, so
 stopping at any point loses only in-flight requests; rerunning resumes. Creating
 data/distill-v2/PAUSE makes it finish in-flight requests and exit. On the box,
