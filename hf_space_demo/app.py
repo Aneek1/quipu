@@ -4,6 +4,7 @@ Uses the model repo's own standalone loader (modeling_quipu_moe.py), so the demo
 exactly the published weights, with a KV cache added in kv_generate.py (same tokens as the
 loader's own generation, about 6x faster). Replies stream token by token."""
 import importlib.util
+import html
 import os
 import sys
 import threading
@@ -15,8 +16,8 @@ from huggingface_hub import hf_hub_download
 import kv_generate as kv
 
 REPO = os.environ.get("QUIPU_REPO", "AneekC/quipu-moe-1B-A149M-chat-distill")
-MAX_NEW = 768
-MAX_PROMPT = 1024          # keep the most recent turns (context is 2,048 tokens)
+MAX_NEW = 1536            # the context is 2,048 tokens: prompt + history + reply share it
+MIN_REPLY = 256           # a long chat keeps at least this much room for the reply
 
 def usable_cpus() -> int:
     # Spaces report the host's CPU count; the container only gets its share.
@@ -75,17 +76,23 @@ def respond(message, history, temperature, repetition_penalty, max_new_tokens):
     msgs = []
     for h in history or []:
         if isinstance(h, dict) and h.get("role") in ("user", "assistant"):
-            msgs.append({"role": h["role"], "content": text_of(h.get("content"))})
+            text = text_of(h.get("content"))
+            if h["role"] == "assistant":
+                text = html.unescape(text)      # undo show()'s escaping before re-encoding
+            msgs.append({"role": h["role"], "content": text})
     msgs.append({"role": "user", "content": text_of(message)})
     ids = encode(msgs)
-    while len(ids) > MAX_PROMPT and len(msgs) > 1:    # drop the oldest turns first
+    ctx = model.cfg.context
+    want = int(max_new_tokens)
+    while len(ids) + want > ctx and len(msgs) > 1:    # drop the oldest turns first
         msgs = msgs[2:] if len(msgs) > 2 else msgs[1:]
         ids = encode(msgs)
-    ids = ids[-MAX_PROMPT:]
+    ids = ids[-(ctx - MIN_REPLY):]                      # a very long single message
+    max_new = min(want, ctx - len(ids))                 # stay inside the window (KV-cache path)
 
     with lock:
         new: list[int] = []
-        for t in kv.stream(model, ids, int(max_new_tokens), {END, EOT},
+        for t in kv.stream(model, ids, max_new, {END, EOT},
                            temperature=float(temperature), repetition_penalty=float(repetition_penalty)):
             new.append(t)
             yield show(tok.decode(new))
@@ -115,7 +122,7 @@ kwargs = dict(
     additional_inputs=[
         gr.Slider(0.0, 1.2, value=0.3, step=0.1, label="Temperature (0 = greedy)"),
         gr.Slider(1.0, 1.5, value=1.15, step=0.05, label="Repetition penalty (1 = off)"),
-        gr.Slider(32, MAX_NEW, value=384, step=32, label="Max new tokens (HTML needs more)"),
+        gr.Slider(64, MAX_NEW, value=768, step=64, label="Max new tokens (the window is 2,048 incl. your message)"),
     ],
     cache_examples=False,
 )
