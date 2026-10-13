@@ -11,6 +11,9 @@
 set -euo pipefail
 export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH
 export HF_HOME=/workspace/hf
+# FlashInfer's sampler JIT-compiles on first use (needs ninja + nvcc, absent from the runtime
+# image); decoding is greedy, so vLLM's own sampler is enough.
+export VLLM_USE_FLASHINFER_SAMPLER=0
 RATE=$1; REV=$2; BUDGET=${3:-3.00}; BOX_START=${4:-}
 # Box takes parts 0..11 (600k prompts): ~370-token answers mean $3 of 3090 time needs more than 250k.
 # The laptop works 19 down to 12, so the ranges cannot overlap.
