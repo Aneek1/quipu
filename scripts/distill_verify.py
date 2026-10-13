@@ -41,7 +41,7 @@ def check(problem: dict, gen: dict, timeout: float) -> dict:
     return rec | {"passed": r.passed, "error": r.error, "kept": r.all_passed}
 
 
-TAG_PRIORITY = ["bf16-vllm", "q4km-llamacpp"]  # first answer per id wins, in this order
+TAG_PRIORITY = ["bf16-vllm", "modal-h100-bf16", "q4km-llamacpp"]  # first answer per id wins, in this order
 
 
 def _tag_rank(tag: str) -> int:
