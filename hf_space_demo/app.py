@@ -15,7 +15,7 @@ from huggingface_hub import hf_hub_download
 import kv_generate as kv
 
 REPO = os.environ.get("QUIPU_REPO", "AneekC/quipu-moe-1B-A149M-chat-distill")
-MAX_NEW = 256
+MAX_NEW = 768
 MAX_PROMPT = 1024          # keep the most recent turns (context is 2,048 tokens)
 
 def usable_cpus() -> int:
@@ -54,6 +54,15 @@ def encode(messages: list[dict]) -> list[int]:
     return ids
 
 
+def show(reply: str) -> str:
+    """Markdown for the chat window that shows code as code: text outside ``` fences has
+    < and > escaped, so HTML the model writes is displayed, not rendered (and hidden)."""
+    parts = reply.split("```")
+    for i in range(0, len(parts), 2):          # even pieces are outside fences
+        parts[i] = parts[i].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "```".join(parts)
+
+
 def text_of(content) -> str:
     if isinstance(content, str):
         return content
@@ -79,7 +88,7 @@ def respond(message, history, temperature, repetition_penalty, max_new_tokens):
         for t in kv.stream(model, ids, int(max_new_tokens), {END, EOT},
                            temperature=float(temperature), repetition_penalty=float(repetition_penalty)):
             new.append(t)
-            yield tok.decode(new)
+            yield show(tok.decode(new))
         if not new:
             yield "(no reply)"
 
@@ -106,7 +115,7 @@ kwargs = dict(
     additional_inputs=[
         gr.Slider(0.0, 1.2, value=0.3, step=0.1, label="Temperature (0 = greedy)"),
         gr.Slider(1.0, 1.5, value=1.15, step=0.05, label="Repetition penalty (1 = off)"),
-        gr.Slider(16, MAX_NEW, value=160, step=16, label="Max new tokens"),
+        gr.Slider(32, MAX_NEW, value=384, step=32, label="Max new tokens (HTML needs more)"),
     ],
     cache_examples=False,
 )
