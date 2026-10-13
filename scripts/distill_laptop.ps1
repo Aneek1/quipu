@@ -40,7 +40,7 @@ function Get-LlamaAssets {
     }
     if ($ghOk) {
         foreach ($n in $names) {
-            & gh release download $LlamaTag --repo ggml-org/llama.cpp --pattern $n --clobber
+            & gh release download $LlamaTag --repo ggml-org/llama.cpp --pattern $n --clobber | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $n" }
         }
         return $names
@@ -51,7 +51,7 @@ function Get-LlamaAssets {
     foreach ($n in $names) {
         if (-not ($rel.assets | Where-Object { $_.name -eq $n })) { throw "asset $n not in llama.cpp release $LlamaTag" }
         $url = "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaTag/$n"
-        Write-Output "downloading $url"
+        Write-Host "downloading $url"   # Write-Output would become part of the return value
         Invoke-WebRequest $url -OutFile (Join-Path $Tools $n) -UseBasicParsing
     }
     return $names
@@ -83,7 +83,21 @@ switch ($Cmd) {
     }
     'start' {
         New-Item -ItemType Directory -Force $Root | Out-Null
-        Remove-Item (Join-Path $Root 'PAUSE') -ErrorAction SilentlyContinue
+        # Refuse if a server is already up (a second start, or one orphaned by closing the window)
+        if (Test-Path $PidFile) {
+            $old = Get-Process -Id ([int](Get-Content $PidFile)) -ErrorAction SilentlyContinue
+            if ($old -and $old.ProcessName -eq 'llama-server') {
+                throw "llama-server already running (pid $($old.Id)). Run pause and wait, or Stop-Process -Id $($old.Id) if it is orphaned."
+            }
+            Remove-Item $PidFile
+        }
+        $busy = $true
+        try { Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 5 | Out-Null } catch { $busy = $false }
+        if ($busy) { throw "something already answers on port $Port; stop it before start" }
+        if (Test-Path (Join-Path $Root 'PAUSE')) {
+            Remove-Item (Join-Path $Root 'PAUSE')
+            Write-Output 'cleared a pending PAUSE file'
+        }
         $server = $null
         $code = 1
         try {
@@ -92,7 +106,7 @@ switch ($Cmd) {
             $ready = $false
             for ($i = 0; $i -lt 150; $i++) {
                 if ($server.HasExited) { throw "llama-server exited during load (code $($server.ExitCode))" }
-                try { Invoke-RestMethod "http://127.0.0.1:$Port/health" | Out-Null; $ready = $true; break } catch { Start-Sleep 2 }
+                try { Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 5 | Out-Null; $ready = $true; break } catch { Start-Sleep 2 }
             }
             if (-not $ready) { throw 'llama-server not healthy after 300 s' }
             & $Py (Join-Path $Repo 'scripts\distill_generate_v2.py') --root 'data/distill-v2' --parts 5:19 --direction down `
@@ -116,13 +130,21 @@ switch ($Cmd) {
         $files = Get-ChildItem (Join-Path $Root 'generations') -Filter '*.jsonl' -ErrorAction SilentlyContinue
         foreach ($f in $files) {
             $rows = 0
-            foreach ($line in [System.IO.File]::ReadLines($f.FullName)) { if ($line.Trim()) { $rows++ } }
+            # ReadWrite share: the generator holds the file open while it appends
+            $fs = New-Object System.IO.FileStream($f.FullName, 'Open', 'Read', 'ReadWrite')
+            $sr = New-Object System.IO.StreamReader($fs)
+            try {
+                while ($null -ne ($line = $sr.ReadLine())) { if ($line.TrimEnd().EndsWith('}')) { $rows++ } }   # skip a half-written tail
+            } finally { $sr.Close() }
             $total += $rows
             $done = Test-Path ($f.FullName -replace '\.jsonl$', '.done')
             '{0,-40} rows {1,7}  done {2}' -f $f.Name, $rows, $done
         }
         '{0,-40} rows {1,7}' -f 'TOTAL', $total
         if (Test-Path (Join-Path $Root 'PAUSE')) { 'PAUSE file present' }
-        if (Test-Path $PidFile) { 'server.pid present: {0}' -f (Get-Content $PidFile) }
+        if (Test-Path $PidFile) {
+            $id = Get-Content $PidFile
+            if (Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue) { 'llama-server running: pid {0}' -f $id } else { 'server.pid is stale (pid {0} gone)' -f $id }
+        }
     }
 }
