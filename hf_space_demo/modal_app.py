@@ -4,8 +4,11 @@ scales to zero when idle.
     modal serve hf_space_demo/modal_app.py    # temporary URL, for testing
     modal deploy hf_space_demo/modal_app.py   # stable URL
 
-The model weights are baked into the image at build time, so a cold start only loads
-them from local disk. One container at most: Gradio needs sticky sessions."""
+The model weights are baked into the image at build time, and the container's memory is
+snapshotted after the model has loaded (enable_memory_snapshot): a cold start restores
+that snapshot instead of importing torch and reading 4 GB of weights again. One
+container at most: Gradio needs sticky sessions."""
+import sys
 from pathlib import Path
 
 import modal
@@ -32,18 +35,21 @@ image = (
 
 app = modal.App("quipu-chat", image=image)
 
-
-@app.function(cpu=4.0, memory=8192, max_containers=1, scaledown_window=300, timeout=600)
-@modal.concurrent(max_inputs=20)
-@modal.asgi_app()
-def ui():
-    import sys
-
+with image.imports():
+    # Runs at container start, before the snapshot is taken: torch, the weights and the
+    # Gradio Blocks are all in the snapshot.
     sys.path.insert(0, "/root")
     import gradio as gr
     from fastapi import FastAPI
 
-    import app as chat  # loads the model once per container
+    import app as chat
 
+
+@app.function(cpu=4.0, memory=8192, max_containers=1, scaledown_window=600, timeout=600,
+              enable_memory_snapshot=True)
+@modal.concurrent(max_inputs=20)
+@modal.asgi_app()
+def ui():
+    chat.torch.set_num_threads(chat.usable_cpus())   # thread pools are not restored from a snapshot
     chat.demo.queue(default_concurrency_limit=1)
     return gr.mount_gradio_app(FastAPI(), chat.demo, path="/")
