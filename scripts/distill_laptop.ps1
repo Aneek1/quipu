@@ -1,7 +1,7 @@
 <#
 Distillation v2 on the laptop: llama-server (4-bit teacher) + the generator.
   .\scripts\distill_laptop.ps1 setup   # download llama.cpp + the GGUF (once)
-  .\scripts\distill_laptop.ps1 start   # serve + generate parts 5..19 downward
+  .\scripts\distill_laptop.ps1 start   # serve + generate parts 19..12 downward (box has 0..11)
   .\scripts\distill_laptop.ps1 pause   # write PAUSE: generator finishes in-flight answers, then start stops the server
   .\scripts\distill_laptop.ps1 status  # parts, rows, done flags, total rows
 Never run alongside a GPU benchmark (they share 8 GB).
@@ -109,7 +109,7 @@ switch ($Cmd) {
                 try { Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 5 | Out-Null; $ready = $true; break } catch { Start-Sleep 2 }
             }
             if (-not $ready) { throw 'llama-server not healthy after 300 s' }
-            & $Py (Join-Path $Repo 'scripts\distill_generate_v2.py') --root 'data/distill-v2' --parts 5:19 --direction down `
+            & $Py (Join-Path $Repo 'scripts\distill_generate_v2.py') --root 'data/distill-v2' --parts 12:19 --direction down `
                 --endpoint "http://127.0.0.1:$Port" --teacher-tag q4km-llamacpp --revision $TeacherRev `
                 --concurrency 4 --max-new-tokens 1024
             $code = $LASTEXITCODE
