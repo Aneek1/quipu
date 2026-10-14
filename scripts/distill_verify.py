@@ -117,6 +117,52 @@ def verify_part(root: Path, part: int, workers: int, timeout: float) -> dict | N
     return {"answers": len(results), "kept": sum(r["kept"] for r in results)}
 
 
+def build_kept(root: Path, part: int) -> int:
+    """kept/part-NNNN.jsonl from verified/part-NNNN.jsonl, the prompts and the generation
+    file each verified row names (its teacher_tag). Returns the rows written."""
+    root = Path(root)
+    keep: dict[str, str] = {}
+    with open(root / "verified" / f"part-{part:04d}.jsonl", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line)
+                if r["kept"]:
+                    keep[r["id"]] = r["teacher_tag"]
+    problems: dict[str, dict] = {}
+    with open(root / "prompts" / f"part-{part:04d}.jsonl", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                row = json.loads(line)
+                if row["id"] in keep:
+                    problems[row["id"]] = row
+    chosen: dict[str, dict] = {}
+    for tag in sorted(set(keep.values()), key=_tag_rank):
+        with open(root / "generations" / f"part-{part:04d}.{tag}.jsonl", encoding="utf-8",
+                  errors="replace") as f:
+            for line in f:
+                try:
+                    g = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(g, dict) and keep.get(g.get("id")) == tag and g["id"] not in chosen:
+                    chosen[g["id"]] = g
+    missing = set(keep) - set(chosen)
+    if missing:
+        raise RuntimeError(f"part {part}: {len(missing)} kept ids have no generation")
+    (root / "kept").mkdir(exist_ok=True)
+    final = root / "kept" / f"part-{part:04d}.jsonl"
+    tmp = final.with_name(final.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fk:
+        for i in sorted(chosen):
+            g, p = chosen[i], problems[i]
+            fk.write(json.dumps({"id": i, "split": p["split"], "prompt": p["prompt"],
+                                 "response": g["response"], "entry_point": p["entry_point"],
+                                 "teacher": g.get("teacher"), "teacher_tag": g.get("teacher_tag"),
+                                 "revision": g.get("revision")}, ensure_ascii=False) + "\n")
+    os.replace(tmp, final)
+    return len(chosen)
+
+
 def verify_parts(root: Path, workers: int, timeout: float) -> dict:
     root = Path(root)
     for p in sorted((root / "prompts").glob("part-*.jsonl")):
