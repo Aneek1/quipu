@@ -759,7 +759,6 @@ if modal is not None:
             raise RuntimeError(f"{TOKENIZER} in the image is {have}, not {TOKENIZER_SHA256}")
 
     @app.function(gpu="L40S:2", cpu=10.0, memory=64 * 1024, timeout=SMOKE_TIMEOUT_S,
-                  ephemeral_disk=64 * 1024,
                   volumes={POOL_MOUNT: pool_vol, SHARDS_MOUNT: shards_vol})
     def smoke(world: int, steps1: int, steps2: int, micro_batch: int, dispatch: str,
               compile: bool, usd_per_hour: float) -> dict:
@@ -778,7 +777,6 @@ if modal is not None:
                          cwd=Path("/src"), timeout_s=SMOKE_TIMEOUT_S - 120)
 
     @app.function(gpu="B200", cpu=6.0, memory=40 * 1024, timeout=4 * 3600,
-                  ephemeral_disk=64 * 1024,
                   volumes={POOL_MOUNT: pool_vol, SHARDS_MOUNT: shards_vol, CKPT_MOUNT: ckpt_vol})
     def train(world: int, micro_batch: int, dispatch: str, compile: bool, hours: float,
               usd_per_hour: float, decay_steps: int, timeout_s: int) -> dict:
