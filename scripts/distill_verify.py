@@ -124,6 +124,12 @@ def verify_parts(root: Path, workers: int, timeout: float) -> dict:
         s = verify_part(root, part, workers, timeout)
         if s:
             print(f"part {part}: {s['kept']}/{s['answers']} kept", flush=True)
+    return summarize(root)
+
+
+def summarize(root: Path) -> dict:
+    """verify_summary.json from the verified/ files as they are (verifies nothing)."""
+    root = Path(root)
     answers = kept = 0
     by_tag: dict[str, dict[str, int]] = {}
     outcomes: Counter = Counter()

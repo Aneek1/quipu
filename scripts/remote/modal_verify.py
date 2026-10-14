@@ -111,6 +111,6 @@ def main(parts: str = "", workers: int = 32):
               f"({100 * out['kept'] / out['answers']:.1f}%)", flush=True)
 
     sys.path.insert(0, str(HERE))
-    from scripts.distill_verify import verify_parts
-    summary = verify_parts(DATA, workers=1, timeout=10.0)   # every part is up to date: summary only
+    from scripts.distill_verify import summarize
+    summary = summarize(DATA)
     print(json.dumps({k: summary[k] for k in ("answers", "kept", "kept_pct")}))
