@@ -153,3 +153,237 @@ def test_build_targets_ask_each_live_source_for_what_it_still_lacks():
     targets = pool.build_targets(1000, shares, states, max_epochs=4)
     # a wants 600 and has 100 unused; b wants 360; c is exhausted (nothing to build)
     assert targets == {"a": 500, "b": 360}
+
+
+# ------------------------------------------------------------------ per-source builder
+
+EOT = 0
+OFFSET = 7
+
+
+class CharTok:
+    """One token per character (id = code point + OFFSET), EOT 0."""
+    eot = EOT
+    vocab_size = 65536
+
+    def encode(self, text):
+        return [ord(c) + OFFSET for c in text]
+
+
+def char_tok():
+    return CharTok()
+
+
+class FakeDecontam:
+    """A document containing "LEAK" holds HumanEval/0."""
+
+    def find(self, text):
+        return ("humaneval", "HumanEval/0", "substring") if "LEAK" in text else None
+
+    def fingerprint(self):
+        return "fake"
+
+
+class FakeLid:
+    """"@label rest" -> label (prob 0.99); untagged -> the source language."""
+
+    def __init__(self, default):
+        self.default = default
+
+    def predict(self, text):
+        label = text[1:].split(" ", 1)[0] if text.startswith("@") else self.default
+        return label, 0.99, {label: 0.99}
+
+
+def memory_rows(texts, metas=None):
+    """open_rows over a list: rows from cursor["row"] on; cursor = the next row."""
+    def open_rows(cursor):
+        start = (cursor or {}).get("row", 0)
+        for i in range(start, len(texts)):
+            meta = dict(metas[i]) if metas else {"i": i}
+            yield pool.Row(texts[i], meta, {"row": i + 1})
+    return open_rows
+
+
+def decode_parts(src_dir):
+    """Every document of a source's parts, in order, as text."""
+    st = pool.SourceState.load(src_dir)
+    docs = []
+    for part in st.parts:
+        arr = np.fromfile(src_dir / part["file"], dtype="<u2")
+        cur = []
+        for t in arr.tolist():
+            if t == EOT:
+                docs.append("".join(chr(x - OFFSET) for x in cur))
+                cur = []
+            else:
+                cur.append(t)
+        assert not cur, "a part ends mid-document"
+    return docs
+
+
+def setup(**kw):
+    return pool.BuildSetup(tokenizer=char_tok, decontam=kw.get("decontam", FakeDecontam()),
+                           lid=kw.get("lid"), max_doc_tokens=kw.get("max_doc_tokens", 10_000))
+
+
+def spec(name="s", **opts):
+    return pool.SourceSpec(name, "memory", "a", 1.0, 1.0, opts)
+
+
+TEXTS = [f"doc {i} " + "x" * (10 + i % 7) for i in range(40)]
+
+
+def test_build_writes_unique_documents_until_the_target(tmp_path):
+    out = tmp_path / "s"
+    texts = TEXTS[:10] + [TEXTS[3], "   ", "has a LEAK inside it"] + TEXTS[10:]
+    res = pool.build_source(out, spec(), 400, setup=setup(), open_rows=memory_rows(texts),
+                            shard_tokens=10_000)
+    docs = decode_parts(out)
+    assert docs == TEXTS[:len(docs)]           # in order, the duplicate / blank / leak gone
+    st = pool.SourceState.load(out)
+    assert st.unique_tokens >= 400 and st.unique_tokens - len(TEXTS[len(docs) - 1]) - 1 < 400
+    assert st.stats["dropped_duplicate"] == 1 and st.stats["dropped_blank"] == 1
+    assert st.stats["dropped_contamination"] == 1
+    assert st.stats["dropped_contamination_as"]["humaneval"] == 1
+    assert res["tokens"] == st.unique_tokens and not st.exhausted
+    assert st.documents == len(docs)
+
+
+def test_a_second_build_continues_the_stream_where_the_first_stopped(tmp_path):
+    out = tmp_path / "s"
+    pool.build_source(out, spec(), 100, setup=setup(), open_rows=memory_rows(TEXTS),
+                      shard_tokens=10_000)
+    first = decode_parts(out)
+    pool.build_source(out, spec(), 100, setup=setup(), open_rows=memory_rows(TEXTS),
+                      shard_tokens=10_000)
+    both = decode_parts(out)
+    assert both[:len(first)] == first and both == TEXTS[:len(both)]
+    assert len(both) > len(first)
+    st = pool.SourceState.load(out)
+    assert [p["file"] for p in st.parts] == ["part_00000.bin", "part_00001.bin"]
+    assert len(st.builds) == 2 and st.stats.get("dropped_duplicate", 0) == 0
+
+
+def test_dedup_survives_a_resume(tmp_path):
+    out = tmp_path / "s"
+    texts = TEXTS[:5] + TEXTS[:5] + TEXTS[5:10]
+    pool.build_source(out, spec(), 40, setup=setup(), open_rows=memory_rows(texts),
+                      shard_tokens=10_000)
+    pool.build_source(out, spec(), 10_000, setup=setup(), open_rows=memory_rows(texts),
+                      shard_tokens=10_000)
+    assert decode_parts(out) == TEXTS[:10]
+    assert pool.SourceState.load(out).stats["dropped_duplicate"] == 5
+
+
+def test_a_stream_that_ends_marks_the_source_exhausted(tmp_path):
+    out = tmp_path / "s"
+    res = pool.build_source(out, spec(), 10**9, setup=setup(), open_rows=memory_rows(TEXTS),
+                            shard_tokens=10_000)
+    st = pool.SourceState.load(out)
+    assert st.exhausted and res["exhausted"] and decode_parts(out) == TEXTS
+    again = pool.build_source(out, spec(), 100, setup=setup(), open_rows=memory_rows(TEXTS),
+                              shard_tokens=10_000)
+    assert again["tokens"] == 0 and len(pool.SourceState.load(out).parts) == 1
+
+
+def test_parts_are_cut_at_document_ends_near_shard_tokens(tmp_path):
+    out = tmp_path / "s"
+    pool.build_source(out, spec(), 10**9, setup=setup(), open_rows=memory_rows(TEXTS),
+                      shard_tokens=100)
+    st = pool.SourceState.load(out)
+    assert len(st.parts) > 3
+    for p in st.parts[:-1]:
+        assert 100 <= p["tokens"] < 100 + 30
+    assert sum(p["tokens"] for p in st.parts) == st.unique_tokens
+    assert decode_parts(out) == TEXTS
+
+
+def test_a_killed_build_resumes_from_its_last_checkpoint(tmp_path):
+    out = tmp_path / "s"
+
+    def dying(cursor):
+        for row in memory_rows(TEXTS)(cursor):
+            if row.cursor["row"] == 25:
+                raise KeyboardInterrupt
+            yield row
+
+    with pytest.raises(KeyboardInterrupt):
+        pool.build_source(out, spec(), 10**9, setup=setup(), open_rows=dying, shard_tokens=100)
+    # junk a crash could leave: a part that was never recorded, unsynced hashes
+    (out / "part_00099.bin").write_bytes(b"\x01\x00")
+    with open(out / "hashes.u64", "ab") as f:
+        f.write(b"\x00" * 16)
+    pool.build_source(out, spec(), 10**9, setup=setup(), open_rows=memory_rows(TEXTS),
+                      shard_tokens=100)
+    assert decode_parts(out) == TEXTS
+    assert not (out / "part_00099.bin").exists()
+    st = pool.SourceState.load(out)
+    assert st.stats.get("dropped_duplicate", 0) == 0 and st.documents == len(TEXTS)
+
+
+def test_a_changed_source_identity_refuses_to_resume(tmp_path):
+    out = tmp_path / "s"
+    pool.build_source(out, spec(), 50, setup=setup(), open_rows=memory_rows(TEXTS),
+                      shard_tokens=10_000, identity={"revision": "a" * 40})
+    with pytest.raises(pool.ResumeError, match="revision"):
+        pool.build_source(out, spec(), 50, setup=setup(), open_rows=memory_rows(TEXTS),
+                          shard_tokens=10_000, identity={"revision": "b" * 40})
+
+
+def test_adapter_drops_lid_and_code_filters_are_counted(tmp_path):
+    out = tmp_path / "s"
+    texts = ["@jpn_Jpan kana text here", "plain ind text", "keep this one too",
+             "minified one", "toolong " * 50, None]
+    metas = [{}, {}, {}, {"path": "dist/app.min.js"}, {}, {"_drop": "dropped_license"}]
+    s = spec(lid="ind_Latn", code=True, path_field="path")
+    pool.build_source(out, s, 10**9, setup=setup(lid=FakeLid("ind_Latn"), max_doc_tokens=100),
+                      open_rows=memory_rows(texts, metas), shard_tokens=10_000)
+    st = pool.SourceState.load(out)
+    assert decode_parts(out) == ["plain ind text", "keep this one too"]
+    assert st.stats["dropped_lid"] == 1 and st.stats["dropped_lid_as"] == {"jpn_Jpan": 1}
+    assert st.stats["skipped_minified"] == 1 and st.stats["dropped_too_long"] == 1
+    assert st.stats["dropped_license"] == 1 and st.stats["rows"] == 6
+
+
+def test_provenance_is_kept_per_document(tmp_path):
+    import gzip
+    out = tmp_path / "s"
+    metas = [{"url": f"https://x/{i}", "_attrib": "CC BY-SA"} for i in range(len(TEXTS))]
+    pool.build_source(out, spec(), 10**9, setup=setup(), open_rows=memory_rows(TEXTS, metas),
+                      shard_tokens=10_000)
+    st = pool.SourceState.load(out)
+    lines = gzip.decompress((out / st.parts[0]["prov"]).read_bytes()).decode().splitlines()
+    assert [json.loads(x)["url"] for x in lines] == [m["url"] for m in metas]
+    assert st.attribution == {"CC BY-SA": len(TEXTS)}
+
+
+def test_limit_docs_stops_early_without_exhausting(tmp_path):
+    out = tmp_path / "s"
+    pool.build_source(out, spec(), 10**9, setup=setup(), open_rows=memory_rows(TEXTS),
+                      shard_tokens=10_000, limit_docs=7)
+    st = pool.SourceState.load(out)
+    assert st.documents == 7 and not st.exhausted
+
+
+def test_html_cap_holds_html_under_its_share(tmp_path):
+    out = tmp_path / "s"
+    texts = [f"{'<html>' if i % 2 else 'code'} {i} " + "y" * 20 for i in range(60)]
+    metas = [{"language": "HTML" if i % 2 else "Python"} for i in range(60)]
+    pool.build_source(out, spec(html_cap=0.2, html_warmup=0), 10**9, setup=setup(),
+                      open_rows=memory_rows(texts, metas), shard_tokens=10_000)
+    st = pool.SourceState.load(out)
+    assert st.stats["html_tokens"] <= 0.2 * st.unique_tokens
+    assert st.stats["skipped_html_cap"] > 0
+
+
+def test_worker_processes_give_the_same_bytes(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    texts = TEXTS + [TEXTS[1], "LEAK here"] + [t + "!" for t in TEXTS]
+    for out, workers in ((a, 0), (b, 2)):
+        pool.build_source(out, spec(), 600, setup=setup(), open_rows=memory_rows(texts),
+                          shard_tokens=200, workers=workers, batch_docs=8)
+    sa, sb = pool.SourceState.load(a), pool.SourceState.load(b)
+    assert sa.cursor == sb.cursor and sa.stats == sb.stats
+    assert [(a / p["file"]).read_bytes() for p in sa.parts] == \
+        [(b / p["file"]).read_bytes() for p in sb.parts]

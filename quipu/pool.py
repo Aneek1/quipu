@@ -226,3 +226,469 @@ def build_targets(total: int, shares: dict[str, float], states: dict[str, Source
         if need > 0:
             out[k] = need
     return out
+
+
+# ------------------------------------------------------------------ per-source state
+
+STATE = "state.json"
+HASHES = "hashes.u64"
+STATE_VERSION = 1
+HTML_CAP_WARMUP_TOKENS = 1_000_000  # as data v2 (scripts/build_shards.py)
+
+
+class ResumeError(RuntimeError):
+    """A saved source (or pool) does not match what this build would make of it."""
+
+
+class NeedMore(RuntimeError):
+    """merge_chunk: live sources have not built enough for the chunk; .targets says
+    how many more tokens each must build."""
+
+    def __init__(self, targets: dict[str, int]) -> None:
+        self.targets = dict(targets)
+        super().__init__("sources must build more before the chunk can be mixed: "
+                         + ", ".join(f"{k} +{v:,}" for k, v in sorted(targets.items())))
+
+
+class Row(NamedTuple):
+    """One row of a source stream. text None: the adapter dropped it (meta["_drop"] is
+    the stat to count, e.g. "dropped_license"). meta: provenance fields (kept per
+    document) and private keys ("_attrib": counted in the attribution summary);
+    "language" feeds the HTML cap, the spec's path_field the code path rules. cursor:
+    the stream position AFTER this row (JSON), where a resumed build starts."""
+    text: str | None
+    meta: dict[str, Any]
+    cursor: dict[str, Any]
+
+
+def _nest(flat: dict[str, int]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k in sorted(flat):
+        if ":" in k:
+            name, sub = k.split(":", 1)
+            out.setdefault(name, {})[sub] = flat[k]
+        else:
+            out[k] = flat[k]
+    return out
+
+
+def _flat(nested: dict[str, Any]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for k, v in nested.items():
+        if isinstance(v, dict):
+            for sub, n in v.items():
+                out[f"{k}:{sub}"] = n
+        else:
+            out[k] = v
+    return out
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_json_atomic(path: Path, obj: Any) -> None:
+    import json
+    import os
+
+    from quipu.fsio import replace_with_retry
+
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    replace_with_retry(tmp, path)
+
+
+@dataclass
+class SourceState:
+    """sources/<name>/state.json. parts: [{"file", "prov", "tokens", "documents"}]."""
+    name: str
+    identity: dict[str, Any] = field(default_factory=dict)
+    cursor: dict[str, Any] | None = None
+    exhausted: bool = False
+    parts: list[dict[str, Any]] = field(default_factory=list)
+    unique_tokens: int = 0
+    documents: int = 0
+    hashes: int = 0
+    stats: dict[str, Any] = field(default_factory=dict)
+    attribution: dict[str, int] = field(default_factory=dict)
+    builds: list[dict[str, Any]] = field(default_factory=list)
+    version: int = STATE_VERSION
+
+    @classmethod
+    def load(cls, directory: str | Path) -> "SourceState":
+        import json
+        d = json.loads((Path(directory) / STATE).read_text(encoding="utf-8"))
+        return cls(**d)
+
+    @classmethod
+    def load_or_new(cls, directory: str | Path, name: str) -> "SourceState":
+        p = Path(directory) / STATE
+        return cls.load(directory) if p.exists() else cls(name=name)
+
+    def save(self, directory: str | Path) -> None:
+        from dataclasses import asdict
+        write_json_atomic(Path(directory) / STATE, asdict(self))
+
+    def totals(self, consumed: int) -> SourceTotals:
+        return SourceTotals(self.unique_tokens, consumed, self.exhausted)
+
+
+def recover(directory: Path, st: SourceState) -> int:
+    """Put a source directory back to its saved state: delete parts / provenance files
+    the state does not list (a build killed between writing a part and saving the
+    state) and temp files, and cut hashes.u64 back to the saved count. Returns the
+    number of files removed."""
+    keep = {p["file"] for p in st.parts} | {p["prov"] for p in st.parts}
+    removed = 0
+    for pat in ("part_*.bin", "prov_*.jsonl.gz", "*.tmp"):
+        for f in directory.glob(pat):
+            if f.name not in keep:
+                f.unlink()
+                removed += 1
+    h = directory / HASHES
+    size = st.hashes * 8
+    if h.exists() and h.stat().st_size != size:
+        if h.stat().st_size < size:
+            raise ResumeError(f"{h}: {h.stat().st_size // 8} hashes on disk but the state "
+                              f"says {st.hashes}")
+        with open(h, "r+b") as f:
+            f.truncate(size)
+    elif not h.exists() and size:
+        raise ResumeError(f"{h} is missing (the state says {st.hashes} hashes)")
+    return removed
+
+
+# ------------------------------------------------------------------ document processing
+
+@dataclass(frozen=True)
+class BuildSetup:
+    """What processing a document needs, picklable for worker processes: a zero-argument
+    tokenizer factory, the decontaminator (find(text) -> (benchmark, task, rule) | None),
+    the optional language-ID classifier (predict) and the code length limit."""
+    tokenizer: Any
+    decontam: Any = None
+    lid: Any = None
+    lid_threshold: float = 0.0
+    max_doc_tokens: int = 16_000
+
+
+OK = "ok"  # a document's outcome: (status, ids, detail); status "ok" or the stat to count
+
+
+def process_doc(text: str, lid_source: str | None, code: bool, setup: BuildSetup,
+                tok: Any) -> tuple[str, Any, str | None]:
+    """Decontaminate, language-ID (when lid_source) and tokenize one document."""
+    import numpy as np
+
+    from quipu.data import encode_document
+
+    if setup.decontam is not None:
+        hit = setup.decontam.find(text)
+        if hit is not None:
+            return "dropped_contamination", None, hit[0]
+    if lid_source is not None and setup.lid is not None:
+        from quipu.shard_mix import lid_decision
+        label, prob, probs = setup.lid.predict(text)
+        _, keep = lid_decision(lid_source, label, prob, probs, setup.lid_threshold)
+        if not keep:
+            return "dropped_lid", None, label
+    ids = encode_document(text, tok)
+    if ids is None:
+        return "dropped_blank", None, None
+    if code and len(ids) > setup.max_doc_tokens:
+        return "dropped_too_long", None, None
+    return OK, np.asarray(ids, dtype=np.uint16), None
+
+
+_WORKER: dict[str, Any] = {}
+
+
+def _init_worker(setup: BuildSetup) -> None:
+    import os
+
+    from quipu.shard_mix import WORKER_ENV
+    for k, v in WORKER_ENV.items():
+        os.environ[k] = v
+    _WORKER["setup"] = setup
+    _WORKER["tok"] = setup.tokenizer()
+
+
+def _work(job: tuple[list[str], str | None, bool]) -> list[tuple[str, Any, str | None]]:
+    texts, lid_source, code = job
+    setup, tok = _WORKER["setup"], _WORKER["tok"]
+    return [process_doc(t, lid_source, code, setup, tok) for t in texts]
+
+
+def content_hash(text: str) -> int:
+    """Exact dedup identity (data v2's): blake2b-8 of the UTF-8 text."""
+    from quipu.shard_mix import content_hash as h
+    return h(text)
+
+
+_MINIFIED_RE = re.compile(r"\.min\.(js|css)$|\.map$", re.IGNORECASE)
+_VENDORED_DIRS = frozenset(["vendor", "node_modules", "dist", "build", "bower_components",
+                            "third_party", "external"])
+_VENDORED_NAME_PARTS = ("bundle", ".pack.")
+
+
+def code_path_reason(path: str | None) -> str | None:
+    """data v2's path rules (scripts/build_shards.py CODE_PATH_SKIP_RULES, the same
+    patterns; tests/test_pool_sources.py checks they agree): "minified", "vendored" or
+    None."""
+    if not path:
+        return None
+    parts = [p for p in str(path).replace("\\", "/").lower().split("/") if p]
+    if not parts:
+        return None
+    name = parts[-1]
+    if _MINIFIED_RE.search(name):
+        return "minified"
+    if _VENDORED_DIRS.intersection(parts[:-1]) or any(k in name for k in _VENDORED_NAME_PARTS):
+        return "vendored"
+    return None
+
+
+# ------------------------------------------------------------------ the builder
+
+def _part_names(index: int) -> tuple[str, str]:
+    return f"part_{index:05d}.bin", f"prov_{index:05d}.jsonl.gz"
+
+
+def build_source(out_dir: str | Path, spec: SourceSpec, target: int, *, setup: BuildSetup,
+                 open_rows: Any, shard_tokens: int, workers: int = 0, batch_docs: int = 256,
+                 limit_docs: int | None = None, identity: dict[str, Any] | None = None,
+                 on_checkpoint: Any = None, log: Any = None) -> dict[str, Any]:
+    """Append at least `target` new unique tokens (stopping after the document that
+    reaches it) of `spec`'s stream to out_dir, continuing from the saved cursor.
+
+    open_rows(cursor) yields Rows from that position (None: the start). Each row is,
+    in order: dropped by the adapter (text None); blank; a code path rule (minified /
+    vendored; spec opts code + path_field); an exact duplicate (blake2b-8 of the text,
+    against every document this source ever kept); contaminated (setup.decontam, every
+    source); another language (setup.lid, when spec opts lid names the language); too
+    long (code only); over the HTML cap (spec opts html_cap); or kept. Processing runs in
+    `workers` processes (0: in this process); decisions are made in stream order, so the
+    output does not depend on the number of workers.
+
+    Kept documents are buffered and written as a part (cut at the first document end
+    at or after shard_tokens), with one provenance line per document. The state is saved
+    after every part, so a killed build resumes from its last part (the rows after it are
+    read again). The stream ending marks the source exhausted. `identity` (revision, file
+    list hash) must match the saved one. on_checkpoint() is called after every save
+    (a Modal Volume commit). limit_docs stops after that many kept documents (smoke
+    runs; not exhaustion). Returns the build's summary.
+    """
+    import gzip
+    import json
+    import time
+    from collections import Counter, deque
+
+    import numpy as np
+
+    from quipu.data import write_shard
+    from quipu.fsio import replace_with_retry
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    st = SourceState.load_or_new(out, spec.name)
+    identity = dict(identity or {})
+    if st.identity and identity:
+        diff = sorted(k for k in set(st.identity) | set(identity)
+                      if st.identity.get(k) != identity.get(k))
+        if diff:
+            raise ResumeError(f"source {spec.name}: the saved build differs in "
+                              f"{', '.join(diff)} ({ {k: st.identity.get(k) for k in diff} } "
+                              f"vs { {k: identity.get(k) for k in diff} }); build it in a new "
+                              "directory")
+    if identity:
+        st.identity = identity
+    recover(out, st)
+    started, t0, cpu0 = _now(), time.time(), time.process_time()
+    summary: dict[str, Any] = {"source": spec.name, "target": target, "tokens": 0,
+                               "documents": 0, "rows": 0, "exhausted": st.exhausted}
+    if st.exhausted or target <= 0:
+        return summary
+
+    stats: Counter = Counter(_flat(st.stats))
+    attribution: Counter = Counter(st.attribution)
+    seen: set[int] = set()
+    hpath = out / HASHES
+    if hpath.exists():
+        seen.update(np.fromfile(hpath, dtype="<u8").tolist())
+    lid_source = spec.get("lid")
+    code = bool(spec.get("code"))
+    path_field = spec.get("path_field")
+    html_cap = spec.get("html_cap")
+    html_warmup = int(spec.get("html_warmup", HTML_CAP_WARMUP_TOKENS))
+    cursor = st.cursor
+
+    buf: list[Any] = []
+    prov: list[str] = []
+    new_hashes: list[int] = []
+    buf_tokens = 0
+    built = docs_this = rows_this = 0
+    process_seconds = 0.0
+
+    def save() -> None:
+        nonlocal buf, prov, new_hashes, buf_tokens
+        if buf:
+            name, pname = _part_names(len(st.parts))
+            write_shard(out / name, np.concatenate(buf))
+            tmp = out / (pname + ".tmp")
+            tmp.write_bytes(gzip.compress("".join(prov).encode("utf-8"), compresslevel=6))
+            replace_with_retry(tmp, out / pname)
+            st.parts.append({"file": name, "prov": pname, "tokens": buf_tokens,
+                             "documents": len(prov)})
+        if new_hashes:
+            with open(hpath, "ab") as f:
+                np.asarray(new_hashes, dtype="<u8").tofile(f)
+            st.hashes += len(new_hashes)
+        buf, prov, new_hashes, buf_tokens = [], [], [], 0
+        st.cursor = cursor
+        st.stats = _nest(dict(stats))
+        st.attribution = dict(attribution)
+        st.save(out)
+        if on_checkpoint is not None:
+            on_checkpoint()
+
+    executor = None
+    if workers > 0:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        executor = ProcessPoolExecutor(workers,
+                                       mp_context=multiprocessing.get_context("spawn"),
+                                       initializer=_init_worker, initargs=(setup,))
+    tok = setup.tokenizer() if executor is None else None
+
+    def prepare(rows: list[Row]) -> tuple[list[Row], list[Any], Any]:
+        """The cheap filters, here; the rest is sent to the workers (or done inline)."""
+        nonlocal process_seconds
+        pre: list[Any] = []
+        texts: list[str] = []
+        for r in rows:
+            if r.text is None:
+                pre.append((r.meta.get("_drop") or "dropped_by_source", None))
+                continue
+            if not r.text.strip():
+                pre.append(("dropped_blank", None))
+                continue
+            if code and path_field:
+                reason = code_path_reason(r.meta.get(path_field))
+                if reason is not None:
+                    pre.append((f"skipped_{reason}", None))
+                    continue
+            h = content_hash(r.text)
+            if h in seen:
+                pre.append(("dropped_duplicate", None))
+                continue
+            pre.append((None, h))
+            texts.append(r.text)
+        if executor is None:
+            c0 = time.process_time()
+            res = [process_doc(t, lid_source, code, setup, tok) for t in texts]
+            process_seconds += time.process_time() - c0
+            return rows, pre, res
+        return rows, pre, executor.submit(_work, (texts, lid_source, code))
+
+    def batches() -> Any:
+        batch: list[Row] = []
+        for r in open_rows(cursor):
+            batch.append(r)
+            if len(batch) >= batch_docs:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    done = ended = False
+    pending: deque = deque()
+    source_it = batches()
+    depth = max(2, 2 * workers)
+    try:
+        while not done:
+            while len(pending) < depth:
+                try:
+                    pending.append(prepare(next(source_it)))
+                except StopIteration:
+                    break
+            if not pending:
+                ended = True
+                break
+            rows, pre, res = pending.popleft()
+            results = res if isinstance(res, list) else res.result()
+            k = 0
+            for r, (status, h) in zip(rows, pre):
+                rows_this += 1
+                stats["rows"] += 1
+                cursor = r.cursor
+                if status is not None:
+                    stats[status] += 1
+                    continue
+                status, ids, detail = results[k]
+                k += 1
+                if status != OK:
+                    stats[status] += 1
+                    if detail is not None:
+                        stats[f"{status}_as:{detail}"] += 1
+                    continue
+                if h in seen:  # a duplicate of a document in the batches in flight
+                    stats["dropped_duplicate"] += 1
+                    continue
+                n = len(ids)
+                if html_cap is not None and r.meta.get("language") == "HTML":
+                    total = st.unique_tokens
+                    if (total >= html_warmup
+                            and stats["html_tokens"] + n > html_cap * (total + n)):
+                        stats["skipped_html_cap"] += 1
+                        continue
+                    stats["html_tokens"] += n
+                seen.add(h)
+                new_hashes.append(h)
+                buf.append(ids)
+                meta = {k2: v for k2, v in r.meta.items() if not k2.startswith("_")}
+                prov.append(json.dumps(meta, ensure_ascii=False, default=str) + "\n")
+                if r.meta.get("_attrib") is not None:
+                    attribution[str(r.meta["_attrib"])] += 1
+                buf_tokens += n
+                built += n
+                docs_this += 1
+                st.unique_tokens += n
+                st.documents += 1
+                stats["kept"] += 1
+                if buf_tokens >= shard_tokens:
+                    save()
+                if built >= target or (limit_docs is not None and docs_this >= limit_docs):
+                    done = True
+                    break
+            if log is not None:
+                log(spec.name, built, target, rows_this)
+        if ended:
+            st.exhausted = True
+        save()
+    finally:
+        for _, _, res in pending:
+            if not isinstance(res, list):
+                res.cancel()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        source_it.close()
+
+    wall = time.time() - t0
+    entry = {"started": started, "finished": _now(), "target": target, "tokens": built,
+             "documents": docs_this, "rows": rows_this, "wall_seconds": round(wall, 3),
+             "cpu_seconds_main": round(time.process_time() - cpu0, 3),
+             "process_seconds": round(process_seconds, 3) if executor is None else None,
+             "workers": workers, "exhausted": st.exhausted, "cursor": st.cursor}
+    st.builds.append(entry)
+    st.save(out)
+    if on_checkpoint is not None:
+        on_checkpoint()
+    summary.update(tokens=built, documents=docs_this, rows=rows_this, exhausted=st.exhausted,
+                   wall_seconds=entry["wall_seconds"], process_seconds=entry["process_seconds"],
+                   cpu_seconds_main=entry["cpu_seconds_main"])
+    return summary
