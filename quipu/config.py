@@ -123,6 +123,10 @@ MOE_DISPATCHES = ("loop", "grouped", "padded")
 OPTIMIZERS = ("adamw", "muon")
 PRECISIONS = ("bf16", "fp8")
 TRAIN_MODES = ("pretrain", "sft")
+LR_SCHEDULES = ("cosine", "wsd")
+DECAY_SHAPES = ("linear", "1-sqrt")
+# TrainConfig int fields that may be 0 (seed; the wsd decay, off at 0).
+TRAIN_ZERO_INTS = frozenset({"seed", "decay_start_step", "decay_steps"})
 GPT2_TOKENIZER = "gpt2"
 # ModelConfig int fields that are 0 for a dense model.
 MOE_INT_FIELDS = ("n_experts", "top_k", "expert_hidden", "shared_experts", "shared_hidden",
@@ -190,6 +194,19 @@ class TrainConfig:
     mode: str = "pretrain"               # "pretrain" | "sft"
     max_epochs: float = 0.0
     base_lr_scale: float = 0.0
+    # LR schedule (quipu.train.lr_at). "cosine": linear warmup from ~0 to lr over
+    # warmup_steps, cosine to lr_min at `steps`, lr_min after (every run before data
+    # v3). "wsd", warmup-stable-decay (continued pretraining, data v3 spec section 2):
+    # linear re-warmup from warmup_start_lr to lr over warmup_steps, then lr for good;
+    # with decay_steps > 0 (a decay branch from a stable checkpoint) the LR leaves lr
+    # at step decay_start_step and reaches lr_min decay_steps later ("linear", or
+    # "1-sqrt": lr_min + (lr - lr_min) x (1 - sqrt(progress))), lr_min after. All
+    # values are the AdamW lr; Muon groups follow by the same factor (train.lr_at).
+    lr_schedule: str = "cosine"          # "cosine" | "wsd"
+    warmup_start_lr: float = 0.0         # wsd only
+    decay_start_step: int = 0            # wsd only; with decay_steps
+    decay_steps: int = 0                 # wsd only; 0 = no decay (stable forever)
+    decay_shape: str = "linear"          # wsd only: "linear" | "1-sqrt"
 
     @property
     def steps(self) -> int:
@@ -433,6 +450,28 @@ def _check_train_extras(train: TrainConfig) -> None:
         raise ValueError(f"max_epochs applies to mode 'sft', got mode {train.mode!r}")
     if not 0 <= train.base_lr_scale <= 1:
         raise ValueError(f"base_lr_scale must be in [0, 1], got {train.base_lr_scale!r}")
+    _check_schedule(train)
+
+
+def _check_schedule(train: TrainConfig) -> None:
+    """The wsd keys are refused under "cosine" (they would be silently ignored); under
+    "wsd" the decay starts after the warmup and needs both of its keys."""
+    _check_choice("lr_schedule", train.lr_schedule, LR_SCHEDULES)
+    _check_choice("decay_shape", train.decay_shape, DECAY_SHAPES)
+    _check_positive("warmup_start_lr", train.warmup_start_lr, allow_zero=True)
+    if train.lr_schedule == "cosine":
+        set_keys = [k for k, off in (("warmup_start_lr", 0.0), ("decay_start_step", 0),
+                                     ("decay_steps", 0), ("decay_shape", "linear"))
+                    if getattr(train, k) != off]
+        if set_keys:
+            raise ValueError(f"{set_keys} apply to lr_schedule 'wsd', got 'cosine'")
+        return
+    if (train.decay_steps > 0) != (train.decay_start_step > 0):
+        raise ValueError(f"decay_start_step ({train.decay_start_step}) and decay_steps "
+                         f"({train.decay_steps}) must both be 0 (stable) or both positive")
+    if train.decay_steps and train.decay_start_step < train.warmup_steps:
+        raise ValueError(f"decay_start_step ({train.decay_start_step}) must not be before "
+                         f"the end of the warmup ({train.warmup_steps})")
 
 
 OVERRIDE_SECTIONS = {"model": ModelConfig, "data": DataConfig, "train": TrainConfig}
@@ -596,7 +635,7 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     # strictly positive.
     _validate_int_fields(model, allow_zero=frozenset(MOE_INT_FIELDS))
     _validate_int_fields(data)
-    _validate_int_fields(train, allow_zero=frozenset({"seed"}))
+    _validate_int_fields(train, allow_zero=TRAIN_ZERO_INTS)
     for section in (model, data, train):
         _validate_float_fields(section)
 

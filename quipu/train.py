@@ -107,6 +107,14 @@ wins, so a retried SFT resumes rather than restarting). Mode "sft" without eithe
 is a usage error. Budget backstop, orphan and signal handling are the same as for
 pretraining.
 
+Continued pretraining (data v3 spec section 2): train.lr_schedule "wsd" (lr_at:
+re-warmup from warmup_start_lr, then constant; a decay over decay_steps from
+decay_start_step). `--init-from PATH --init-optimizers` also loads the checkpoint's
+optimizer states (the run still starts at step 0 on its own data and schedule).
+`--branch-from PATH` loads another run's whole state (weights, optimizers, step, stream,
+RNG) into this run, whose ckpt_dir must be elsewhere: a decay branch from a stable
+checkpoint. Both apply only when --resume finds no checkpoint of the run's own.
+
 Data parallel (quipu.dist), on N GPUs of one machine:
 
     torchrun --standalone --nproc_per_node=N -m quipu.train --config ... --run-id ...
@@ -466,6 +474,24 @@ def _load_optimizer_state(opt: torch.optim.Optimizer, state: dict[str, Any]) -> 
             group.setdefault(key, value)
 
 
+def resolve_checkpoint(path: str | Path, flag: str) -> Path:
+    """A checkpoint file from what --init-from / --branch-from accept: the file
+    itself, a latest.pt pointer, or a checkpoint directory (its latest.pt).
+    UsageError when there is nothing there."""
+    path = Path(path)
+    if path.is_dir():
+        path = path / LATEST
+    if not path.is_file():
+        raise UsageError(f"{flag} {path}: no such checkpoint")
+    if path.name == LATEST:
+        pointer = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(pointer, dict) and set(pointer) == {"file"}:
+            path = path.parent / pointer["file"]
+            if not path.is_file():
+                raise UsageError(f"{flag}: {LATEST} points at {path}, which is missing")
+    return path
+
+
 def _atomic_save(obj: Any, path: Path) -> None:
     """torch.save to a temp name beside `path`, then swap it in. A kill mid-write
     leaves at worst a stray .tmp, never a truncated checkpoint at the final path."""
@@ -476,6 +502,36 @@ def _atomic_save(obj: Any, path: Path) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def lr_at(cfg: TrainConfig, step: int) -> float:
+    """The AdamW learning rate of the step that starts at `step` (0-based); every other
+    group follows by the same factor (Trainer._set_lrs).
+
+    "cosine": linear warmup to cfg.lr over warmup_steps (the first step at
+    lr / warmup_steps), cosine to lr_min at cfg.steps, lr_min after.
+    "wsd": linear re-warmup from warmup_start_lr (step 0) to lr (step warmup_steps),
+    then lr with no end. With decay_steps > 0, from decay_start_step the LR falls to
+    lr_min over decay_steps steps (decay_shape), lr_min after."""
+    if cfg.lr_schedule == "wsd":
+        return _wsd_lr(cfg, step)
+    if step < cfg.warmup_steps:
+        return cfg.lr * (step + 1) / cfg.warmup_steps
+    if step >= cfg.steps:
+        return cfg.lr_min
+    progress = (step - cfg.warmup_steps) / max(1, cfg.steps - cfg.warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return cfg.lr_min + (cfg.lr - cfg.lr_min) * cosine
+
+
+def _wsd_lr(cfg: TrainConfig, step: int) -> float:
+    if step < cfg.warmup_steps:
+        return cfg.warmup_start_lr + (cfg.lr - cfg.warmup_start_lr) * step / cfg.warmup_steps
+    if cfg.decay_steps <= 0 or step < cfg.decay_start_step:
+        return cfg.lr
+    progress = min(1.0, (step - cfg.decay_start_step) / cfg.decay_steps)
+    keep = 1.0 - (math.sqrt(progress) if cfg.decay_shape == "1-sqrt" else progress)
+    return cfg.lr_min + (cfg.lr - cfg.lr_min) * keep
 
 
 class Trainer:
@@ -771,14 +827,7 @@ class Trainer:
     # ---- optimisation --------------------------------------------------------
 
     def lr_at(self, step: int) -> float:
-        cfg = self.train_cfg
-        if step < cfg.warmup_steps:
-            return cfg.lr * (step + 1) / cfg.warmup_steps
-        if step >= cfg.steps:
-            return cfg.lr_min
-        progress = (step - cfg.warmup_steps) / max(1, cfg.steps - cfg.warmup_steps)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return cfg.lr_min + (cfg.lr - cfg.lr_min) * cosine
+        return lr_at(self.train_cfg, step)
 
     def _zero_grad(self) -> None:
         for opt in self.optimizers:
@@ -1154,27 +1203,13 @@ class Trainer:
         # Load to CPU: set_rng_state needs CPU ByteTensors, and model/optimizer
         # load_state_dict move their tensors to the right device themselves.
         state = torch.load(path, map_location="cpu", weights_only=False)
-        if "optimizers" in state:
-            saved_opts = state["optimizers"]
-            kinds = list(state.get("optimizer_kinds") or [])
-        else:                                   # pre-M6 (quipu-114m): one AdamW
-            saved_opts = [state["optimizer"]]
-            kinds = ["AdamW"]
-        mine = [type(opt).__name__ for opt in self.optimizers]
-        if kinds != mine or len(saved_opts) != len(self.optimizers):
-            raise UsageError(
-                f"checkpoint {path} holds optimizer state for {kinds}, but train.optimizer "
-                f"{self.train_cfg.optimizer!r} builds {mine}; resume with the config the "
-                "run was started with"
-            )
+        if not ("optimizers" in state or "optimizer" in state):
+            raise UsageError(f"{path} is not a training checkpoint (no optimizer state; "
+                             "a milestone?)")
+        self._load_optimizers(state, Path(path))     # checks the kinds first
         self.step = state["step"]
         self.model.load_state_dict(
             {k.removeprefix("_orig_mod."): v for k, v in state["model"].items()})
-        for opt, saved in zip(self.optimizers, saved_opts):
-            _load_optimizer_state(opt, saved)
-        # load_state_dict brought back the checkpoint's base_lr / weight_decay; the
-        # config wins (a deliberate LR change on resume must take effect).
-        apply_config_lrs(self.optimizers, self.train_cfg)
         if self.is_moe and state.get("moe_health_streak") is not None:
             self._health_streak = state["moe_health_streak"].clone()
         if self.is_moe and state.get("moe_interval") is not None:
@@ -1190,35 +1225,66 @@ class Trainer:
         # startup. (Optimizer state is not: it was loaded from that same file.)
         dist.broadcast_params(self.model)
 
-    def init_weights_from(self, path: str | Path) -> Path:
+    def init_weights_from(self, path: str | Path, optimizers: bool = False) -> Path:
         """Load model weights only (spec 13: the SFT starts from the final pretraining
         checkpoint): optimizers, step, stream and RNG stay fresh, so the schedule
         starts at step 0. `path` is a training checkpoint (its "model"), a bf16
         milestone (a bare state_dict), a latest.pt pointer, or a checkpoint
         directory (its latest.pt). Strict: every key must match this model (which
         also catches an SFT config whose model differs from the pretrained one).
-        Returns the file loaded."""
-        path = Path(path)
-        if path.is_dir():
-            path = path / LATEST
-        if not path.is_file():
-            raise UsageError(f"--init-from {path}: no such checkpoint")
+        Returns the file loaded.
+
+        optimizers=True (--init-optimizers; continued pretraining, data v3): also the
+        checkpoint's optimizer states (AdamW moments, Muon momentum), with the
+        config's LRs and weight decay applied on top; step, stream and RNG stay
+        fresh, so a new schedule (the wsd re-warmup) runs on new data from step 0
+        without throwing the moments away. Needs a full training checkpoint built
+        with the same optimizers."""
+        path = resolve_checkpoint(path, "--init-from")
         obj = torch.load(path, map_location="cpu", weights_only=False)
-        if isinstance(obj, dict) and set(obj) == {"file"}:       # a latest.pt pointer
-            path = path.parent / obj["file"]
-            obj = torch.load(path, map_location="cpu", weights_only=False)
-        state = obj["model"] if isinstance(obj, dict) and isinstance(obj.get("model"), dict) \
-            else obj
+        full = isinstance(obj, dict) and isinstance(obj.get("model"), dict)
+        state = obj["model"] if full else obj
         try:
             self.model.load_state_dict(
                 {k.removeprefix("_orig_mod."): v for k, v in state.items()}, strict=True)
         except RuntimeError as exc:
             raise UsageError(f"--init-from {path} does not fit this model: "
                              f"{str(exc).splitlines()[0]}") from exc
+        if optimizers:
+            if not full or "optimizers" not in obj:
+                raise UsageError(f"--init-optimizers: {path} holds no optimizer state "
+                                 "(a milestone or a pre-M6 checkpoint); drop the flag to "
+                                 "start the optimizers fresh")
+            self._load_optimizers(obj, path)
         dist.broadcast_params(self.model)
-        print(f"initialised weights from {path} (fresh optimizer, step 0)", flush=True)
-        self._safe_log(self.log.note, "init_from", str(path))
+        what = "with its optimizer state" if optimizers else "fresh optimizer"
+        print(f"initialised weights from {path} ({what}, step 0)", flush=True)
+        self._safe_log(self.log.note, "init_from",
+                       {"path": str(path), "optimizers": optimizers} if optimizers
+                       else str(path))
         return path
+
+    def _load_optimizers(self, state: dict[str, Any], path: Path) -> None:
+        """A checkpoint's optimizer states into self.optimizers (same kinds, same
+        order), then the config's LRs and weight decay on top."""
+        if "optimizers" in state:
+            saved_opts = state["optimizers"]
+            kinds = list(state.get("optimizer_kinds") or [])
+        else:                                   # pre-M6 (quipu-114m): one AdamW
+            saved_opts = [state["optimizer"]]
+            kinds = ["AdamW"]
+        mine = [type(opt).__name__ for opt in self.optimizers]
+        if kinds != mine or len(saved_opts) != len(self.optimizers):
+            raise UsageError(
+                f"checkpoint {path} holds optimizer state for {kinds}, but train.optimizer "
+                f"{self.train_cfg.optimizer!r} builds {mine}; resume with the config the "
+                "run was started with"
+            )
+        for opt, saved in zip(self.optimizers, saved_opts):
+            _load_optimizer_state(opt, saved)
+        # load_state_dict brought back the checkpoint's base_lr / weight_decay; the
+        # config wins (a deliberate LR change on resume must take effect).
+        apply_config_lrs(self.optimizers, self.train_cfg)
 
     def resume_from_latest(self) -> None:
         """Load the latest checkpoint and drop log entries past it: those steps are
@@ -1507,7 +1573,15 @@ def main(argv: list[str] | None = None) -> None:
                         help="start from these model weights with a fresh optimizer and "
                              "schedule (train.mode sft); ignored when --resume finds the "
                              "run's own checkpoint")
-    parser.add_argument("--val-by-source-out", default="results/sft/val_by_source.json",
+    parser.add_argument("--init-optimizers", action="store_true",
+                        help="with --init-from: also load the checkpoint's optimizer states "
+                             "(continued pretraining: new schedule and data, same moments)")
+    parser.add_argument("--branch-from", default=None, metavar="CHECKPOINT",
+                        help="start from another run's full training state (weights, "
+                             "optimizers, step, stream, RNG) under this run's own ckpt_dir "
+                             "and run id: a decay branch from a stable checkpoint. Ignored "
+                             "when --resume finds the run's own checkpoint")
+    parser.add_argument("--val-by-source-out",default="results/sft/val_by_source.json",
                         metavar="JSON",
                         help="train.mode sft: after a completed run, the held-out chat loss "
                              "per source (<shard_dir>/val_by_source/*, micro_batch 1) goes "
@@ -1538,10 +1612,22 @@ def _train(args: Any, world: int) -> None:
     # Checked before the Trainer (and its run log) exists, so a mistake here leaves
     # nothing behind and the same command, corrected, can run.
     has_own_checkpoint = args.resume and (Path(cfg.train.ckpt_dir) / LATEST).exists()
+    if args.init_from and args.branch_from:
+        raise UsageError("--init-from (weights, new run) and --branch-from (a run's whole "
+                         "state) exclude each other; pass one")
+    if args.init_optimizers and not args.init_from:
+        raise UsageError("--init-optimizers needs --init-from")
     if args.init_from and not has_own_checkpoint:
         start = Path(args.init_from)
         if not (start.is_file() or (start / LATEST).is_file()):
             raise UsageError(f"--init-from {start}: no checkpoint file, and no {LATEST} in it")
+    branch = None
+    if args.branch_from and not has_own_checkpoint:
+        branch = resolve_checkpoint(args.branch_from, "--branch-from")
+        if branch.parent.resolve() == Path(cfg.train.ckpt_dir).resolve():
+            raise UsageError(f"--branch-from {branch} is in this run's own ckpt_dir; a "
+                             "branch writes its checkpoints elsewhere (use --resume to "
+                             "continue a run)")
     if cfg.train.mode == "sft" and not args.init_from and not has_own_checkpoint:
         raise UsageError("train.mode 'sft' starts from pretrained weights: pass --init-from "
                          "CHECKPOINT (e.g. the pretraining ckpt_dir)")
@@ -1594,7 +1680,17 @@ def _train(args: Any, world: int) -> None:
         print(f"--init-from {args.init_from} ignored: resuming the run's own checkpoint",
               flush=True)
     elif args.init_from:
-        trainer.init_weights_from(args.init_from)
+        trainer.init_weights_from(args.init_from, optimizers=args.init_optimizers)
+    if args.branch_from and has_own_checkpoint:
+        print(f"--branch-from {args.branch_from} ignored: resuming the run's own checkpoint",
+              flush=True)
+    elif branch is not None:
+        trainer.load_checkpoint(branch)
+        trainer.log.truncate_to(trainer.step)
+        print(f"branched from {branch} at step {trainer.step}, stream position "
+              f"{trainer.stream.position}", flush=True)
+        trainer._safe_log(trainer.log.note, "branch_from",
+                          {"path": str(branch), "step": trainer.step})
     trainer.run()
     if cfg.train.mode == "sft" and args.val_by_source_out and dist.is_main():
         write_val_by_source(trainer, Path(cfg.data.shard_dir) / "val_by_source",
