@@ -533,6 +533,7 @@ def build_source(out_dir: str | Path, spec: SourceSpec, target: int, *, setup: B
     buf_tokens = 0
     built = docs_this = rows_this = 0
     process_seconds = 0.0
+    processed = {"tokens": 0, "docs": 0, "rows_fetched": 0}  # incl. work discarded at the stop
 
     def save() -> None:
         nonlocal buf, prov, new_hashes, buf_tokens
@@ -592,12 +593,15 @@ def build_source(out_dir: str | Path, spec: SourceSpec, target: int, *, setup: B
             c0 = time.perf_counter()  # inline and CPU-bound: wall time is CPU time here
             res = [process_doc(t, lid_source, code, setup, tok) for t in texts]
             process_seconds += time.perf_counter() - c0
+            processed["docs"] += len(res)
+            processed["tokens"] += sum(len(x[1]) for x in res if x[0] == OK)
             return rows, pre, res
         return rows, pre, executor.submit(_work, (texts, lid_source, code))
 
     def batches() -> Any:
         batch: list[Row] = []
         for r in open_rows(cursor):
+            processed["rows_fetched"] += 1
             batch.append(r)
             if len(batch) >= batch_docs:
                 yield batch
@@ -683,14 +687,19 @@ def build_source(out_dir: str | Path, spec: SourceSpec, target: int, *, setup: B
              "documents": docs_this, "rows": rows_this, "wall_seconds": round(wall, 3),
              "cpu_seconds_main": round(time.process_time() - cpu0, 3),
              "process_seconds": round(process_seconds, 3) if executor is None else None,
-             "workers": workers, "exhausted": st.exhausted, "cursor": st.cursor}
+             "workers": workers, "exhausted": st.exhausted, "cursor": st.cursor,
+             "processed_tokens": processed["tokens"] if executor is None else None,
+             "processed_docs": processed["docs"] if executor is None else None,
+             "rows_fetched": processed["rows_fetched"]}
     st.builds.append(entry)
     st.save(out)
     if on_checkpoint is not None:
         on_checkpoint()
     summary.update(tokens=built, documents=docs_this, rows=rows_this, exhausted=st.exhausted,
                    wall_seconds=entry["wall_seconds"], process_seconds=entry["process_seconds"],
-                   cpu_seconds_main=entry["cpu_seconds_main"])
+                   cpu_seconds_main=entry["cpu_seconds_main"],
+                   processed_tokens=entry["processed_tokens"],
+                   rows_fetched=processed["rows_fetched"])
     return summary
 
 

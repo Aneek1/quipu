@@ -206,9 +206,15 @@ def smoke(env: Env, root: Path, names: list[str], docs: int) -> dict[str, Any]:
             print(f"  {name}: FAILED {exc!r}"[:300], flush=True)
             continue
         st = pool.SourceState.load(pool.source_dir(root, name))
+        # Rates over everything processed (the batches in flight at the stop included),
+        # not just the documents kept: tokens through decontam + LID + BPE per second of
+        # one core, and per second of the main process's own work (reading, parquet
+        # decoding, hashing, writing).
         proc = (a["process_seconds"] or 0) + (b["process_seconds"] or 0)
         main = a["cpu_seconds_main"] + b["cpu_seconds_main"] - proc
         wall = a["wall_seconds"] + b["wall_seconds"]
+        ptok = (a["processed_tokens"] or 0) + (b["processed_tokens"] or 0)
+        fetched = a["rows_fetched"] + b["rows_fetched"]
         report["sources"][name] = {
             "documents": st.documents, "tokens": st.unique_tokens, "rows": st.stats.get("rows"),
             "exhausted": st.exhausted, "resumed": len(st.builds) == 2 and b["rows"] > 0,
@@ -217,8 +223,10 @@ def smoke(env: Env, root: Path, names: list[str], docs: int) -> dict[str, Any]:
             "wall_seconds": round(wall, 2), "process_seconds": round(proc, 3),
             "main_seconds": round(main, 3),
             "docs_per_s_wall": round(st.documents / wall, 1) if wall else None,
-            "tok_per_s_core": round(st.unique_tokens / proc) if proc else None,
-            "tok_per_s_main": round(st.unique_tokens / main) if main > 0 else None,
+            "processed_tokens": ptok, "rows_fetched": fetched,
+            "tok_per_s_core": round(ptok / proc) if proc else None,
+            "tok_per_s_main": round(ptok / main) if main > 0 else None,
+            "tokens_per_doc": round(st.unique_tokens / st.documents) if st.documents else None,
             "share_target": env.cfg.sources[name].share,
             "seconds_total": round(time.time() - t0, 1)}
         r = report["sources"][name]

@@ -323,21 +323,28 @@ def iter_local_jsonl(directory: str, files: list[str], cursor: dict[str, Any] | 
     return _iter_lines(open_file, files, cursor, "jsonl")
 
 
+USER_AGENT = "quipu-pool/1.0 (data v3 builder; +https://github.com/Aneek1/quipu)"
+
+
 class UrllibHttp:
-    """HEAD and ranged GET with the standard library."""
+    """HEAD and ranged GET with the standard library. A named User-Agent: the
+    RedPajama host (Cloudflare) answers urllib's default agent with 403."""
 
     def __init__(self, timeout: float = 60.0) -> None:
         self.timeout = timeout
 
     def head(self, url: str) -> dict[str, str]:
         import urllib.request
-        req = urllib.request.Request(url, method="HEAD")
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return dict(r.headers.items())
 
     def open(self, url: str, offset: int) -> Any:
         import urllib.request
-        req = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"} if offset else {})
+        headers = {"User-Agent": USER_AGENT}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        req = urllib.request.Request(url, headers=headers)
         r = urllib.request.urlopen(req, timeout=self.timeout)
         if offset and r.status != 206:
             r.close()

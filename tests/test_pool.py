@@ -364,6 +364,10 @@ def test_limit_docs_stops_early_without_exhausting(tmp_path):
                       shard_tokens=10_000, limit_docs=7)
     st = pool.SourceState.load(out)
     assert st.documents == 7 and not st.exhausted
+    # throughput counts cover the work done on the batches in flight, not just the kept
+    b = st.builds[-1]
+    assert b["processed_docs"] == len(TEXTS) and b["rows_fetched"] == len(TEXTS)
+    assert b["processed_tokens"] > st.unique_tokens
 
 
 def test_html_cap_holds_html_under_its_share(tmp_path):
