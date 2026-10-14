@@ -589,9 +589,9 @@ def build_source(out_dir: str | Path, spec: SourceSpec, target: int, *, setup: B
             pre.append((None, h))
             texts.append(r.text)
         if executor is None:
-            c0 = time.process_time()
+            c0 = time.perf_counter()  # inline and CPU-bound: wall time is CPU time here
             res = [process_doc(t, lid_source, code, setup, tok) for t in texts]
-            process_seconds += time.process_time() - c0
+            process_seconds += time.perf_counter() - c0
             return rows, pre, res
         return rows, pre, executor.submit(_work, (texts, lid_source, code))
 
