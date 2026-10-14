@@ -35,6 +35,9 @@ quipu/shard_mix.py. Unlike the build above, it resumes after a crash or preempti
 (rerun the same command) and fails early; scripts/remote/build_shards_box.md is the
 runbook for building it on a rented CPU box.
 
+Data v3 (the rolling continued-pretraining pool, configs/data-v3.toml) is a separate
+builder, scripts/build_pool.py (quipu/pool.py), so this one stays as it was.
+
 Run: uv run python scripts/build_shards.py --config configs/quipu-moe.toml \
          --lid-filter --train-tokens 8.3e9 --preflight     # metadata only, minutes
      uv run python scripts/build_shards.py --config configs/quipu-moe.toml \
