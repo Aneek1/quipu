@@ -1,6 +1,6 @@
 # Data v3 and monthly continued pretraining (design)
 
-Date: 14 Oct 2026. Status: draft for the owner's review.
+Date: 14 Oct 2026. Status: approved by the owner on 14 Oct (open questions answered below).
 
 ## Goal
 
@@ -21,6 +21,9 @@ count and makes the jump cheap when bigger compute comes.
 | Monthly compute | Option A: **4 B200-hours a month on Modal**, inside the $30 free credit. The $30 hard limit stays. |
 | Model | Continue the published 1B-A149M (same architecture and tokenizer), not a new model. |
 | Data | Open, licence-checked corpora (below), Stack Exchange included, the 498k-ish verified coding answers as a high-quality slice. |
+| Releases | A decayed checkpoint is published **every second month** (owner, 14 Oct). |
+| Urdu | **Native-script Urdu (`urd_Arab`) added** alongside romanized Urdu (owner, 14 Oct). |
+| Code access | The owner accepted the `bigcode/starcoderdata` terms; access checked from the laptop on 14 Oct (865 files listed, README downloaded). |
 | Never | Claude-written data; datasets whose terms forbid training; synthetic data from models whose licences would bind our weights (Qwen/DeepSeek/Phi-4-derived NVIDIA sets). |
 
 ## Sources (licences checked 14 Oct 2026)
@@ -34,7 +37,7 @@ count and makes the jump cheap when bigger compute comes.
 | Q&A | 5% | Stack Exchange, **dumps up to April 2024 only** (RedPajama-1T `stackexchange` subset, or the archive.org dumps ≤ 2024-04) | CC BY-SA (attribution, share-alike) | ~20B | Dumps since June 2024 come with a click-through forbidding LLM training: not used. Keep author/URL fields for attribution. |
 | Maths | 7% | `HuggingFaceTB/finemath` (finemath-4plus first, then 3plus) + `open-web-math/open-web-math` | ODC-By | 9.6B / 34B + 14.7B | |
 | Reference | 4% | `wikimedia/wikipedia` (English + the nine languages), `allenai/peS2o` v2, `common-pile/arxiv_papers_filtered` | CC BY-SA / ODC-By / per-paper CC | ~6B / 42B / 29B | peS2o is a loading script: converted to parquet once. |
-| Nine languages | 10% | `HuggingFaceFW/fineweb-2` (as now: ind, zsm, cmn split Hans/Hant, jpn, kor, tam, hin_Deva, hin_Latn, urd_Latn) | ODC-By | large for zh/ja/id/ko; thin for zsm/tam; **near zero for hin_Latn (0.2 GB) and urd_Latn (0.13 GB)** | Thin languages repeat at most 4 epochs, then their share goes to the others. Adding native-script Urdu (`urd_Arab`, 6.9 GB) is an open question for the owner. |
+| Nine languages | 10% | `HuggingFaceFW/fineweb-2` (as now: ind, zsm, cmn split Hans/Hant, jpn, kor, tam, hin_Deva, hin_Latn, urd_Latn) | ODC-By | large for zh/ja/id/ko; thin for zsm/tam; **near zero for hin_Latn (0.2 GB) and urd_Latn (0.13 GB)** | Thin languages repeat at most 4 epochs, then their share goes to the others. Native-script Urdu (`urd_Arab`, 6.9 GB) is added at 1/3 of the Urdu share (see "Urdu script and the tokenizer"). |
 | Verified answers | 1% | `data/distill-v2/kept` (Qwen2.5-Coder-7B-Instruct, Apache-2.0, every answer passed its unit tests) | Apache-2.0 teacher | ~0.2B | Mixed into pretraining (the planned step-2 experiment), and reused later for the chat fine-tune. |
 
 Shares are of training tokens, set per monthly chunk. Not used (and why):
@@ -46,6 +49,19 @@ licence, left out to keep the pool non-synthetic).
 
 The model card gains an attribution section (Stack Exchange, Wikipedia, starcoderdata
 per-file licences, ODC-By sources) and notes the CC BY-SA share-alike question.
+
+## Urdu script and the tokenizer
+
+The 48k tokenizer was trained on romanized Urdu, not Arabic script. Measured on 14 Oct on the
+same sentence: Urdu in Arabic script 1.34 characters per token, romanized Urdu 3.37, Hindi
+(Devanagari) 2.64, English 4.81. So Arabic-script Urdu costs about 2.5x the tokens of the same
+text romanized, and the model learns it from near-byte pieces.
+
+- **Current model (this spec):** `urd_Arab` goes in as it is, at a small share (1/3 of the
+  Urdu slice), so it is not starved of real text while the tokenizer stays fixed. Changing the
+  vocabulary mid-run would mean new embedding rows and a re-tokenized pool.
+- **Next model (the ~1B-active one):** the tokenizer is retrained with `urd_Arab` in its
+  sample, and the gate in `scripts/tokenizer_gate.py` gains an Arabic-script check.
 
 ## Components
 
@@ -68,7 +84,7 @@ per-file licences, ODC-By sources) and notes the CC BY-SA share-alike question.
   a checkpoint well before Modal's hard limit could cut it.
 - **Learning-rate schedule: warmup-stable-decay.** A short re-warmup from the
   pretrain's final LR to a stable LR, then constant across months (no fixed end
-  date). Whenever we publish, a short decay branch (~10% of that month's tokens) is
+  date). Every second month (the release cadence), a short decay branch (~10% of that month's tokens) is
   trained from the stable checkpoint and published; the next month continues from
   the stable checkpoint, not the decayed one.
 - Evaluation every month on the same milestone set as the pretrain (bits per byte
@@ -118,7 +134,7 @@ grant would plug into.
 - The chat fine-tune on the verified answers (separate, ~$2-5, can run any month).
 - New tokenizer.
 
-## Open questions for the owner
-1. Accept the `bigcode/starcoderdata` terms on Hugging Face (the owner's account)?
-2. Native-script Urdu (`urd_Arab`) alongside romanized Urdu?
-3. Publish a decayed checkpoint every month, or every second month?
+## Answered (14 Oct)
+1. `bigcode/starcoderdata` terms: accepted by the owner; access confirmed.
+2. Native-script Urdu: yes (see above).
+3. Releases: every second month.
