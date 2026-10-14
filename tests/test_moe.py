@@ -156,14 +156,14 @@ def test_empty_expert_path():
     assert layer.experts.gate.grad[5].abs().max() == 0
 
 
-@pytest.mark.parametrize("dispatch", ["loop", "padded"])
+@pytest.mark.parametrize("dispatch", ["loop", "padded", "grouped"])
 def test_zero_tokens_forward(dispatch):
     layer = MoELayer(_cfg(moe_dispatch=dispatch))
     y, stats = layer(torch.randn(0, 32))
     assert y.shape == (0, 32) and int(stats.counts.sum()) == 0 and int(stats.dropped) == 0
 
 
-@pytest.mark.parametrize("dispatch", ["loop", "padded"])
+@pytest.mark.parametrize("dispatch", ["loop", "padded", "grouped"])
 def test_repeated_forward_backward_is_bit_identical(dispatch):
     torch.manual_seed(0)
     layer = _wide(MoELayer(_cfg(moe_dispatch=dispatch)))
@@ -182,6 +182,42 @@ def test_repeated_forward_backward_is_bit_identical(dispatch):
     assert torch.equal(y1, y2) and torch.equal(gx1, gx2)
     for name in g1:
         assert torch.equal(g1[name], g2[name]), name
+
+
+# --- MoE layer: grouped dispatch ------------------------------------------------
+
+@pytest.mark.parametrize("activation", ["swiglu", "situ_glu"])
+def test_grouped_dispatch_equals_loop(activation):
+    # Same maths as loop (no drops, per token), one grouped matmul per projection.
+    torch.manual_seed(0)
+    loop = _wide(MoELayer(_cfg(activation=activation)))
+    grouped = MoELayer(_cfg(activation=activation, moe_dispatch="grouped"))
+    grouped.load_state_dict(loop.state_dict())
+    with torch.no_grad():                      # two experts get no tokens
+        for m in (loop, grouped):
+            m.balancer.bias[1] = -1e4
+            m.balancer.bias[6] = -1e4
+    x = torch.randn(3, 10, 32, requires_grad=True)
+    y_loop, s_loop = loop(x)
+    y_grp, s_grp = grouped(x)
+    assert torch.allclose(y_grp, y_loop, atol=1e-5)
+    assert torch.allclose(y_grp, _naive(grouped, x), atol=1e-5)
+    assert torch.equal(s_grp.counts, s_loop.counts) and int(s_grp.dropped) == 0
+    assert s_grp.counts[1] == 0 and s_grp.counts[6] == 0
+    params = lambda m: [m.experts.gate, m.experts.up, m.experts.down, m.router.weight]
+    g_loop = torch.autograd.grad((y_loop * y_loop.detach().sin()).sum(), [x, *params(loop)])
+    g_grp = torch.autograd.grad((y_grp * y_grp.detach().sin()).sum(), [x, *params(grouped)])
+    for a, b in zip(g_loop, g_grp):
+        assert torch.allclose(a, b, atol=1e-5)
+    assert g_grp[1][1].abs().max() == 0       # an empty expert's gate gets a zero gradient
+
+
+def test_grouped_dispatch_can_switch_with_loop():
+    layer = MoELayer(_cfg())
+    layer.dispatch = "grouped"
+    assert layer.dispatch == "grouped"
+    with pytest.raises(ValueError):
+        layer.dispatch = "nope"
 
 
 # --- MoE layer: padded dispatch -------------------------------------------------
@@ -318,7 +354,7 @@ def test_balancer_never_gets_gradients():
 
 # --- precision, init, config ------------------------------------------------------
 
-@pytest.mark.parametrize("dispatch", ["loop", "padded"])
+@pytest.mark.parametrize("dispatch", ["loop", "padded", "grouped"])
 def test_bf16_autocast_forward_is_finite(dispatch):
     torch.manual_seed(0)
     layer = MoELayer(_cfg(moe_dispatch=dispatch))

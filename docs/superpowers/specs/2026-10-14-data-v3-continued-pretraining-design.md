@@ -90,6 +90,7 @@ pretrain: Muon, torch.compile, 524,288-token batches; 2 warm-up + 6 timed steps)
 | B200 (178 GiB) | 34,719 tok/s | 58,078 | **112,860** | 92.9 GiB |
 | H100 (79 GiB) | 21,801 | 37,284 | out of memory | — |
 | RTX 5090 (the pretrain, micro_batch 4) | 44,331 | | | |
+| **B200, grouped dispatch** (quipu.moe forward_grouped) | | | **366,229** (3.24x) | 92.4 GiB |
 
 Throughput roughly doubles with each doubling of the micro batch: the step is
 dominated by per-micro-step overhead (the MoE dispatch over 64 experts, recompiles
@@ -103,11 +104,11 @@ on empty experts), not by the GPU's maths. Two consequences:
 | Item | Cost / yield |
 |---|---|
 | B200, per hour incl. CPU/memory | ~$6.90 (Modal list price $6.25 + ~$0.65) |
-| 4 B200-hours a month at 112,860 tok/s | ~$27.50 → **~1.6B tokens/month** (more after the MoE speed-up) |
+| 4 B200-hours a month at 366,229 tok/s (grouped) | ~$27.50 → **~5.3B tokens/month** (1.6B with the old loop dispatch) |
 | For comparison: Vast RTX 5090 at $0.53/h | ~8B tokens for the same $27.50, but paid in cash; Modal's $30 is free credit |
 | Building a 10B-token chunk on Modal CPUs | to be measured on the first chunk; estimate $2-4 |
 
-At ~1.6B tokens a month the pool needs only ~2B tokens per month built ahead.
+At ~5.3B tokens a month the pool needs ~6B tokens per month built ahead.
 
 At that rate, 100B tokens is years of free credit; the pool and launcher are what a
 grant would plug into.

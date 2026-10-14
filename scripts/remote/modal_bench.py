@@ -6,6 +6,7 @@ GPU then times real training steps (compile, Muon, accumulation) at several micr
 batches. The 5090 run measured 44,331 tokens/s at micro_batch 4.
 
     modal run scripts/remote/modal_bench.py --gpus "B200,H100" --micro-batches "8,16,32"
+    modal run scripts/remote/modal_bench.py --gpus B200 --micro-batches 32 --dispatch grouped
 """
 import subprocess
 from pathlib import Path
@@ -29,10 +30,12 @@ vol = modal.Volume.from_name("quipu-shards", create_if_missing=True)
 app = modal.App("quipu-bench", image=image)
 
 
-def bench(micro_batches: str) -> str:
+def bench(micro_batches: str, dispatch: str) -> str:
     # The run config points at data/shards-moe; the Volume holds the same layout.
     cfg = Path("/src/run_config.toml").read_text()
     cfg = cfg.replace('shard_dir = "data/shards-moe"', 'shard_dir = "/shards"')
+    assert "moe_dispatch" not in cfg and "[model]\n" in cfg
+    cfg = cfg.replace("[model]\n", f'[model]\nmoe_dispatch = "{dispatch}"\n', 1)
     Path("/tmp/bench.toml").write_text(cfg)
     out = []
     for mb in micro_batches.split(","):
@@ -52,17 +55,17 @@ kw = dict(volumes={"/shards": vol}, cpu=8.0, memory=65536, timeout=45 * 60)
 
 
 @app.function(gpu="B200", **kw)
-def bench_b200(micro_batches: str) -> str:
-    return bench(micro_batches)
+def bench_b200(micro_batches: str, dispatch: str) -> str:
+    return bench(micro_batches, dispatch)
 
 
 @app.function(gpu="H100", **kw)
-def bench_h100(micro_batches: str) -> str:
-    return bench(micro_batches)
+def bench_h100(micro_batches: str, dispatch: str) -> str:
+    return bench(micro_batches, dispatch)
 
 
 @app.local_entrypoint()
-def main(gpus: str = "B200,H100", micro_batches: str = "8,16,32"):
+def main(gpus: str = "B200,H100", micro_batches: str = "8,16,32", dispatch: str = "loop"):
     have = set()
     for d in ("train", "val"):
         try:
@@ -75,6 +78,6 @@ def main(gpus: str = "B200,H100", micro_batches: str = "8,16,32"):
                 print("uploading", s, flush=True)
                 up.put_file(str(HERE / "data" / "shards-moe" / s), s)
     fns = {"B200": bench_b200, "H100": bench_h100}
-    calls = {g: fns[g].spawn(micro_batches) for g in gpus.split(",")}
+    calls = {g: fns[g].spawn(micro_batches, dispatch) for g in gpus.split(",")}
     for g, c in calls.items():
         print(f"===== {g}\n{c.get()}", flush=True)

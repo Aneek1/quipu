@@ -47,9 +47,10 @@ class ModelConfig:
     attnres_checkpoint: bool = False     # recompute the AttnRes depth mix in backward (CPU: +14% time, ~no memory saved)
     balance_update_rate: float = 0.3     # Quantile Balancing bias EMA rate
     # Routed-expert dispatch: "loop" runs each expert on its own contiguous slice;
+    # "grouped" is the same maths in one grouped matmul per projection (fast, no drops);
     # "padded" pads every slice to capacity ceil(capacity_factor * T * top_k / n)
     # and runs all experts in one batched matmul, dropping overflow tokens.
-    moe_dispatch: str = "loop"           # "loop" | "padded"
+    moe_dispatch: str = "loop"           # "loop" | "grouped" | "padded"
     capacity_factor: float = 1.5         # "padded" only
 
     @property
@@ -118,7 +119,7 @@ class DataConfig:
 ENGLISH_TEXT_KEY = "eng_Latn"
 MODEL_KINDS = ("dense", "moe")
 ACTIVATIONS = ("swiglu", "situ_glu")
-MOE_DISPATCHES = ("loop", "padded")
+MOE_DISPATCHES = ("loop", "grouped", "padded")
 OPTIMIZERS = ("adamw", "muon")
 PRECISIONS = ("bf16", "fp8")
 TRAIN_MODES = ("pretrain", "sft")

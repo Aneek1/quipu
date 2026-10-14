@@ -7,8 +7,9 @@ Pieces, smallest first:
   where g = W_gate x and u = W_up x. Near zero tanh(z / b) * b ~ z, so it is SwiGLU;
   for large inputs |h| <= b1 * b2, which keeps bf16 activations bounded.
 - ExpertBank: n experts stored as stacked weights ([n, d, h] gate/up, [n, h, d] down).
-  Two dispatches over tokens already sorted by expert: "loop" runs each expert on its
-  contiguous slice; "padded" pads every slice to a fixed capacity and runs all experts
+  Three dispatches over tokens already sorted by expert: "loop" runs each expert on its
+  contiguous slice; "grouped" does the same maths in one grouped matmul per projection
+  (torch._grouped_mm: no host sync, no per-expert kernels); "padded" pads every slice to a fixed capacity and runs all experts
   in one batched matmul, dropping overflow. Padded drops are batch-dependent
   (Switch-style capacity over the whole flattened batch): see MoELayer.
 - Router: fp32 softmax scores; Top-k chosen on score + bias, weights taken from the
@@ -151,6 +152,21 @@ class ExpertBank(nn.Module):
         if not outs:
             return x_sorted.new_zeros(0, self.down.shape[-1])
         return torch.cat(outs, dim=0)
+
+    def forward_grouped(
+        self, x_sorted: torch.Tensor, w_sorted: torch.Tensor, counts: torch.Tensor
+    ) -> torch.Tensor:
+        """The loop's maths in three grouped matmuls (torch._grouped_mm): expert e's
+        rows are [offs[e-1], offs[e]) of one call per projection. No host sync, no
+        Python loop, no drops, and the shapes depend only on the row count, so
+        torch.compile does not recompile when an expert's share changes or is empty."""
+        dtype = _compute_dtype(x_sorted)
+        gate, up, down = self._weights(dtype)
+        x_sorted = x_sorted.to(dtype)
+        offs = torch.cumsum(counts, 0).to(torch.int32)
+        h = self.act(torch._grouped_mm(x_sorted, gate, offs=offs),
+                     torch._grouped_mm(x_sorted, up, offs=offs)) * w_sorted[:, None].to(dtype)
+        return torch._grouped_mm(h, down, offs=offs)
 
     def forward_padded(
         self,
@@ -305,10 +321,11 @@ class MoELayer(nn.Module):
     else x's dtype). The batch's router scores are kept so the trainer can call
     update_balance() after its optimizer step.
 
-    dispatch ("loop" | "padded") is a validated, mutable attribute: a model trained
+    dispatch ("loop" | "grouped" | "padded") is a validated, mutable attribute: a model trained
     with padded dispatch can be switched to loop for evaluation. Padded dispatch
     drops overflow Switch-style, so its drops (and a token's output) depend on the
-    rest of the batch; loop dispatch drops nothing and is per-token."""
+    rest of the batch; loop and grouped drop nothing and are per-token (grouped is the
+    fast one: same results as loop up to float rounding)."""
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
@@ -342,7 +359,7 @@ class MoELayer(nn.Module):
 
     @dispatch.setter
     def dispatch(self, mode: str) -> None:
-        if mode not in ("loop", "padded"):
+        if mode not in ("loop", "grouped", "padded"):
             raise ValueError(f"unknown moe_dispatch {mode!r}")
         self._dispatch = mode
 
@@ -374,6 +391,9 @@ class MoELayer(nn.Module):
         if self.dispatch == "padded":
             out, dropped = self.experts.forward_padded(
                 x_sorted, w_sorted, flat_expert[order], counts, self.capacity(T))
+        elif self.dispatch == "grouped":
+            out = self.experts.forward_grouped(x_sorted, w_sorted, counts)
+            dropped = counts.new_zeros(())
         else:
             out = self.experts.forward_loop(x_sorted, w_sorted, counts)
             dropped = counts.new_zeros(())
