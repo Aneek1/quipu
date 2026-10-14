@@ -125,3 +125,8 @@ uv run python scripts/remote/modal_train.py --here --gpus 8 --hours 20 \
 - Whether grouped dispatch is trusted for the long run before a loss comparison with loop
   on the same steps.
 - Pool size: 10B tokens is not enough for a multi-day 8-GPU run.
+
+## If the first collective fails with "Cuda failure 801 'operation not supported'" or "101 'invalid device ordinal'"
+Seen on Modal (2x L40S, 14 Oct, NCCL 2.28.9): NCCL's cuMem buffer sharing is refused inside
+the container. `export NCCL_CUMEM_ENABLE=0` fixed it there (P2P can stay on). On a bare DGX it
+should not be needed; try without first, since cuMem is the faster path with NVLink.

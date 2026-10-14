@@ -741,7 +741,9 @@ if modal is not None:
         modal.Image.debian_slim(python_version="3.13")
         .apt_install("build-essential")                  # torch.compile builds C++ wrappers
         .pip_install(*PIP)
-        .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": "/src"})
+        # NCCL 2.28 shares buffers between ranks through cuMem, which Modal's containers
+        # refuse (Cuda failure 801 / 101 at the first collective; 2x L40S, 14 Oct).
+        .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": "/src", "NCCL_CUMEM_ENABLE": "0"})
         .add_local_dir(HERE / "quipu", "/src/quipu", ignore=["__pycache__", "memory"])
         .add_local_file(HERE / "configs" / "quipu-moe.toml", "/src/configs/quipu-moe.toml")
         .add_local_file(HERE / CONFIG, f"/src/{CONFIG}")
