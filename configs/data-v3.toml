@@ -1,0 +1,395 @@
+# Data v3 pool (docs/superpowers/specs/2026-10-14-data-v3-continued-pretraining-design.md).
+# Built by scripts/build_pool.py (locally) or scripts/remote/modal_pool.py (Modal CPUs,
+# Volume "quipu-pool"), in rolling chunks of [pool] chunk_tokens.
+#
+# Every Hugging Face source is pinned to the commit resolved with HfApi().dataset_info on
+# 14 Oct 2026. A source's share of a chunk is   slice share x weight / (sum of the
+# slice's weights)   (shares are percent of the chunk's tokens and sum to 100).
+# A source that runs dry is repeated, at most max_epochs times in all (counting the
+# first pass); after that its share goes to the other sources in proportion to theirs.
+
+[pool]
+tokenizer        = "artifacts/tokenizer/tokenizer.json"
+tokenizer_sha256 = "9f3e33d074f3a0d7da234eec11a59de1e20aa756855d1ef552fc9706b9006943"
+vocab_size       = 49152
+shard_tokens     = 100_000_000
+chunk_tokens     = 10_000_000_000
+max_epochs       = 4
+max_doc_tokens   = 16_000          # code sources only (as data v2)
+# Decontamination (quipu/decontam.py) on EVERY source, the benchmark commits pinned.
+humaneval_revision = "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544"  # openai/openai_humaneval (MIT)
+mbpp_revision      = "4bb6404fdc6cacfda99d4ac4205087b89d32030c"  # google-research-datasets/mbpp (CC-BY-4.0)
+lid_model          = "AneekC/lid-specialists-9plus1"
+lid_revision       = "117966eb565a5e3c2ee1f1ce7b56848726b56982"
+# Stack Exchange: dumps up to April 2024 only (later dumps forbid LLM training).
+stackexchange_cutoff = "2024-04-30"
+
+[slices]          # percent of every chunk
+code      = 45    # bigcode/starcoderdata, the 14 languages of quipu-moe's code mix
+code_old  = 5     # codeparrot/github-code-clean, permissive licences (data v2's source)
+code_web  = 3     # OpenCoder-LLM/opc-fineweb-code-corpus
+english   = 20    # HuggingFaceFW/fineweb-edu
+qa        = 5     # Stack Exchange (RedPajama-1T, dump of March 2023)
+maths     = 7     # finemath + open-web-math
+reference = 4     # Wikipedia (English + the nine languages' wikis), peS2o, arXiv
+languages = 10    # FineWeb-2, the nine languages (+ urd_Arab at 1/3 of Urdu)
+verified  = 1     # data/distill-v2/kept (unit-test-verified answers)
+
+# ------------------------------------------------------------------ code (starcoderdata)
+# Weights are quipu-moe's [data.code_language_weights]; keys there are github-code-clean
+# labels, the directories here are starcoderdata's (GO -> go, C++ -> cpp, ...).
+# starcoderdata has no licence column: BigCode kept permissively licensed files only
+# (The Stack v1.2 with opt-outs removed); per-file attribution is repo + path.
+[defaults.starcoder]
+kind        = "hf_parquet"
+slice       = "code"
+repo        = "bigcode/starcoderdata"
+revision    = "9fc30b578cedaec69e47302df72cf00feed7c8c4"
+text_field  = "content"
+meta_fields = ["id", "max_stars_repo_name", "max_stars_repo_path"]
+path_field  = "max_stars_repo_path"
+code        = true
+licence     = "per-file permissive licences (The Stack v1.2, BigCode terms of use)"
+
+[sources.starcoder-python]
+defaults = "starcoder"
+weight   = 0.325
+files    = ["python/*.parquet"]
+language = "Python"
+[sources.starcoder-javascript]
+defaults = "starcoder"
+weight   = 0.272
+files    = ["javascript/*.parquet"]
+language = "JavaScript"
+[sources.starcoder-typescript]
+defaults = "starcoder"
+weight   = 0.12
+files    = ["typescript/*.parquet"]
+language = "TypeScript"
+[sources.starcoder-html]
+defaults = "starcoder"
+weight   = 0.08
+files    = ["html/*.parquet"]
+language = "HTML"
+[sources.starcoder-css]
+defaults = "starcoder"
+weight   = 0.05
+files    = ["css/*.parquet"]
+language = "CSS"
+[sources.starcoder-sql]
+defaults = "starcoder"
+weight   = 0.02
+files    = ["sql/*.parquet"]
+language = "SQL"
+[sources.starcoder-php]
+defaults = "starcoder"
+weight   = 0.03
+files    = ["php/*.parquet"]
+language = "PHP"
+[sources.starcoder-java]
+defaults = "starcoder"
+weight   = 0.03
+files    = ["java/*.parquet"]
+language = "Java"
+[sources.starcoder-go]
+defaults = "starcoder"
+weight   = 0.03
+files    = ["go/*.parquet"]
+language = "GO"
+[sources.starcoder-shell]
+defaults = "starcoder"
+weight   = 0.01
+files    = ["shell/*.parquet"]
+language = "Shell"
+[sources.starcoder-dockerfile]
+defaults = "starcoder"
+weight   = 0.003
+files    = ["dockerfile/*.parquet"]
+language = "Dockerfile"
+[sources.starcoder-c]
+defaults = "starcoder"
+weight   = 0.01
+files    = ["c/*.parquet"]
+language = "C"
+[sources.starcoder-cpp]
+defaults = "starcoder"
+weight   = 0.01
+files    = ["cpp/*.parquet"]
+language = "C++"
+[sources.starcoder-rust]
+defaults = "starcoder"
+weight   = 0.01
+files    = ["rust/*.parquet"]
+language = "Rust"
+
+# ------------------------------------------------------------------ code (old, web)
+# Data v2 read github-code-clean files 0..412 (data/shards-moe/manifest.json,
+# code.last_file_read); v3 continues at 413. Files 840..879 stay held out (code_val).
+[sources.github-code-clean]
+kind        = "hf_parquet"
+slice       = "code_old"
+weight      = 1
+repo        = "codeparrot/github-code-clean"
+revision    = "c48d40f9e70f0196f8236901ee35807f7d6c44c0"
+files       = ["data/train-*.parquet"]
+file_range  = [413, 840]
+text_field  = "code"
+meta_fields = ["repo_name", "path", "language", "license"]
+path_field  = "path"
+code        = true
+html_cap    = 0.08
+attribution_field = "license"
+licence     = "per-file (only the licences below kept)"
+[sources.github-code-clean.keep]
+language = ["Python", "JavaScript", "TypeScript", "HTML", "CSS", "SQL", "PHP", "Java",
+            "GO", "Shell", "Dockerfile", "C", "C++", "Rust"]
+license  = ["mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc", "cc0-1.0",
+            "unlicense"]
+
+[sources.opc-fineweb-code]
+kind        = "hf_parquet"
+slice       = "code_web"
+weight      = 1
+repo        = "OpenCoder-LLM/opc-fineweb-code-corpus"
+revision    = "9e8e48e666c226294d6f9e6c2e13f2c84c1c06f3"
+files       = ["data/train-*.parquet"]
+text_field  = "text"
+meta_fields = ["url", "dump"]
+licence     = "MIT (dataset); web pages from Common Crawl"
+
+# ------------------------------------------------------------------ English
+# The full FineWeb-Edu (score >= 3), newest Common Crawl dump first. Data v2's English
+# validation file is held out by id: its documents also sit in these dumps.
+[sources.fineweb-edu]
+kind        = "hf_parquet"
+slice       = "english"
+weight      = 1
+repo        = "HuggingFaceFW/fineweb-edu"
+revision    = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+files       = ["data/CC-MAIN-*/*.parquet"]
+order       = "dir_desc"
+text_field  = "text"
+meta_fields = ["id", "url", "dump"]
+exclude_ids = ["sample/10BT/013_00000.parquet"]
+id_field    = "id"
+attribution_field = "dump"
+licence     = "ODC-By 1.0 (and the Common Crawl terms of use)"
+
+# ------------------------------------------------------------------ Q&A
+# RedPajama-1T's Stack Exchange file: the 28 largest sites, HTML stripped, each question
+# followed by its answers by score ("Q: ...\n\nA: ..."). Its README says it was
+# downloaded from the Internet Archive; the file was last modified on 17 Apr 2023 and
+# every row's timestamp is 2023-03-29, so the dump is the March 2023 one (the last
+# before Stack Exchange paused the dumps in June 2023), well before the 2024-04 cutoff.
+# The builder re-checks the HTTP Last-Modified, size and ETag and every row's timestamp
+# against stackexchange_cutoff and refuses the source on any mismatch.
+[sources.stackexchange]
+kind           = "http_jsonl"
+slice          = "qa"
+weight         = 1
+url            = "https://data.together.xyz/redpajama-data-1T/v1.0.0/stackexchange/stackexchange.jsonl"
+via            = "togethercomputer/RedPajama-Data-1T"
+revision       = "398f92572e94f4793e41c22ab7ea2a788d9e7de4"   # the HF repo with urls/stackexchange.txt
+content_length = 80046059672
+etag           = "\"6c66b2c35742401d9abfb95d502c2be4-9543\""
+last_modified  = "2023-04-17"
+sha256         = "999f802cee2578e82555dd634d41cc3249eac88a25036063898305ac5258941e"  # sha256/stackexchange_SHA256SUMS.txt
+dump_date      = "2023-03"
+date_field     = "timestamp"
+text_field     = "text"
+meta_fields    = ["url", "question_score"]
+render         = "stackexchange_redpajama"
+attribution_field = "site"
+licence        = "CC BY-SA (2.5 / 3.0 / 4.0 by post date); attribution: site + question URL"
+
+# ------------------------------------------------------------------ maths
+# finemath-3plus contains every finemath-4plus document: reading 4plus first and then
+# 3plus through ONE dedup set gives 4plus first and only the 3-score rest after it.
+[sources.finemath]
+kind        = "hf_parquet"
+slice       = "maths"
+weight      = 5
+repo        = "HuggingFaceTB/finemath"
+revision    = "e92b25a616738fe95dc186b64dfb19f9c8525594"
+files       = ["finemath-4plus/*.parquet", "finemath-3plus/*.parquet"]
+text_field  = "text"
+meta_fields = ["url"]
+licence     = "ODC-By 1.0"
+
+[sources.open-web-math]
+kind        = "hf_parquet"
+slice       = "maths"
+weight      = 2
+repo        = "open-web-math/open-web-math"
+revision    = "fde8ef8de2300f5e778f56261843dab89f230815"
+files       = ["data/train-*.parquet"]
+text_field  = "text"
+meta_fields = ["url"]
+licence     = "ODC-By 1.0"
+
+# ------------------------------------------------------------------ reference
+[defaults.wikipedia]
+kind        = "hf_parquet"
+slice       = "reference"
+repo        = "wikimedia/wikipedia"
+revision    = "b04c8d1ceb2f5cd4588862100d08de323dccfbaa"
+text_field  = "text"
+render      = "title_text"
+meta_fields = ["id", "url", "title"]
+licence     = "CC BY-SA 3.0 / GFDL (Wikipedia dump 2023-11-01)"
+
+[sources.wikipedia-en]
+defaults = "wikipedia"
+weight   = 1.5
+files    = ["20231101.en/*.parquet"]
+[sources.wikipedia-id]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.id/*.parquet"]
+[sources.wikipedia-ms]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.ms/*.parquet"]
+[sources.wikipedia-zh]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.zh/*.parquet"]
+[sources.wikipedia-ja]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.ja/*.parquet"]
+[sources.wikipedia-ko]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.ko/*.parquet"]
+[sources.wikipedia-ta]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.ta/*.parquet"]
+[sources.wikipedia-hi]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.hi/*.parquet"]
+[sources.wikipedia-ur]
+defaults = "wikipedia"
+weight   = 0.0625
+files    = ["20231101.ur/*.parquet"]
+
+# peS2o's loading script (peS2o.py) is not run: the v2 data files it reads are plain
+# gzipped JSON lines in the same repo and are streamed directly.
+[sources.pes2o]
+kind        = "hf_jsonl_gz"
+slice       = "reference"
+weight      = 1
+repo        = "allenai/peS2o"
+revision    = "636a503e44a3ca1b58e01fb61eab0825cd574de0"
+files       = ["data/v2/train-*.json.gz"]
+text_field  = "text"
+meta_fields = ["id", "source"]
+attribution_field = "source"
+licence     = "ODC-By 1.0 (papers: their own licences, see Semantic Scholar)"
+
+[sources.arxiv]
+kind        = "hf_jsonl_gz"
+slice       = "reference"
+weight      = 1
+repo        = "common-pile/arxiv_papers_filtered"
+revision    = "033cf7f53f9b348deec868c1a5a48484f3ee9e52"
+files       = ["arxiv-papers-*.json.gz"]
+text_field  = "text"
+meta_fields = ["id", "license", "url"]
+render      = "arxiv"
+attribution_field = "license"
+licence     = "per-paper open licences (Common Pile filtered: CC BY, CC BY-SA, CC0, public domain)"
+
+# ------------------------------------------------------------------ nine languages
+# Weights: 3 each = 1/9 of the slice per language; Urdu's 3 split 2 (romanized, as v2)
+# + 1 (native script, owner 14 Oct). Language ID (the owner's specialist, as v2) drops
+# a document whose top label is another language; cmn_Hani keeps either Chinese script.
+# skip_rows: the rows data v2 already read from the start of each subset
+# (data/shards-moe/manifest.json, text.by_language.*.rows_scanned). hin_Latn and
+# urd_Latn were read whole by v2 and are tiny: they start again from row 0 and will
+# hit the 4-epoch limit first.
+[defaults.fineweb2]
+kind        = "hf_parquet"
+slice       = "languages"
+repo        = "HuggingFaceFW/fineweb-2"
+revision    = "af9c13333eb981300149d5ca60a8e9d659b276b9"
+text_field  = "text"
+meta_fields = ["id", "url"]
+licence     = "ODC-By 1.0 (and the Common Crawl terms of use)"
+
+[sources.fw2-ind_Latn]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/ind_Latn/train/*.parquet"]
+lid       = "ind_Latn"
+skip_rows = 106510
+[sources.fw2-zsm_Latn]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/zsm_Latn/train/*.parquet"]
+lid       = "zsm_Latn"
+skip_rows = 136421
+[sources.fw2-cmn_Hani]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/cmn_Hani/train/*.parquet"]
+lid       = "cmn_Hani"
+skip_rows = 230932
+[sources.fw2-jpn_Jpan]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/jpn_Jpan/train/*.parquet"]
+lid       = "jpn_Jpan"
+skip_rows = 102732
+[sources.fw2-kor_Hang]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/kor_Hang/train/*.parquet"]
+lid       = "kor_Hang"
+skip_rows = 108305
+[sources.fw2-tam_Taml]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/tam_Taml/train/*.parquet"]
+lid       = "tam_Taml"
+skip_rows = 98884
+[sources.fw2-hin_Deva]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/hin_Deva/train/*.parquet"]
+lid       = "hin_Deva"
+skip_rows = 170762
+[sources.fw2-hin_Latn]
+defaults  = "fineweb2"
+weight    = 3
+files     = ["data/hin_Latn/train/*.parquet"]
+lid       = "hin_Latn"
+[sources.fw2-urd_Latn]
+defaults  = "fineweb2"
+weight    = 2
+files     = ["data/urd_Latn/train/*.parquet"]
+lid       = "urd_Latn"
+# Native-script Urdu: the LID specialist has no urd_Arab label (it was trained on
+# romanized Urdu), so this subset is not language-filtered; FineWeb-2's own LID chose it.
+[sources.fw2-urd_Arab]
+defaults  = "fineweb2"
+weight    = 1
+files     = ["data/urd_Arab/train/*.parquet"]
+
+# ------------------------------------------------------------------ verified answers
+# Local, read-only. Only the "train" split: the "val" rows stay held out for the chat
+# fine-tune's evaluation. Teacher Qwen/Qwen2.5-Coder-7B-Instruct (Apache-2.0); the
+# builder records each row's teacher and revision.
+[sources.verified-answers]
+kind        = "local_jsonl"
+slice       = "verified"
+weight      = 1
+path        = "data/distill-v2/kept"
+files       = ["part-*.jsonl"]
+render      = "prompt_response"
+split       = "train"
+meta_fields = ["id", "teacher", "revision"]
+attribution_field = "teacher"
+licence     = "Apache-2.0 teacher outputs (Qwen/Qwen2.5-Coder-7B-Instruct); prompts: see data/distill-v2/prompts/manifest.json"
