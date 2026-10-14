@@ -387,3 +387,136 @@ def test_worker_processes_give_the_same_bytes(tmp_path):
     assert sa.cursor == sb.cursor and sa.stats == sb.stats
     assert [(a / p["file"]).read_bytes() for p in sa.parts] == \
         [(b / p["file"]).read_bytes() for p in sb.parts]
+
+
+# ------------------------------------------------------------------ the mixer
+
+def mix_config(tmp_path, shares=(("a", 50), ("b", 30), ("c", 20)), shard_tokens=100):
+    lines = [BASE.split("[slices]")[0].replace("shard_tokens = 100",
+                                               f"shard_tokens = {shard_tokens}"),
+             "[slices]"]
+    lines += [f"{n} = {v}" for n, v in shares]
+    for n, _ in shares:
+        lines += [f"[sources.{n}]", 'kind = "memory"', f'slice = "{n}"', "weight = 1"]
+    return pool.load_pool_config(_write(tmp_path, "\n".join(lines) + "\n"))
+
+
+def corpus(name, n, size=9):
+    """n distinct documents of exactly `size` characters (size + 1 tokens with EOT)."""
+    return [f"{name}{i:0{size - len(name)}d}" for i in range(n)]
+
+
+CORPORA = {"a": corpus("a", 400), "b": corpus("b", 400), "c": corpus("c", 5)}
+
+
+def builder(root, cfg, corpora=CORPORA):
+    calls = []
+
+    def build(targets):
+        calls.append(dict(targets))
+        for name, target in targets.items():
+            pool.build_source(pool.source_dir(root, name), cfg.sources[name], target,
+                              setup=setup(), open_rows=memory_rows(corpora[name]),
+                              shard_tokens=cfg.shard_tokens)
+    return build, calls
+
+
+def mixed_docs(root):
+    """The mixed shards' documents in order (as text), and the shard file names."""
+    files = sorted((root / "mixed").glob("shard_*.bin"))
+    arr = np.concatenate([np.fromfile(f, dtype="<u2") for f in files])
+    docs, cur = [], []
+    for t in arr.tolist():
+        if t == EOT:
+            docs.append("".join(chr(x - OFFSET) for x in cur))
+            cur = []
+        else:
+            cur.append(t)
+    return docs, [f.name for f in files], cur
+
+
+def test_a_chunk_mixes_the_sources_by_share_into_continuing_shards(tmp_path):
+    cfg = mix_config(tmp_path, shares=(("a", 60), ("b", 40)))
+    root = tmp_path / "pool"
+    build, calls = builder(root, cfg)
+    rec = pool.run_chunk(root, cfg, build, chunk_tokens=1000, eot=EOT)
+    assert calls[0] == {"a": 600, "b": 400}
+    docs, files, tail = mixed_docs(root)
+    assert files == [f"shard_{i:05d}.bin" for i in range(10)]
+    assert sum(len(d) + 1 for d in docs) + len(tail) == 1000
+    a = [d for d in docs if d.startswith("a")]
+    assert a == CORPORA["a"][:len(a)]          # each source's documents in its order
+    assert rec["by_source"]["a"]["share"] == pytest.approx(0.6, abs=0.011)
+    assert rec["tokens"] == 1000 and rec["index"] == 0
+
+    rec2 = pool.run_chunk(root, cfg, build, chunk_tokens=500, eot=EOT)
+    docs2, files2, _ = mixed_docs(root)
+    assert files2[-5:] == [f"shard_{i:05d}.bin" for i in range(10, 15)]
+    a2 = [d for d in docs2 if d.startswith("a")]
+    assert a2 == CORPORA["a"][:len(a2)] and len(set(a2)) == len(a2)  # nothing reused
+    assert rec2["index"] == 1 and rec2["shards"] == [10, 14]
+    m = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert m["total_tokens"] == 1500 and len(m["chunks"]) == 2
+    assert m["sources"]["a"]["unique_tokens"] >= 900
+
+
+def test_merge_refuses_a_live_source_that_has_not_built_enough(tmp_path):
+    cfg = mix_config(tmp_path, shares=(("a", 60), ("b", 40)))
+    root = tmp_path / "pool"
+    build, _ = builder(root, cfg)
+    build({"a": 600, "b": 100})
+    with pytest.raises(pool.NeedMore) as e:
+        pool.merge_chunk(root, cfg, 1000, eot=EOT)
+    assert set(e.value.targets) == {"b"} and e.value.targets["b"] > 290
+    assert not (root / "mixed").exists() or not list((root / "mixed").glob("*.bin"))
+
+
+def test_a_thin_source_repeats_four_epochs_then_its_share_is_redistributed(tmp_path):
+    cfg = mix_config(tmp_path)                     # a 50, b 30, c 20; c has 50 tokens
+    root = tmp_path / "pool"
+    build, calls = builder(root, cfg)
+    r1 = pool.run_chunk(root, cfg, build, chunk_tokens=500, eot=EOT)
+    # c ran dry in round 1: its 4 epochs = 200 tokens; it gives 100 here (its share)
+    assert pool.SourceState.load(pool.source_dir(root, "c")).exhausted
+    assert r1["by_source"]["c"]["tokens"] == 100
+    r2 = pool.run_chunk(root, cfg, build, chunk_tokens=500, eot=EOT)
+    assert r2["by_source"]["c"]["tokens"] == 100   # epochs 3 and 4
+    r3 = pool.run_chunk(root, cfg, build, chunk_tokens=500, eot=EOT)
+    assert r3["by_source"]["c"]["tokens"] == 0     # budget spent: share moves on
+    a3, b3 = r3["by_source"]["a"]["allocated"], r3["by_source"]["b"]["allocated"]
+    assert a3 + b3 == 500 and abs(a3 - 312.5) <= 0.5   # c's 20% went 5:3 to a and b
+    docs, _, _ = mixed_docs(root)
+    c = [d for d in docs if d.startswith("c")]
+    assert c == CORPORA["c"] * 4                    # exactly four passes, in order
+    m = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert m["sources"]["c"]["epochs_used"] == pytest.approx(4.0)
+
+
+def test_a_killed_merge_is_redone_identically(tmp_path):
+    cfg = mix_config(tmp_path, shares=(("a", 60), ("b", 40)))
+    root = tmp_path / "pool"
+    build, _ = builder(root, cfg)
+    pool.run_chunk(root, cfg, build, chunk_tokens=1000, eot=EOT)
+    before = {f.name: f.read_bytes() for f in (root / "mixed").glob("*.bin")}
+    pool_json = (root / "pool.json").read_text(encoding="utf-8")
+    # a second chunk killed after writing some shards but before pool.json
+    build({"a": 300, "b": 200})
+    (root / "mixed" / "shard_00010.bin").write_bytes(b"\x05\x00" * 7)
+    (root / "mixed" / "shard_00011.bin.tmp").write_bytes(b"\x05\x00")
+    assert (root / "pool.json").read_text(encoding="utf-8") == pool_json
+    pool.merge_chunk(root, cfg, 500, eot=EOT)
+    after = {f.name: f.read_bytes() for f in (root / "mixed").glob("*.bin")}
+    assert {k: after[k] for k in before} == before
+    assert len(after) == 15 and not list((root / "mixed").glob("*.tmp"))
+
+
+def test_fit_chunk_tokens_is_the_largest_chunk_the_built_sources_can_fill(tmp_path):
+    cfg = mix_config(tmp_path, shares=(("a", 60), ("b", 40)))
+    root = tmp_path / "pool"
+    build, _ = builder(root, cfg)
+    build({"a": 600, "b": 100})
+    t = pool.fit_chunk_tokens(root, cfg)
+    assert 240 <= t <= 260                         # b's ~100 tokens at 40%
+    pool.merge_chunk(root, cfg, t, eot=EOT)
+    with pytest.raises(pool.NeedMore):
+        pool.merge_chunk(root, cfg, 200, eot=EOT)

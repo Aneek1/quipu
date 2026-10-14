@@ -692,3 +692,335 @@ def build_source(out_dir: str | Path, spec: SourceSpec, target: int, *, setup: B
                    wall_seconds=entry["wall_seconds"], process_seconds=entry["process_seconds"],
                    cpu_seconds_main=entry["cpu_seconds_main"])
     return summary
+
+
+# ------------------------------------------------------------------ the pool and the mixer
+
+SOURCES = "sources"
+MIXED = "mixed"
+POOL_FILE = "pool.json"
+MANIFEST = "manifest.json"
+POOL_VERSION = 1
+
+
+def source_dir(root: str | Path, name: str) -> Path:
+    return Path(root) / SOURCES / name
+
+
+def shard_name(index: int) -> str:
+    return f"shard_{index:05d}.bin"
+
+
+@dataclass
+class PoolState:
+    """pool.json: tokens each source has given to the chunks (repeats included), the
+    next mixed shard index, and every chunk's record."""
+    consumed: dict[str, int] = field(default_factory=dict)
+    next_shard: int = 0
+    chunks: list[dict[str, Any]] = field(default_factory=list)
+    provenance: dict[str, Any] = field(default_factory=dict)
+    version: int = POOL_VERSION
+
+    @classmethod
+    def load(cls, root: str | Path) -> "PoolState":
+        import json
+        p = Path(root) / POOL_FILE
+        if not p.exists():
+            return cls()
+        return cls(**json.loads(p.read_text(encoding="utf-8")))
+
+    def save(self, root: str | Path) -> None:
+        from dataclasses import asdict
+        write_json_atomic(Path(root) / POOL_FILE, asdict(self))
+
+
+def load_states(root: str | Path, names: Any) -> dict[str, SourceState | None]:
+    out: dict[str, SourceState | None] = {}
+    for n in names:
+        d = source_dir(root, n)
+        out[n] = SourceState.load(d) if (d / STATE).exists() else None
+    return out
+
+
+def pool_totals(root: str | Path, cfg: PoolConfig, ps: PoolState | None = None
+                ) -> dict[str, SourceTotals]:
+    ps = ps or PoolState.load(root)
+    out = {}
+    for n, st in load_states(root, cfg.sources).items():
+        c = int(ps.consumed.get(n, 0))
+        out[n] = st.totals(c) if st is not None else SourceTotals(0, c, False)
+    return out
+
+
+def missing_tokens(total: int, cfg: PoolConfig, totals: dict[str, SourceTotals]
+                   ) -> tuple[dict[str, int], dict[str, int], int]:
+    """(allocation, what each live source still lacks for it, shortfall)."""
+    want, short = chunk_allocation(total, cfg.shares(), bounds_for(totals, cfg.max_epochs))
+    need = {}
+    for n, w in want.items():
+        t = totals[n]
+        if not t.exhausted and t.unique - t.consumed < w:
+            need[n] = w - (t.unique - t.consumed)
+    return want, need, short
+
+
+def fit_chunk_tokens(root: str | Path, cfg: PoolConfig) -> int:
+    """The largest chunk the sources' built tokens can fill without building more
+    (smoke runs: a few hundred documents per source set the chunk size)."""
+    totals = pool_totals(root, cfg)
+    lo, hi = 0, max(1, sum(t.unique for t in totals.values()) * cfg.max_epochs)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if missing_tokens(mid, cfg, totals)[1]:
+            hi = mid - 1
+        else:
+            lo = mid
+    return lo
+
+
+class _Docs:
+    """A source's documents from token position `start` (a document boundary), read
+    from its parts (memory-mapped); with wrap, the stream starts again at the first
+    document when it ends (the repeat epochs of an exhausted source)."""
+
+    def __init__(self, directory: Path, st: SourceState, start: int, eot: int,
+                 wrap: bool) -> None:
+        self.dir, self.parts, self.eot, self.wrap = directory, st.parts, eot, wrap
+        self.unique = st.unique_tokens
+        if self.unique <= 0:
+            raise ValueError(f"{st.name}: no tokens built")
+        self.pos = start % self.unique if wrap else start
+        if not wrap and start > self.unique:
+            raise ValueError(f"{st.name}: position {start} beyond its {self.unique} tokens")
+        self._load(self.pos)
+
+    def _load(self, pos: int) -> None:
+        import numpy as np
+        acc = 0
+        for i, p in enumerate(self.parts):
+            if pos < acc + p["tokens"]:
+                self.part, self.base = i, acc
+                self.arr = np.memmap(self.dir / p["file"], dtype="<u2", mode="r")
+                self.ends = np.flatnonzero(self.arr == self.eot)
+                off = pos - acc
+                if off and self.arr[off - 1] != self.eot:
+                    raise ValueError(f"{self.dir.name}: position {pos} is not a document end")
+                self.k = int(np.searchsorted(self.ends, off))
+                return
+            acc += p["tokens"]
+        self.part = None  # at the end
+
+    def __iter__(self) -> "_Docs":
+        return self
+
+    def __next__(self) -> Any:
+        while True:
+            if self.part is None:
+                if not self.wrap or self.pos == 0:
+                    raise StopIteration
+                self.pos = 0
+                self._load(0)
+                continue
+            if self.k < len(self.ends):
+                lo = 0 if self.k == 0 else int(self.ends[self.k - 1]) + 1
+                hi = int(self.ends[self.k]) + 1
+                self.k += 1
+                self.pos = self.base + hi
+                return self.arr[lo:hi]
+            nxt = self.base + self.parts[self.part]["tokens"]
+            self.pos = nxt
+            self._load(nxt)
+            if self.part is None and self.wrap:
+                self.pos = 0
+                self._load(0)
+
+
+def _recover_mixed(mixed: Path, next_shard: int) -> int:
+    """Delete shards a killed merge wrote beyond pool.json's next_shard, and temp files."""
+    removed = 0
+    if not mixed.exists():
+        return 0
+    for f in list(mixed.glob("shard_*.bin")) + list(mixed.glob("*.tmp")):
+        m = re.fullmatch(r"shard_(\d+)\.bin", f.name)
+        if m is None or int(m.group(1)) >= next_shard:
+            f.unlink()
+            removed += 1
+    return removed
+
+
+def merge_chunk(root: str | Path, cfg: PoolConfig, chunk_tokens: int | None = None, *,
+                eot: int, provenance: dict[str, Any] | None = None,
+                log: Any = None) -> dict[str, Any]:
+    """Mix the next chunk of `chunk_tokens` (default cfg.chunk_tokens) from what the
+    sources have built and append it to mixed/ as shards of cfg.shard_tokens, indices
+    continuing from the last chunk.
+
+    Allocation: chunk_allocation over the shares, exhausted sources bounded by their
+    epoch budget. A live source that has not built its allocation raises NeedMore
+    (nothing is written). Before each document the source furthest below its
+    allocated share of the tokens written so far supplies it (ties: config order);
+    a source stops at its allocation (its last document may pass it), and the chunk
+    ends at the first document end at or after its total, so no document is ever cut.
+    The last shard of a chunk holds the remainder. pool.json is saved only after the
+    shards are written; shards past it (a killed merge) are deleted first, so a rerun
+    writes the same bytes.
+    """
+    import numpy as np
+
+    from quipu.data import write_shard
+
+    root = Path(root)
+    T = int(chunk_tokens if chunk_tokens is not None else cfg.chunk_tokens)
+    ps = PoolState.load(root)
+    mixed = root / MIXED
+    _recover_mixed(mixed, ps.next_shard)
+    states = load_states(root, cfg.sources)
+    totals = pool_totals(root, cfg, ps)
+    want, need, short = missing_tokens(T, cfg, totals)
+    if need:
+        raise NeedMore(need)
+    total = T - short
+    order = [n for n in cfg.sources if want[n] > 0]
+    if not order:
+        raise RuntimeError("no source has tokens for this chunk")
+    readers = {n: _Docs(source_dir(root, n), states[n], ps.consumed.get(n, 0), eot,
+                        wrap=states[n].exhausted) for n in order}
+    shares = {n: want[n] / total for n in order}
+    taken = dict.fromkeys(order, 0)
+    docs = dict.fromkeys(order, 0)
+    active = list(order)
+    mixed.mkdir(parents=True, exist_ok=True)
+    first = ps.next_shard
+    index = first
+    buf = np.empty(cfg.shard_tokens, dtype=np.uint16)
+    fill = written = 0
+    shards: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        nonlocal fill, index
+        write_shard(mixed / shard_name(index), buf[:fill].copy())
+        shards.append({"file": shard_name(index), "tokens": fill})
+        index += 1
+        fill = 0
+
+    while written < total:
+        if not active:
+            raise RuntimeError(f"chunk ran out of documents after {written:,} of {total:,} "
+                               "tokens")
+        best = max(active, key=lambda n: (shares[n] * written - taken[n], -order.index(n)))
+        try:
+            doc = next(readers[best])
+        except StopIteration:
+            raise RuntimeError(f"{best} ran out of documents after {taken[best]:,} tokens "
+                               f"(allocated {want[best]:,})") from None
+        pos = 0
+        while pos < len(doc):
+            take = min(cfg.shard_tokens - fill, len(doc) - pos)
+            buf[fill:fill + take] = doc[pos:pos + take]
+            fill += take
+            pos += take
+            if fill == cfg.shard_tokens:
+                flush()
+        taken[best] += len(doc)
+        docs[best] += 1
+        written += len(doc)
+        if taken[best] >= want[best]:
+            active.remove(best)
+        if log is not None and docs[best] % 100_000 == 0:
+            log(written, total)
+    if fill:
+        flush()
+
+    by_source = {}
+    for n in cfg.sources:
+        st = states[n]
+        c0 = ps.consumed.get(n, 0)
+        got = taken.get(n, 0)
+        u = st.unique_tokens if st is not None else 0
+        by_source[n] = {"target_share": cfg.sources[n].share, "allocated": want[n],
+                        "tokens": got, "documents": docs.get(n, 0),
+                        "share": round(got / written, 6) if written else 0.0,
+                        "epochs_before": round(c0 / u, 4) if u else 0.0,
+                        "epochs_after": round((c0 + got) / u, 4) if u else 0.0,
+                        "exhausted": bool(st and st.exhausted)}
+        ps.consumed[n] = c0 + got
+    rec = {"index": len(ps.chunks), "target_tokens": T, "tokens": written,
+           "shortfall": short, "shards": [first, index - 1], "finished": _now(),
+           "by_source": by_source}
+    ps.chunks.append(rec)
+    ps.next_shard = index
+    if provenance:
+        ps.provenance = provenance
+    ps.save(root)
+    write_manifest(root, cfg, ps)
+    return rec
+
+
+def write_manifest(root: str | Path, cfg: PoolConfig, ps: PoolState | None = None,
+                   top: int = 50) -> dict[str, Any]:
+    """manifest.json: the mixed shards, every chunk, and per source its revision,
+    unique tokens and documents, repeats, filter counts and attribution summary."""
+    import hashlib
+    import json
+
+    root = Path(root)
+    ps = ps or PoolState.load(root)
+    states = load_states(root, cfg.sources)
+    sources = {}
+    for n, s in cfg.sources.items():
+        st = states[n]
+        u = st.unique_tokens if st else 0
+        c = ps.consumed.get(n, 0)
+        attr = sorted((st.attribution if st else {}).items(), key=lambda kv: (-kv[1], kv[0]))
+        sources[n] = {
+            "kind": s.kind, "slice": s.slice, "share": s.share,
+            **{k: s.opts[k] for k in ("repo", "url", "via", "revision", "files", "licence",
+                                      "dump_date", "last_modified", "path", "split", "lid")
+               if k in s.opts},
+            "identity": st.identity if st else {},
+            "unique_tokens": u, "documents": st.documents if st else 0,
+            "exhausted": bool(st and st.exhausted), "consumed": c,
+            "epochs_used": round(c / u, 4) if u else 0.0,
+            "cursor": st.cursor if st else None, "stats": st.stats if st else {},
+            "attribution": {"distinct": len(attr), "top": dict(attr[:top])},
+            "builds": len(st.builds) if st else 0,
+        }
+    shards = []
+    for rec in ps.chunks:
+        lo, hi = rec["shards"]
+        for i in range(lo, hi + 1):
+            p = root / MIXED / shard_name(i)
+            shards.append({"file": shard_name(i), "chunk": rec["index"],
+                           "tokens": p.stat().st_size // 2 if p.exists() else None})
+    cfg_bytes = Path(cfg.path).read_bytes() if Path(cfg.path).exists() else b""
+    m = {"format": "data v3 pool (quipu/pool.py)", "version": POOL_VERSION,
+         "config": cfg.path, "config_sha256": hashlib.sha256(cfg_bytes).hexdigest(),
+         "dtype": "uint16 little-endian", "shard_dir": MIXED,
+         "shard_tokens": cfg.shard_tokens, "max_epochs": cfg.max_epochs,
+         "total_tokens": sum(r["tokens"] for r in ps.chunks), "shards": shards,
+         "chunks": ps.chunks, "provenance": ps.provenance, "sources": sources,
+         "written": _now()}
+    write_json_atomic(root / MANIFEST, m)
+    return m
+
+
+def run_chunk(root: str | Path, cfg: PoolConfig, build: Any, *, chunk_tokens: int | None = None,
+              eot: int, max_rounds: int = 5, provenance: dict[str, Any] | None = None,
+              log: Any = print) -> dict[str, Any]:
+    """Build what the next chunk needs (build(targets): {source: new tokens}; the caller
+    runs the sources, in parallel or not), then merge it. A source that runs dry while
+    building gives its share to the others, which may then need more: another round."""
+    T = int(chunk_tokens if chunk_tokens is not None else cfg.chunk_tokens)
+    targets = build_targets(T, cfg.shares(), pool_totals(root, cfg), max_epochs=cfg.max_epochs)
+    for rnd in range(max_rounds):
+        if targets:
+            if log:
+                log(f"round {rnd + 1}: building {len(targets)} sources, "
+                    f"{sum(targets.values()):,} tokens")
+            build(targets)
+        try:
+            return merge_chunk(root, cfg, T, eot=eot, provenance=provenance)
+        except NeedMore as exc:
+            targets = exc.targets
+    raise RuntimeError(f"chunk not mixed after {max_rounds} build rounds; still missing "
+                       f"{targets}")
