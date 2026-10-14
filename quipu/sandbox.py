@@ -23,23 +23,32 @@ FENCE = re.compile(r"```[ \t]*(?:python|py|Python)?[ \t]*\r?\n(.*?)```", re.S)
 KEEP_ENV = ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
 RESULT_TAG = "__QUIPU_RESULT__"
 
+# The solution and its tests run in their own namespace (named __main__, as a script
+# would be): sharing the harness's globals let an answer's own `ok`, `first` or
+# `TESTS` overwrite the counts.
 HARNESS = r'''
-import json, sys
-TESTS = json.load(open("tests.json", encoding="utf-8"))
-ok = 0
-first = ""
-try:
-    exec(compile(open("solution.py", encoding="utf-8").read(), "solution.py", "exec"), globals())
-except BaseException as e:
-    print("{tag}" + json.dumps({{"passed": 0, "total": len(TESTS), "error": "solution:" + type(e).__name__}}))
-    sys.exit(0)
-for t in TESTS:
+def _main():
+    import json, sys
+    out = sys.stdout
+    tests = json.load(open("tests.json", encoding="utf-8"))
+    ns = {{"__name__": "__main__", "__builtins__": __builtins__}}
     try:
-        exec(t, globals())
-        ok += 1
+        exec(compile(open("solution.py", encoding="utf-8").read(), "solution.py", "exec"), ns)
     except BaseException as e:
-        first = first or type(e).__name__
-print("{tag}" + json.dumps({{"passed": ok, "total": len(TESTS), "error": first}}))
+        out.write("\n{tag}" + json.dumps({{"passed": 0, "total": len(tests), "error": "solution:" + type(e).__name__}}) + "\n")
+        return
+    ok, first = 0, ""
+    for t in tests:
+        try:
+            exec(t, ns)
+            ok += 1
+        except BaseException as e:
+            first = first or type(e).__name__
+    out.write("\n{tag}" + json.dumps({{"passed": ok, "total": len(tests), "error": first}}) + "\n")
+    out.flush()
+
+
+_main()
 '''.format(tag=RESULT_TAG)
 
 

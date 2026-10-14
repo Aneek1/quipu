@@ -46,3 +46,13 @@ def test_child_sees_no_secrets(monkeypatch):
     r = run_tests(code, ["assert LEAK is None"])
     assert r.all_passed
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-test-not-real"
+
+
+def test_solution_cannot_overwrite_the_harness_counters():
+    # Answers that define globals named like the harness's own (ok, first, TESTS, json)
+    # must not change the count: these once reported 10/10 with error [..] or 2.
+    code = ADD + "ok = 99\nfirst = ['apple']\nTESTS = []\njson = None\n"
+    r = run_tests(code, ["assert add(1, 2) == 3", "assert add(2, 2) == 5"])
+    assert r.passed == 1 and r.total == 2 and r.error == "AssertionError"
+    r = run_tests(ADD + "first = [0, 0, 2]\n", ["assert add(1, 2) == 3"])
+    assert r.all_passed and r.error == ""
