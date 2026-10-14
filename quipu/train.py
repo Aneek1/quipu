@@ -106,9 +106,45 @@ no checkpoint of its own (with --resume and a latest.pt, the run's own checkpoin
 wins, so a retried SFT resumes rather than restarting). Mode "sft" without either
 is a usage error. Budget backstop, orphan and signal handling are the same as for
 pretraining.
+
+Data parallel (quipu.dist), on N GPUs of one machine:
+
+    torchrun --standalone --nproc_per_node=N -m quipu.train --config ... --run-id ...
+
+Every process (rank) holds the whole model on cuda:LOCAL_RANK and takes 1/N of each
+step's micro-batches: train.batch_tokens stays the GLOBAL batch, each rank runs
+grad_accum / N micro-batches (a grad_accum that does not divide by N is a usage
+error), and the training stream is read through quipu.dist.RankStream, so every rank
+reads every batch and keeps its own (rank r's j-th micro-batch of a step is the
+step's micro-batch j*N + r). The stream position, and so checkpoints and resume, is
+the single-process one. After the micro-batches the gradients are all-reduced in
+large buckets (the mean for pretraining, whose ranks divide by their own
+grad_accum; the SUM for the SFT, whose ranks divide by the step's global target
+count N, all-reduced up front), and the logged loss, expert counts and drops are
+summed over the ranks. Clipping, the non-finite check and the optimizer step then
+run on identical gradients on every rank; the MoE balance update all-gathers every
+rank's stashed router scores first, so every rank moves the biases the same way.
+Rank 0's weights are broadcast at startup (and after a checkpoint or --init-from
+load), and every checkpoint first checks that the replicas still match
+(quipu.dist.params_match; a mismatch is quipu.dist.ReplicaMismatch, a crash). Up to
+float rounding this is the single-process run: tests/test_dist.py checks weights,
+balancer biases and logged losses against one process.
+
+Only rank 0 writes: the run log, checkpoints, milestones, evaluation (estimate_loss,
+the mix evaluation, the per-source SFT loss), compile stats and stdout (the other
+ranks' stdout goes to os.devnull; their stderr stays). The others wait at a barrier
+while rank 0 evaluates or saves. Stops happen at a step boundary on every rank
+together: at the top of each step the ranks all-reduce three flags, rank 0's orphan
+and budget decisions and any rank's stop signal (under torchrun the stop handler only
+sets that flag, so no rank is interrupted inside a collective), and all of them take
+the same path (checkpoint, then the same exception, so rank 0's exit code is the
+single-process one; torchrun reports a non-zero exit of any rank as its own failure).
+A crash on one rank leaves the others waiting in a collective until torchrun tears
+the job down. Without torchrun (WORLD_SIZE unset) nothing here runs.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import errno
@@ -130,9 +166,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from quipu import dist
 from quipu.bpe import EOT as BPE_EOT, SPECIAL_TOKENS
 from quipu.childproc import TRAIN_LOG_ENV
 from quipu.config import Config, ModelConfig, TrainConfig, load_config, parse_overrides
+from quipu.dist import RankStream
 from quipu.eval import estimate_loss
 from quipu.fp8 import Fp8Unsupported, apply_precision
 from quipu.fsio import replace_with_retry
@@ -194,6 +232,9 @@ _stopping = False
 _orphaned: str | None = None
 _guards: list["_OrphanGuard"] = []
 _orphan_sink: Any = None
+# Data parallel: a stop signal reached this rank. The handler sets it rather than
+# raising, and the ranks act on it together at the next step (Trainer._check_stops).
+_stop_requested = False
 
 # SetThreadExecutionState flags (winbase.h).
 ES_CONTINUOUS = 0x80000000
@@ -330,6 +371,18 @@ class RunLogUnreadable(ValueError):
     """--resume found no readable run log (RunLog raises ValueError for it)."""
 
 
+class _NullLog:
+    """The run log of a data-parallel rank other than 0: rank 0 writes the run's one
+    log, every call here goes nowhere. `record` is an empty log, so resume reads
+    "no steps logged"."""
+
+    def __init__(self) -> None:
+        self.record: dict[str, Any] = {"steps": [], "evals": []}
+
+    def __getattr__(self, name: str) -> Callable[..., None]:
+        return lambda *args, **kwargs: None
+
+
 def _set_thread_execution_state(flags: int) -> None:
     """Ask Windows not to sleep while training (the request a media player makes;
     no system setting changes). A no-op elsewhere, and never fatal: a failed
@@ -450,6 +503,15 @@ class Trainer:
         self.nonfinite_streak = 0
         self.skipped_steps = 0      # cumulative non-finite skips, checkpointed
         self.ckpt_dir = Path(train_cfg.ckpt_dir)
+        # Data parallel (quipu.dist; world 1 without torchrun): this rank's share of
+        # each step's micro-batches. Checked before anything is built or written.
+        self.world, self.rank = dist.world_size(), dist.rank()
+        if train_cfg.grad_accum % self.world:
+            raise UsageError(
+                f"grad_accum {train_cfg.grad_accum} (batch_tokens / (micro_batch x "
+                f"context)) does not split over {self.world} processes; choose "
+                "batch_tokens and micro_batch so that it divides by the process count")
+        self.grad_accum = train_cfg.grad_accum // self.world
 
         # self.model is always the plain module: checkpoints, milestones, the
         # balancer and set_dispatch go through it. self.forward_model is what runs
@@ -460,12 +522,19 @@ class Trainer:
         # into either precision.
         self.model = apply_precision(build_model(model_cfg).to(device),
                                      train_cfg.precision, device)
+        # The same seed already gives every rank the same weights; the broadcast
+        # makes that a guarantee rather than an assumption about init kernels.
+        dist.broadcast_params(self.model)
         self.forward_model: nn.Module = self.model
         self.compiled = False
         self.is_moe = isinstance(self.model, QuipuMoE)
         # "sft": masked chat blocks (loss on assistant tokens only); else plain tokens.
         stream_cls = MaskedBlockStream if train_cfg.mode == "sft" else TokenStream
         self.stream = stream_cls(shard_dir, train_cfg.micro_batch, model_cfg.context)
+        if self.world > 1:
+            # Every rank reads every batch and keeps its own: the position (the
+            # checkpoint state) is the same on all of them.
+            self.stream = RankStream(self.stream, self.rank, self.world)
         self.val_stream = (
             stream_cls(val_dir, train_cfg.micro_batch, model_cfg.context) if val_dir else None
         )
@@ -478,7 +547,7 @@ class Trainer:
             self.mix_weights = {k: float(v) for k, v in mix_weights.items()
                                 if k == ENGLISH or k in mix_splits}
             for label in self.mix_weights:
-                if label == ENGLISH:
+                if label == ENGLISH or not dist.is_main():    # rank 0 evaluates
                     continue
                 n = (train_cfg.eval_batches if label == CODE
                      else max(1, train_cfg.eval_batches // MIX_LANG_BATCH_DIVISOR))
@@ -507,6 +576,8 @@ class Trainer:
             self._health_streak = torch.zeros(shape, dtype=torch.long)
             self._interval_counts = torch.zeros(shape, dtype=torch.long)
             self._interval_dropped = torch.zeros(model_cfg.n_layer, dtype=torch.long)
+            # The step-wide cap, over the GLOBAL grad_accum: under data parallelism
+            # the ranks together stash what one process would have.
             self.balance_rows = max(1, BALANCE_SAMPLE_TOKENS // train_cfg.grad_accum)
         # dataclasses.asdict copies; vars() would hand out the frozen config's live
         # __dict__. Not wrapped in _safe_log: a bad log path at startup should fail
@@ -516,6 +587,9 @@ class Trainer:
             "train": dataclasses.asdict(train_cfg),
             "derived": {"steps": train_cfg.steps, "grad_accum": train_cfg.grad_accum},
         }
+        if self.world > 1:
+            config["derived"].update(world_size=self.world,
+                                     grad_accum_per_rank=self.grad_accum)
         if resume and not (self.ckpt_dir / LATEST).exists():
             # Checked before RunLog, whose resume path rewrites the log on open: a
             # refused resume must leave the log exactly as it was. An unreadable
@@ -529,7 +603,8 @@ class Trainer:
             if isinstance(record, dict):
                 self._check_restart_allowed(_last_logged_step(record))
         try:
-            self.log = RunLog(run_dir, run_id, config, resume=resume)
+            self.log = (RunLog(run_dir, run_id, config, resume=resume) if dist.is_main()
+                        else _NullLog())
         except ValueError as exc:
             raise RunLogUnreadable(str(exc)) from exc
         if epoch_cap is not None:
@@ -741,6 +816,8 @@ class Trainer:
 
     def train_step(self) -> float:
         cfg = self.train_cfg
+        world = self.world
+        accum = self.grad_accum        # this rank's micro-batches (cfg.grad_accum / world)
         lr = self.lr_at(self.step)
         muon_lr = self._set_lrs(lr)
 
@@ -774,9 +851,14 @@ class Trainer:
                 # mean over every assistant token of the step, as one full batch
                 # would give. A mean per micro-batch would weight a token by how
                 # few assistant tokens happened to share its micro-batch.
-                batches = [self.stream.next_batch() for _ in range(cfg.grad_accum)]
+                batches = [self.stream.next_batch() for _ in range(accum)]
                 n_targets = sum(int((y != IGNORE_INDEX).sum()) for _, y in batches)
-            for i in range(cfg.grad_accum):
+                if world > 1:
+                    # N is the whole step's count, over every rank's micro-batches:
+                    # the ranks' gradients are then summed, not averaged.
+                    n_targets = int(dist.all_reduce_(
+                        torch.tensor(n_targets, dtype=torch.long, device=self.device)))
+            for i in range(accum):
                 x, y = batches[i] if sft else self.stream.next_batch()
                 x, y = x.to(self.device), y.to(self.device)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
@@ -796,8 +878,8 @@ class Trainer:
                 else:
                     # Divide before backward so the accumulated gradient is the mean
                     # over the whole batch, not the sum over micro-batches.
-                    (loss / cfg.grad_accum).backward()
-                    total_t += loss.detach().double() / cfg.grad_accum
+                    (loss / accum).backward()
+                    total_t += loss.detach().double() / accum
                 if self.is_moe and sft:
                     self._drop_padding_scores(x)
                 if self.is_moe:
@@ -807,8 +889,23 @@ class Trainer:
                     stats = self.model.last_stats
                     step_counts += torch.stack([s.counts for s in stats])
                     step_dropped += torch.stack([s.dropped for s in stats])
-                    self.model.accumulate_balance_scores(self.balance_rows)
+                    # The step-wide micro-batch index (RankStream: j * world + rank),
+                    # so the rows sampled are the ones one process would take.
+                    self.model.accumulate_balance_scores(self.balance_rows,
+                                                         index=i * world + self.rank)
 
+            if world > 1:
+                # Pretraining: each rank's gradient is the mean over its own
+                # micro-batches, so the mean over the ranks is the global batch's.
+                # SFT: each rank's is its share of the global mean already (/ N).
+                dist.all_reduce_gradients(self.model.parameters(),
+                                          op="sum" if sft else "mean")
+                dist.all_reduce_(total_t)
+                if not sft:
+                    total_t /= world
+                if self.is_moe:
+                    dist.all_reduce_(step_counts)
+                    dist.all_reduce_(step_dropped)
             total = total_t.item()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
             if not (math.isfinite(total) and torch.isfinite(grad_norm)):
@@ -820,12 +917,13 @@ class Trainer:
                     self.model.clear_balance_scores()   # nor the balancer
                 self.nonfinite_streak += 1
                 self.skipped_steps += 1
-                print(
-                    f"warning: non-finite loss/grad at step {self.step} "
-                    f"(loss {total}, grad norm {float(grad_norm)}); step skipped "
-                    f"({self.nonfinite_streak} in a row)",
-                    file=sys.stderr, flush=True,
-                )
+                if dist.is_main():      # every rank skips (identical gradients)
+                    print(
+                        f"warning: non-finite loss/grad at step {self.step} "
+                        f"(loss {total}, grad norm {float(grad_norm)}); step skipped "
+                        f"({self.nonfinite_streak} in a row)",
+                        file=sys.stderr, flush=True,
+                    )
                 if self.nonfinite_streak >= MAX_NONFINITE_STREAK:
                     raise NonFiniteStop(
                         f"non-finite loss/grad for {MAX_NONFINITE_STREAK} consecutive "
@@ -839,7 +937,10 @@ class Trainer:
                 opt.step()
             if self.is_moe:
                 # After the weights move, from the scores the forwards captured:
-                # no extra forward.
+                # no extra forward. Every rank's scores, so every rank's biases
+                # move the same way.
+                if world > 1:
+                    self.model.gather_balance_scores(dist.all_gather_cat)
                 self.model.update_balance()
         except BaseException:
             # Once opt.step() has started the weights may already reflect these
@@ -923,6 +1024,8 @@ class Trainer:
         load = c / target
         bad = (load < self.moe_health_low) | (load > self.moe_health_high)
         self._health_streak = torch.where(bad, self._health_streak + 1, 0)
+        if not dist.is_main():
+            return              # the counts are all-reduced; rank 0 reports
         for l, e in (self._health_streak == self.moe_health_window + 1).nonzero().tolist():
             alert = {"step": self.step, "layer": l, "expert": e,
                      "load": float(load[l, e]), "streak": int(self._health_streak[l, e])}
@@ -939,10 +1042,25 @@ class Trainer:
     def save_checkpoint(self) -> Path:
         """Write step_N.pt, point latest.pt at it, prune, and print one line
         `checkpoint step N saved in X.X s (Y.Y GB)`: the A/B runner and the box
-        launcher parse it to size the grace they give an interrupt checkpoint."""
+        launcher parse it to size the grace they give an interrupt checkpoint.
+
+        Data parallel: every rank calls it. The replicas are checked first (a
+        mismatch raises quipu.dist.ReplicaMismatch: rank 0's copy would not be the
+        run's state); then rank 0 writes and the others wait for it."""
         t0 = time.monotonic()
-        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         path = self.ckpt_dir / f"step_{self.step:06d}.pt"
+        if not dist.params_match(self.model):
+            raise dist.ReplicaMismatch(
+                f"step {self.step}: the {self.world} ranks' weights or balancer biases "
+                "differ, so there is no one model to checkpoint (a nondeterministic "
+                "kernel, or a rank that took a different step); not saving")
+        if dist.is_main():
+            self._write_checkpoint(path, t0)
+        dist.barrier()
+        return path
+
+    def _write_checkpoint(self, path: Path, t0: float) -> None:
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         _atomic_save(
             {
                 "step": self.step,
@@ -973,7 +1091,6 @@ class Trainer:
             gb = float("nan")
         print(f"checkpoint step {self.step} saved in {time.monotonic() - t0:.1f} s "
               f"({gb:.1f} GB)", flush=True)
-        return path
 
     def _prune_checkpoints(self, keep_name: str) -> None:
         """Keep the newest ckpt_keep step_*.pt files (~1.4 GB each); never delete the
@@ -1019,13 +1136,16 @@ class Trainer:
     def save_milestone(self) -> Path | None:
         """bf16 weights at the current step, for post-run evaluation. A file that is
         already there is left alone: a resumed run re-reaching a milestone step must
-        not rewrite what the first pass wrote (returns None then)."""
+        not rewrite what the first pass wrote (returns None then). Data parallel:
+        rank 0 writes, the others wait (and get None)."""
         path = self.milestone_path(self.step)
-        if path.exists():
-            return None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_save(_bf16_state_dict(self.model), path)
-        return path
+        written = None
+        if dist.is_main() and not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_save(_bf16_state_dict(self.model), path)
+            written = path
+        dist.barrier()
+        return written
 
     def load_checkpoint(self, path: str | Path | None = None) -> None:
         if path is None:
@@ -1066,6 +1186,9 @@ class Trainer:
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
+        # Every rank loaded the same file; rank 0's copy is broadcast anyway, as at
+        # startup. (Optimizer state is not: it was loaded from that same file.)
+        dist.broadcast_params(self.model)
 
     def init_weights_from(self, path: str | Path) -> Path:
         """Load model weights only (spec 13: the SFT starts from the final pretraining
@@ -1092,6 +1215,7 @@ class Trainer:
         except RuntimeError as exc:
             raise UsageError(f"--init-from {path} does not fit this model: "
                              f"{str(exc).splitlines()[0]}") from exc
+        dist.broadcast_params(self.model)
         print(f"initialised weights from {path} (fresh optimizer, step 0)", flush=True)
         self._safe_log(self.log.note, "init_from", str(path))
         return path
@@ -1155,6 +1279,37 @@ class Trainer:
             _stopping = True
             raise OrphanStop(f"orphaned at step {self.step} ({_orphaned})")
 
+    def _check_stops(self) -> None:
+        """The top of every step: the orphan stop, then the spend backstop. Data
+        parallel: rank 0's clock and output decide both, any rank's stop signal
+        (_stop_requested) interrupts, and the three flags are all-reduced so every
+        rank raises the same thing at the same step (and so meets the others in the
+        stop's checkpoint). Rank 0 raises with its usual message."""
+        global _stopping
+        if self.world == 1:
+            self._check_orphaned()
+            self._check_budget()
+            return
+        cfg = self.train_cfg
+        main = dist.is_main()
+        flags = torch.tensor(
+            [int(main and _orphaned is not None),
+             int(main and cfg.budget_usd > 0 and self.budget_spent_usd() >= cfg.budget_usd),
+             int(_stop_requested)], dtype=torch.int32, device=self.device)
+        orphaned, budget, signalled = dist.all_reduce_(flags, "max").tolist()
+        if orphaned:
+            if main:
+                self._check_orphaned()
+            _stopping = True
+            raise OrphanStop(f"rank 0 orphaned at step {self.step}")
+        if budget:
+            if main:
+                self._check_budget()
+            _stopping = True
+            raise BudgetStop(f"rank 0's budget backstop at step {self.step}")
+        if signalled:
+            raise KeyboardInterrupt(f"stop signal at step {self.step}")
+
     def _run(self) -> None:
         cfg = self.train_cfg
         milestones = set(cfg.milestones)
@@ -1167,8 +1322,7 @@ class Trainer:
             if self.step > 0 and (self.step in milestones or self.step == cfg.steps):
                 self.save_milestone()      # no-op when the file exists
             while self.step < cfg.steps:
-                self._check_orphaned()
-                self._check_budget()
+                self._check_stops()
                 before = self.step
                 loss = self.train_step()
                 if self.step == before:
@@ -1177,20 +1331,23 @@ class Trainer:
                     # estimate_loss runs MoE layers with loop dispatch (no drops) and
                     # restores the training dispatch afterwards. The eager module, not
                     # the compiled one: eval mode, no_grad and loop dispatch would each
-                    # force a recompile (or a compile failure) mid-run.
-                    val = estimate_loss(self.model, self.val_stream,
-                                        cfg.eval_batches, self.device)
-                    if self.mix_weights:
-                        self._eval_mix(loss, val)
-                    else:
-                        self._safe_log(self.log.log_eval, self.step, val)
-                        print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}",
-                              flush=True)
+                    # force a recompile (or a compile failure) mid-run. Data
+                    # parallel: rank 0 evaluates, the others wait.
+                    if dist.is_main():
+                        val = estimate_loss(self.model, self.val_stream,
+                                            cfg.eval_batches, self.device)
+                        if self.mix_weights:
+                            self._eval_mix(loss, val)
+                        else:
+                            self._safe_log(self.log.log_eval, self.step, val)
+                            print(f"step {self.step:>6}  train {loss:.4f}  val {val:.4f}",
+                                  flush=True)
+                    dist.barrier()
                 # Milestone before checkpoint: a resume from checkpoint N starts after
                 # step N, so milestone N must already be on disk by then.
                 if self.step in milestones or self.step == cfg.steps:
                     self.save_milestone()
-                if self.step % cfg.eval_every == 0:
+                if self.step % cfg.eval_every == 0 and dist.is_main():
                     self._log_compile_stats()
                 if self.step % cfg.ckpt_every == 0:
                     self.save_checkpoint()
@@ -1356,12 +1513,27 @@ def main(argv: list[str] | None = None) -> None:
                              "per source (<shard_dir>/val_by_source/*, micro_batch 1) goes "
                              "here; '' to skip")
     args = parser.parse_args(argv)
+    # Under torchrun: join the process group first (every rank runs everything
+    # below). Not under torchrun: a no-op returning 1.
+    world = dist.init_from_env(cuda=args.device != "cpu" and _pick_device("auto") == "cuda")
+    if dist.is_main():
+        _train(args, world)
+        return
+    # Rank 0 prints the run's stdout; the other ranks' would only repeat it. Their
+    # stderr (warnings, a crash's traceback) stays.
+    with open(os.devnull, "w", encoding="utf-8") as sink, contextlib.redirect_stdout(sink):
+        _train(args, world)
 
+
+def _train(args: Any, world: int) -> None:
+    """main() after the arguments and the process group: every rank runs this."""
     try:
         cfg: Config = load_config(args.config, parse_overrides(args.override))
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise UsageError(f"bad config {args.config!r}: {exc}") from exc
     device = _pick_device(args.device)
+    if world > 1 and device == "cuda":
+        device = f"cuda:{dist.local_rank()}"      # init_from_env made it current too
     check_shard_tokenizer(cfg.data.shard_dir, cfg.data.tokenizer)
     # Checked before the Trainer (and its run log) exists, so a mistake here leaves
     # nothing behind and the same command, corrected, can run.
@@ -1424,7 +1596,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.init_from:
         trainer.init_weights_from(args.init_from)
     trainer.run()
-    if cfg.train.mode == "sft" and args.val_by_source_out:
+    if cfg.train.mode == "sft" and args.val_by_source_out and dist.is_main():
         write_val_by_source(trainer, Path(cfg.data.shard_dir) / "val_by_source",
                             Path(args.val_by_source_out), args.run_id)
 
@@ -1445,8 +1617,10 @@ def _install_stop_handlers() -> dict[int, Any]:
     platform; an ignored or custom SIGINT handler is left alone. Once the trainer
     has begun a stop of its own (_stopping: the budget backstop or an orphan stop),
     every signal is ignored with a note, so e.g. the launcher's SIGINT cannot abort
-    the backstop's checkpoint. Returns the previous handlers for run_main to
-    restore. Main thread only (signal.signal)."""
+    the backstop's checkpoint. Under torchrun (world size > 1) the first signal
+    sets _stop_requested instead of raising, and every rank takes the interrupt path
+    together at the top of the next step (Trainer._check_stops). Returns the
+    previous handlers for run_main to restore. Main thread only (signal.signal)."""
     if threading.current_thread() is not threading.main_thread():
         return {}
     signals = list(STOP_SIGNALS)
@@ -1456,6 +1630,7 @@ def _install_stop_handlers() -> dict[int, Any]:
 
     def stop(signum: int, frame: Any) -> None:
         nonlocal fired
+        global _stop_requested
         if fired:
             print(f"signal {signum} again; still saving the interrupt checkpoint",
                   file=sys.stderr, flush=True)
@@ -1466,6 +1641,13 @@ def _install_stop_handlers() -> dict[int, Any]:
                   file=sys.stderr, flush=True)
             return
         fired = True
+        if dist.world_size() > 1:
+            # Raising here could leave this rank inside a collective the others
+            # never finish; every rank stops together at the next step instead.
+            _stop_requested = True
+            print(f"signal {signum}: stopping every rank at the next step like an "
+                  "interrupt (checkpoint, exit 130)", file=sys.stderr, flush=True)
+            return
         print(f"signal {signum}: stopping like an interrupt (checkpoint, exit 130)",
               file=sys.stderr, flush=True)
         raise KeyboardInterrupt
@@ -1486,8 +1668,8 @@ def run_main(argv: list[str] | None = None) -> int:
     or SIGBREAK: all checkpoint first). Codes 2, 3, 4 and 130 are not worth
     retrying; 1 may be. stdout / stderr are guarded meanwhile: a write that finds
     its reader gone is an orphan stop (checkpoint, 130), see the module docstring."""
-    global _stopping, _orphaned
-    _stopping, _orphaned = False, None
+    global _stopping, _orphaned, _stop_requested
+    _stopping, _orphaned, _stop_requested = False, None, False
     saved = _guard_output()
     previous = _install_stop_handlers()
     try:
@@ -1496,6 +1678,12 @@ def run_main(argv: list[str] | None = None) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         _unguard_output(saved)
+        _stop_requested = False
+        try:
+            dist.shutdown()           # torchrun: leave the process group (no-op otherwise)
+        except Exception as exc:      # the exit code is already decided
+            print(f"warning: process group shutdown failed: {exc}", file=sys.stderr,
+                  flush=True)
 
 
 def _run_main(argv: list[str] | None) -> int:
