@@ -377,8 +377,11 @@ def check_http_source(spec: SourceSpec, headers: dict[str, str], cutoff: str) ->
     return {"content_length": size, "etag": h.get("etag"), "last_modified": day}
 
 
-def iter_http_jsonl(http: Any, url: str, cursor: dict[str, Any] | None
+def iter_http_jsonl(http: Any, url: str, cursor: dict[str, Any] | None, size: int | None = None
                     ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+    """Rows of one JSON-lines file over HTTP; cursor {"offset"}. A line without its
+    newline before the end of the file (`size`) is a cut connection: read again from
+    the same byte, never skipped."""
     offset = int((cursor or {}).get("offset", 0))
     attempt = 0
     while True:
@@ -387,23 +390,106 @@ def iter_http_jsonl(http: Any, url: str, cursor: dict[str, Any] | None
             try:
                 while True:
                     line = r.readline()
-                    if not line:
+                    # without a known size a missing newline can only be taken as the end
+                    cut = size is not None and offset + len(line) < size
+                    if not line and not cut:
                         return
-                    if not line.endswith(b"\n"):
-                        # the last line without a newline is fine at the end of the file;
-                        # a cut connection gives a short line and the next read fails
-                        rest = r.read(1)
-                        if rest:
-                            line += rest + r.readline()
+                    if cut and not line.endswith(NL):
+                        raise ConnectionError(f"short read at byte {offset} (size {size})")
+                    rec = json.loads(line) if line.strip() else None
                     offset += len(line)
                     attempt = 0
-                    if line.strip():
-                        yield json.loads(line), {"offset": offset}
+                    if rec is not None:
+                        yield rec, {"offset": offset}
             finally:
                 r.close()
         except Exception as exc:
             attempt += 1
             _retry(exc, attempt, f"read {url} (byte {offset})")
+
+
+NL = b"\n"
+
+
+def stripe_starts(http: Any, url: str, size: int, stripes: int) -> list[list[int]]:
+    """[start, end) byte ranges of `stripes` equal parts of the file, each start moved
+    to the beginning of the next line (the first stripe starts at 0). Empty stripes
+    are dropped."""
+    starts = [0]
+    for k in range(1, stripes):
+        s = k * size // stripes
+        attempt = 0
+        while True:
+            try:
+                r = http.open(url, s)
+                try:
+                    s += len(r.readline())
+                finally:
+                    r.close()
+                break
+            except Exception as exc:
+                attempt += 1
+                _retry(exc, attempt, f"find stripe {k} of {url}")
+        starts.append(min(max(s, starts[-1]), size))
+    ends = starts[1:] + [size]
+    return [[a, b] for a, b in zip(starts, ends) if b > a]
+
+
+def iter_http_jsonl_striped(http: Any, url: str, cursor: dict[str, Any] | None, size: int,
+                            stripes: int) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+    """Rows of a JSON-lines file read as `stripes` byte ranges, one line from each in
+    turn (a file sorted by site gives every chunk rows from all over it). Cursor
+    {"stripes": [[offset, end], ...], "turn": k}: each range's next byte and the range
+    whose turn is next."""
+    if cursor is None:
+        state = {"stripes": stripe_starts(http, url, size, stripes), "turn": 0}
+    else:
+        state = {"stripes": [list(x) for x in cursor["stripes"]], "turn": int(cursor["turn"])}
+    open_: dict[int, Any] = {}
+    attempt = 0
+    st = state["stripes"]
+    n = len(st)
+
+    def advance(k: int) -> int:
+        for j in range(1, n + 1):
+            if st[(k + j) % n][0] < st[(k + j) % n][1]:
+                return (k + j) % n
+        return k
+
+    try:
+        while any(off < end for off, end in st):
+            k = state["turn"]
+            if st[k][0] >= st[k][1]:
+                state["turn"] = advance(k)
+                continue
+            try:
+                r = open_.get(k)
+                if r is None:
+                    r = open_[k] = http.open(url, st[k][0])
+                line = r.readline()
+                if not line.endswith(NL) and st[k][0] + len(line) < st[k][1]:
+                    raise ConnectionError(f"stripe {k}: short read at byte {st[k][0]} (ends "
+                                          f"{st[k][1]})")
+                rec = json.loads(line) if line.strip() else None
+            except Exception as exc:
+                bad = open_.pop(k, None)
+                if bad is not None:
+                    bad.close()
+                attempt += 1
+                _retry(exc, attempt, f"read {url} (stripe {k}, byte {st[k][0]})")
+                continue
+            attempt = 0
+            st[k][0] += len(line)
+            if st[k][0] >= st[k][1]:
+                done = open_.pop(k, None)
+                if done is not None:
+                    done.close()
+            state["turn"] = advance(k)
+            if rec is not None:
+                yield rec, {"stripes": [list(x) for x in st], "turn": state["turn"]}
+    finally:
+        for r in open_.values():
+            r.close()
 
 
 def iter_posts_xml(path: str, cutoff: str, site: str
@@ -538,11 +624,20 @@ def open_source(spec: SourceSpec, *, fs: Any = None, base: str | None = None,
                     "revision": spec.get("revision"), "etag": spec.get("etag"),
                     "content_length": spec.get("content_length"),
                     "last_modified": spec.get("last_modified"),
-                    "dump_date": spec.get("dump_date"), "sha256": spec.get("sha256")}
+                    "dump_date": spec.get("dump_date"), "sha256": spec.get("sha256"),
+                    "stripes": int(spec.get("stripes", 1))}
+        stripes = int(spec.get("stripes", 1))
 
         def open_rows(cursor: Any) -> Iterator[Row]:
-            check_http_source(spec, http.head(url), cutoff)
-            for rec, cur in iter_http_jsonl(http, url, cursor):
+            checked = check_http_source(spec, http.head(url), cutoff)
+            if stripes > 1:
+                if not checked["content_length"]:
+                    raise SourceRefused(f"{spec.name}: striped reads need the file size")
+                it = iter_http_jsonl_striped(http, url, cursor, checked["content_length"],
+                                             stripes)
+            else:
+                it = iter_http_jsonl(http, url, cursor, checked["content_length"])
+            for rec, cur in it:
                 yield render(rec, cur)
         return Source(spec, open_rows, identity)
 

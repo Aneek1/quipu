@@ -183,6 +183,8 @@ licence     = "ODC-By 1.0 (and the Common Crawl terms of use)"
 # before Stack Exchange paused the dumps in June 2023), well before the 2024-04 cutoff.
 # The builder re-checks the HTTP Last-Modified, size and ETag and every row's timestamp
 # against stackexchange_cutoff and refuses the source on any mismatch.
+# The file is sorted by site (apple.stackexchange.com first): it is read as 28 byte-range
+# stripes, one row from each in turn, so every chunk gets questions from all over it.
 [sources.stackexchange]
 kind           = "http_jsonl"
 slice          = "qa"
@@ -195,6 +197,7 @@ etag           = "\"6c66b2c35742401d9abfb95d502c2be4-9543\""
 last_modified  = "2023-04-17"
 sha256         = "999f802cee2578e82555dd634d41cc3249eac88a25036063898305ac5258941e"  # sha256/stackexchange_SHA256SUMS.txt
 dump_date      = "2023-03"
+stripes        = 28
 date_field     = "timestamp"
 text_field     = "text"
 meta_fields    = ["url", "question_score"]

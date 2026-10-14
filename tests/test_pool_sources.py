@@ -240,6 +240,47 @@ def test_stack_exchange_reads_resume_at_the_byte_after_a_dropped_connection(monk
     assert len(rows) == 6 and len(http.opened) == 2 and http.opened[1] > 0
 
 
+def test_striped_reads_interleave_the_file_and_resume_exactly():
+    rows = [{**SE_ROWS[i % 2], "text": f"Q: q{i}\n\nA: a{i}"} for i in range(23)]
+    data = se_bytes(rows)
+    s = spec("http_jsonl", **{**SE_SPEC, "content_length": len(data), "stripes": 4})
+    src = ps.open_source(s, http=FakeHttp(data))
+    got = list(src.open_rows(None))
+    texts = [r.text for r in got]
+    assert sorted(texts) == sorted(r["text"] for r in rows)       # every row exactly once
+    assert texts[:2] != [rows[0]["text"], rows[1]["text"]]       # interleaved, not in file order
+    assert texts[0] == rows[0]["text"]
+    for k, r in enumerate(got):
+        rest = [x.text for x in ps.open_source(s, http=FakeHttp(data)).open_rows(r.cursor)]
+        assert rest == texts[k + 1:]
+    assert src.identity["stripes"] == 4
+
+
+class ShortReadHttp(FakeHttp):
+    """The first response stops in the middle of a line (EOF, no error): a cut
+    connection as readline sees it."""
+
+    def open(self, url, offset):
+        self.opened.append(offset)
+        data = self.data[offset:]
+        if self.fail_at is not None and offset < self.fail_at:
+            cut, self.fail_at = self.fail_at - offset, None
+            return io.BytesIO(data[:cut])
+        return io.BytesIO(data)
+
+
+@pytest.mark.parametrize("stripes", [1, 3])
+def test_a_line_cut_short_is_read_again_not_skipped(monkeypatch, stripes):
+    monkeypatch.setattr(ps, "retry_wait", lambda attempt: 0)
+    rows = [{**SE_ROWS[i % 2], "text": f"Q: q{i}\n\nA: a{i}"} for i in range(9)]
+    data = se_bytes(rows)
+    first_nl = data.index(b"\n")
+    http = ShortReadHttp(data, fail_at=first_nl - 10)          # inside the first line
+    s = spec("http_jsonl", **{**SE_SPEC, "content_length": len(data), "stripes": stripes})
+    got = [r.text for r in ps.open_source(s, http=http).open_rows(None)]
+    assert sorted(got) == sorted(r["text"] for r in rows)
+
+
 @pytest.mark.parametrize("headers, match", [
     ({"Content-Length": "5", "ETag": '"e1"', "Last-Modified": "Mon, 17 Apr 2023 03:15:54 GMT"},
      "size"),
