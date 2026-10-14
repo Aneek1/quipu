@@ -741,7 +741,7 @@ if modal is not None:
         modal.Image.debian_slim(python_version="3.13")
         .apt_install("build-essential")                  # torch.compile builds C++ wrappers
         .pip_install(*PIP)
-        .env({"PYTHONUNBUFFERED": "1"})
+        .env({"PYTHONUNBUFFERED": "1", "PYTHONPATH": "/src"})
         .add_local_dir(HERE / "quipu", "/src/quipu", ignore=["__pycache__", "memory"])
         .add_local_file(HERE / "configs" / "quipu-moe.toml", "/src/configs/quipu-moe.toml")
         .add_local_file(HERE / CONFIG, f"/src/{CONFIG}")
