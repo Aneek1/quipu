@@ -34,6 +34,8 @@ optimizer step, so every layer's Quantile Balancing bias moves on the whole step
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn as nn
 
@@ -121,12 +123,19 @@ class QuipuMoE(nn.Module):
             x = self.attnres(x, lambda i, h: self._sublayer(i, h, cos, sin))
         return self.lm_head(self.norm(x))
 
-    def accumulate_balance_scores(self, max_rows: int | None = None) -> None:
+    def accumulate_balance_scores(self, max_rows: int | None = None,
+                                  index: int | None = None) -> None:
         """Stash every layer's router scores from the latest forward for the next
         update_balance() (once per micro-batch under gradient accumulation; see
-        MoELayer.accumulate_balance_scores for max_rows)."""
+        MoELayer.accumulate_balance_scores for max_rows and index)."""
         for block in self.blocks:
-            block.moe.accumulate_balance_scores(max_rows)
+            block.moe.accumulate_balance_scores(max_rows, index)
+
+    def gather_balance_scores(self, gather: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        """Every layer's stashed scores through gather (see MoELayer); data parallel
+        training calls it before update_balance() with quipu.dist.all_gather_cat."""
+        for block in self.blocks:
+            block.moe.gather_balance_scores(gather)
 
     def clear_balance_scores(self) -> None:
         for block in self.blocks:

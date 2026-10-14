@@ -29,7 +29,7 @@ in reverse, and two identical steps give bit-identical gradients.
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -406,7 +406,8 @@ class MoELayer(nn.Module):
             y = y + ffn(xf).float()
         return y.to(_compute_dtype(x)).reshape(shape), MoEStats(counts, dropped)
 
-    def accumulate_balance_scores(self, max_rows: int | None = None) -> None:
+    def accumulate_balance_scores(self, max_rows: int | None = None,
+                                  index: int | None = None) -> None:
         """Stash the latest forward's router scores for this optimizer step's balance
         update. Under gradient accumulation the trainer calls this once per
         micro-batch, so update_balance() sees the whole step, not the last micro-batch.
@@ -415,16 +416,30 @@ class MoELayer(nn.Module):
         micro-batch per layer): every stride-th token, stride = ceil(T / max_rows),
         starting at an offset that rotates with the micro-batch index so successive
         micro-batches do not all sample the same positions. Deterministic, so a
-        resumed run balances exactly as the uninterrupted one did."""
+        resumed run balances exactly as the uninterrupted one did. `index` is that
+        micro-batch index within the step (default: how many are stashed already);
+        a data-parallel rank passes the step-wide index of its micro-batch, so the
+        ranks together sample the rows one process would have."""
         s = self._last_scores
         if s is None:
             return
+        if index is None:
+            index = len(self._step_scores)
         if max_rows is not None and s.shape[0] > max_rows:
             stride = math.ceil(s.shape[0] / max_rows)
             # A copy: the strided view would keep the whole (T, n) tensor alive.
-            s = s[len(self._step_scores) % stride :: stride].clone()
+            s = s[index % stride :: stride].clone()
         self._step_scores.append(s)
         self._last_scores = None
+
+    def gather_balance_scores(self, gather: Callable[[torch.Tensor], torch.Tensor]) -> None:
+        """Replace the stashed scores by gather(all of them concatenated): under data
+        parallelism, every rank's rows in rank order (quipu.dist.all_gather_cat), so
+        every rank's update_balance() sees the whole step and moves the bias the same
+        way. The quantile update does not depend on the order of the rows."""
+        mine = (torch.cat(self._step_scores) if self._step_scores
+                else self.balancer.bias.new_zeros(0, self.n_experts))
+        self._step_scores = [gather(mine)]
 
     def clear_balance_scores(self) -> None:
         """Drop stashed and latest scores (a skipped or abandoned step)."""
