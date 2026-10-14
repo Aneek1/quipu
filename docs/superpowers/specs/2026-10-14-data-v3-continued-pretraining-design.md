@@ -122,7 +122,7 @@ on empty experts), not by the GPU's maths. Two consequences:
 | B200, per hour incl. CPU/memory | ~$6.90 (Modal list price $6.25 + ~$0.65) |
 | 4 B200-hours a month at 366,229 tok/s (grouped) | ~$27.50 → **~5.3B tokens/month** (1.6B with the old loop dispatch) |
 | For comparison: Vast RTX 5090 at $0.53/h | ~8B tokens for the same $27.50, but paid in cash; Modal's $30 is free credit |
-| Building a 10B-token chunk on Modal CPUs | to be measured on the first chunk; estimate $2-4 |
+| Building a 10B-token chunk on Modal CPUs | measured on chunk 0 (14 Oct): **$2.51**, ~20 min, 2 rounds (42 + 36 containers), 101 shards |
 
 At ~5.3B tokens a month the pool needs ~6B tokens per month built ahead.
 
