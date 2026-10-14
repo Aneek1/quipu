@@ -62,9 +62,28 @@ def generate(parts: str, minutes: float, concurrency: int = 256) -> dict:
     ready = time.time() - t0
     print(f"vLLM ready in {ready:.0f}s", flush=True)
 
-    pause = Path("/vol/PAUSE")
-    pause.unlink(missing_ok=True)
+    # A private root per container (prompts and generations are the shared Volume dirs), so
+    # each container's PAUSE file stops only that container when several run in parallel.
+    run = Path("/tmp/run")
+    run.mkdir(exist_ok=True)
     gens = Path("/vol/generations")
+    gens.mkdir(exist_ok=True)
+    for name, target in (("prompts", "/vol/prompts"), ("generations", "/vol/generations")):
+        if not (run / name).exists():
+            (run / name).symlink_to(target)
+    pause = run / "PAUSE"
+    pause.unlink(missing_ok=True)
+
+    stop_commits = threading.Event()
+
+    def commit_every(seconds: float = 300) -> None:   # a crash loses at most ~5 min of answers
+        while not stop_commits.wait(seconds):
+            try:
+                vol.commit()
+            except Exception as e:
+                print("volume commit failed:", e, flush=True)
+
+    threading.Thread(target=commit_every, daemon=True).start()
 
     def rows() -> int:
         return sum(sum(1 for _ in f.open()) for f in gens.glob(f"*.{TAG}.jsonl")) if gens.exists() else 0
@@ -74,10 +93,11 @@ def generate(parts: str, minutes: float, concurrency: int = 256) -> dict:
     timer.start()
     g0 = time.time()
     rc = subprocess.run(
-        [sys.executable, "/src/scripts/distill_generate_v2.py", "--root", "/vol", "--parts", parts,
+        [sys.executable, "/src/scripts/distill_generate_v2.py", "--root", str(run), "--parts", parts,
          "--direction", "down", "--endpoint", "http://127.0.0.1:8000", "--teacher-tag", TAG,
          "--revision", REV, "--concurrency", str(concurrency), "--max-new-tokens", "1024"]).returncode
     timer.cancel()
+    stop_commits.set()
     gen_s = time.time() - g0
     pause.unlink(missing_ok=True)
     server.terminate()
@@ -99,5 +119,11 @@ def generate(parts: str, minutes: float, concurrency: int = 256) -> dict:
 
 
 @app.local_entrypoint()
-def main(parts: str = "19:19", minutes: float = 12.0, concurrency: int = 256):
-    print(generate.remote(parts, minutes, concurrency))
+def main(parts: str = "19:19", minutes: float = 12.0, concurrency: int = 256, each: str = ""):
+    """--each "18,17,16,15" runs one container per part, in parallel (one GPU each)."""
+    if each:
+        jobs = [f"{int(p)}:{int(p)}" for p in each.split(",")]
+        for out in generate.starmap([(j, minutes, concurrency) for j in jobs]):
+            print(out)
+    else:
+        print(generate.remote(parts, minutes, concurrency))
