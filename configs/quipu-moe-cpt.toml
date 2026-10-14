@@ -1,0 +1,53 @@
+name = "quipu-moe-cpt"
+
+# Continued pretraining of quipu-moe on the data v3 pool (spec
+# docs/superpowers/specs/2026-10-14-data-v3-continued-pretraining-design.md, section 2),
+# launched by scripts/remote/modal_train.py (or torchrun directly on a GPU box).
+#
+# The model must be EXACTLY the pretrained one: the real run trained
+# remote-runs/quipu-moe/results/moe/run_config.toml, i.e. quipu-moe.toml with Muon.
+# Deliberately NOT inherit_if_present results/ab/winners.toml: that file says
+# activation "situ_glu", but the published model was trained with "swiglu", and a
+# strict state_dict load cannot tell the two apart (same parameters, different
+# function). tests/test_modal_train.py checks this config against run_config.toml.
+inherit = "quipu-moe.toml"
+
+[data]
+# The trainer's view of the pool (quipu.shard_view.make_shard_view): train/ links to
+# the pool's mixed/ shards, val/ to the old English validation shard. The launcher
+# overrides it with the path it built the view at.
+shard_dir = "data/shards-cpt"
+
+[train]
+# Warmup-stable-decay (quipu.train.lr_at). The pretrain's cosine ended at lr_min 6e-5
+# (Muon 0.002); the re-warmup starts there and climbs to the stable LR, which then
+# holds across months with no end date. Every second month a decay branch
+# (--branch-from the stable checkpoint, decay_start_step / decay_steps set by the
+# launcher) falls to lr_min over ~10% of that month's tokens and is published; the next
+# month continues from the stable checkpoint.
+# The stable LR (half the pretrain peak: lr 6e-4 -> 3e-4, Muon 0.02 -> 0.01) is a
+# judgement call, not a tuned value.
+optimizer       = "muon"
+lr_schedule     = "wsd"
+lr              = 3e-4
+muon_lr         = 0.01
+warmup_start_lr = 6e-5        # the pretrain's final AdamW LR (Muon follows: 0.002)
+warmup_steps    = 250         # ~131M tokens
+lr_min          = 3e-5        # where a decay branch ends
+decay_shape     = "1-sqrt"
+# No fixed end: the run stops on its wall-clock budget (budget_usd / usd_per_hour, set
+# per launch) and checkpoints. 10T tokens is only the upper bound steps needs.
+total_tokens    = 10_000_000_000_000
+batch_tokens    = 524_288     # as the pretrain
+micro_batch     = 32          # B200 (178 GiB): 92.9 GiB peak measured on 14 Oct
+compile         = true
+milestones      = []
+ckpt_dir        = "checkpoints/quipu-moe-cpt"
+ckpt_every      = 500         # ~8.1 GB each (fp32 weights + optimizer states)
+ckpt_keep       = 2
+eval_every      = 500
+eval_batches    = 20
+# The launcher always passes both; this default only bounds a launch that forgot to
+# (3 h 45 min at ~$6.90/h for one B200 with its CPU and memory).
+usd_per_hour    = 6.90
+budget_usd      = 25.875
