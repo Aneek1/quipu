@@ -79,6 +79,14 @@
   .status .tag { flex: none; font: 500 11.5px/1 var(--sans); color: var(--fg); padding: 5px 9px; border-radius: 999px; background: #27272a; }
   .status .arr { flex: none; color: var(--dim); transition: transform .15s; }
   .status:hover .arr { transform: translateX(2px); color: var(--fg); }
+  .contact-lede { color: var(--muted); font-size: 17px; max-width: 56ch; margin: 0 0 28px; }
+  .contact-mail { display: inline-flex; align-items: center; gap: 12px; font: 500 clamp(20px, 3.4vw, 28px)/1.2 var(--mono); color: var(--fg);
+    text-decoration: none; padding: 14px 20px; border: 1px solid var(--line2); border-radius: 10px; background: var(--bg2);
+    max-width: 100%; overflow-wrap: anywhere; transition: border-color .15s; }
+  .contact-mail:hover { border-color: var(--accent); }
+  .contact-mail .arr { color: var(--dim); transition: transform .15s, color .15s; }
+  .contact-mail:hover .arr { transform: translateX(3px); color: var(--accent); }
+  .contact-alt { color: var(--dim); font-size: 14.5px; margin: 22px 0 0; }
   h1 { font-family: var(--sans); font-weight: 600; color: var(--fg); font-size: clamp(38px, 5.6vw, 64px); line-height: 1.02; letter-spacing: -0.035em; margin: 26px 0 22px; }
   h1 .dim { color: var(--dim); }
   .sub { color: var(--muted); font-size: 17px; margin: 0 0 32px; max-width: 52ch; }
@@ -253,6 +261,7 @@
         <a class="ext" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Demo</a>
         <a class="ext hide-m" href="https://huggingface.co/AneekC">Hugging Face</a>
         <a class="ext" href="https://github.com/Aneek1/quipu">GitHub</a>
+        <a class="ext" href="#contact">Contact</a>
       </div>
     </nav>
   </div>
@@ -461,7 +470,7 @@
     <div class="links-row"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-114m">Weights, milestones and model card on Hugging Face <span class="arr">↗</span></a></div>
   </section>
 
-  <section id="next" style="border-bottom:0">
+  <section id="next">
     <p class="label"><span class="idx">09</span> Next</p>
     <h2>Where it goes from here.</h2>
     <ol class="roadmap">
@@ -474,6 +483,14 @@
       <li class="next"><span class="st">next</span><div><b>Chat fine-tune on the verified answers</b><span class="d">All 498k execution-verified answers from distillation v2.</span></div></li>
       <li><span class="st">later</span><div><b>A ~1B-active model</b><span class="d">When bigger compute is available.</span></div></li>
     </ol>
+  </section>
+
+  <section id="contact" style="border-bottom:0">
+    <p class="label"><span class="idx">10</span> Contact</p>
+    <h2>Get in touch.</h2>
+    <p class="contact-lede">Questions about the models or the data, bug reports, research collaboration, or compute for bigger runs.</p>
+    <a class="contact-mail" href="mailto:hello@quipulm.dev">hello@quipulm.dev<span class="arr" aria-hidden="true">&rarr;</span></a>
+    <p class="contact-alt">Issues and pull requests are welcome on <a href="https://github.com/Aneek1/quipu/issues">GitHub</a>.</p>
   </section>
 </main>
 
