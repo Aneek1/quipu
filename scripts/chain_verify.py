@@ -6,7 +6,9 @@ The chain is cut at the first turn that fails; it is kept when 2+ turns survive.
 chains go to data/chains/kept/{train,val}/part-NNNN.jsonl as rows with "messages"; counts go
 to data/chains/verify_summary.json. When a chain id appears under several teacher
 tags, the first by scripts.distill_verify's tag priority wins. Re-checks cut short by a
-sandbox crash (infrastructure, not the answer) are counted apart as recheck_sandbox_error.
+sandbox crash (infrastructure, not the answer) are counted apart as recheck_sandbox_error; turns with no tests or no code are
+recheck_unusable (not a verdict on the answer); a split other than exactly train or val is
+skipped and counted as bad_split.
 Fine-tuning reads kept/train only; the held-out eval (later chain_eval) reads gen/ for
 the val seeds' tests, so val chains never reach training.
 
@@ -95,7 +97,7 @@ def _load(gen_dir: Path, stats: Counter) -> dict[str, list[dict]]:
 def verify(root: Path, workers: int = 8, timeout: float = 10.0) -> dict:
     root = Path(root)
     summary = {"chains": 0, "kept": 0, "kept_3_turns": 0, "recheck_failed": 0,
-               "recheck_sandbox_error": 0, "verifier_errors": 0, "bad_lines": 0,
+               "recheck_sandbox_error": 0, "recheck_unusable": 0, "bad_split": 0, "verifier_errors": 0, "bad_lines": 0,
                "bad_records": 0, "stop": Counter(), "kept_by_split": Counter()}
     stats: Counter = Counter()
     parts = _load(root / "gen", stats)
@@ -111,16 +113,21 @@ def verify(root: Path, workers: int = 8, timeout: float = 10.0) -> dict:
                 summary["verifier_errors"] += 1
             elif why == "sandbox_error":
                 summary["recheck_sandbox_error"] += 1
+            elif why in ("no_tests", "no_code"):
+                summary["recheck_unusable"] += 1
             elif n < c.get("kept_turns", 0):
                 summary["recheck_failed"] += 1
+            split = c.get("split")
+            if split not in rows:                           # only exact "train" / "val"
+                summary["bad_split"] += 1
+                continue
             if n < 2:
                 continue
             msgs = []
             for t in c["turns"][:n]:
                 msgs += [{"role": "user", "content": t["user"]},
                          {"role": "assistant", "content": t["assistant"]}]
-            split = c.get("split")
-            rows["val" if split == "val" else "train"].append(
+            rows[split].append(
                 {"id": c["id"], "seed_id": c.get("seed_id"), "split": split,
                  "teacher": c.get("teacher"), "revision": c.get("revision"),
                  "teacher_tag": c.get("teacher_tag"), "turns": n,

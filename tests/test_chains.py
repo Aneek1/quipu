@@ -657,3 +657,27 @@ def test_recheck_retries_a_sandbox_error_once(monkeypatch):
     assert cv.recheck(c) == (2, "")
     monkeypatch.setattr(cv, "check_turn", lambda *a, **k: "sandbox_error")
     assert cv.recheck(c) == (0, "sandbox_error")
+
+
+def test_verify_routes_only_exact_train_and_val_splits(tmp_path):
+    rows = []
+    for i, split in enumerate(["train", "val", "test", None, "VAL"]):
+        seed = SEED | {"id": f"dv2-000001{i}"}
+        seed = {k: v for k, v in seed.items() if k != "split"} if split is None else seed | {"split": split}
+        c = ch.run_chain(seed | {"split": split or "train"}, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+        if split is None:
+            del c["split"]
+        rows.append(c)
+    _write_jsonl(tmp_path / "gen" / "part-0000.q4.jsonl", rows)
+    summary = cv.verify(tmp_path, workers=1)
+    assert [k["split"] for k in _kept(tmp_path, "train")] == ["train"]
+    assert [k["split"] for k in _kept(tmp_path, "val")] == ["val"]
+    assert summary["kept"] == 2 and summary["bad_split"] == 3
+
+
+def test_verify_counts_unusable_chains_apart_from_failures(tmp_path):
+    c = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    c["turns"][1]["tests"] = []
+    _write_jsonl(tmp_path / "gen" / "part-0000.q4.jsonl", [c])
+    summary = cv.verify(tmp_path, workers=1)
+    assert summary["recheck_unusable"] == 1 and summary["recheck_failed"] == 0
