@@ -557,7 +557,7 @@ def test_verify_rechecks_turns_and_writes_chat_messages(tmp_path):
 
     summary = cv.verify(tmp_path, workers=2)
 
-    kept = [json.loads(l) for l in (tmp_path / "kept" / "part-0000.jsonl").read_text(encoding="utf-8").splitlines()]
+    kept = [json.loads(l) for l in (tmp_path / "kept" / "train" / "part-0000.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [k["id"] for k in kept] == ["ch-dv2-0000007"]
     assert [m["role"] for m in kept[0]["messages"]] == ["user", "assistant", "user", "assistant"]
     assert kept[0]["turns"] == 2 and kept[0]["max_turns"] == 2
@@ -582,3 +582,78 @@ def test_verify_counts_sandbox_errors_apart_from_real_failures(tmp_path, monkeyp
     summary = cv.verify(tmp_path, workers=1)
     assert summary["chains"] == 2 and summary["kept"] == 1
     assert summary["recheck_sandbox_error"] == 1 and summary["recheck_failed"] == 0
+
+
+def _kept(tmp_path, split, part="part-0000"):
+    f = tmp_path / "kept" / split / f"{part}.jsonl"
+    return [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines()]
+
+
+def test_verify_skips_ledgers_torn_lines_and_bad_records(tmp_path):
+    good = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    gen = tmp_path / "gen"
+    _write_jsonl(gen / "part-0000.q4.jsonl", [good, {"id": "x", "note": "no turns"}])
+    with open(gen / "part-0000.q4.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"id": "torn", "tur')                       # torn last line
+    _write_jsonl(gen / "part-0000.q4.jsonl.failures.jsonl", [{"seed_id": "a", "error": "boom"}])
+    summary = cv.verify(tmp_path, workers=1)
+    assert summary["chains"] == 1 and summary["kept"] == 1
+    assert summary["bad_lines"] == 1 and summary["bad_records"] == 1
+
+
+def test_verify_handles_wide_part_numbers(tmp_path):
+    good = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    _write_jsonl(tmp_path / "gen" / "part-10000.q4.jsonl", [good])
+    assert cv.verify(tmp_path, workers=1)["kept"] == 1
+    assert [k["id"] for k in _kept(tmp_path, "train", "part-10000")] == ["ch-dv2-0000007"]
+
+
+def test_verify_survives_a_chain_that_raises(tmp_path, monkeypatch):
+    good = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    boom = ch.run_chain(SEED | {"id": "dv2-0000008"}, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    boom["turns"][1]["assistant"] = "```python\n# BOOM\n" + NEW + "```"
+    _write_jsonl(tmp_path / "gen" / "part-0000.q4.jsonl", [good, boom])
+    real = cv.check_turn
+
+    def bad(code, *a, **k):
+        if "BOOM" in code:
+            raise RuntimeError("x")
+        return real(code, *a, **k)
+
+    monkeypatch.setattr(cv, "check_turn", bad)
+    summary = cv.verify(tmp_path, workers=1)
+    assert summary["verifier_errors"] == 1 and summary["kept"] == 1 and summary["chains"] == 2
+
+
+def test_verify_keeps_val_apart_and_writes_ascii(tmp_path):
+    train = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    val = ch.run_chain(SEED | {"id": "dv2-0000008", "split": "val"},
+                       FakeTeacher(request="Please let add take an optional third number c, é."),
+                       max_turns=2) | {"teacher_tag": "q4"}
+    _write_jsonl(tmp_path / "gen" / "part-0000.q4.jsonl", [train, val])
+    summary = cv.verify(tmp_path, workers=1)
+    assert [k["id"] for k in _kept(tmp_path, "train")] == ["ch-dv2-0000007"]
+    assert [k["id"] for k in _kept(tmp_path, "val")] == ["ch-dv2-0000008"]
+    assert summary["kept_by_split"] == {"train": 1, "val": 1}
+    raw = (tmp_path / "kept" / "val" / "part-0000.jsonl").read_text(encoding="utf-8")
+    assert raw.isascii() and "\\u00e9" in raw
+
+
+def test_recheck_ends_on_a_turn_without_tests():
+    c = ch.run_chain(SEED, FakeTeacher(), max_turns=2)
+    c["turns"][1]["tests"] = []
+    assert cv.recheck(c) == (1, "no_tests")
+
+
+def test_recheck_retries_a_sandbox_error_once(monkeypatch):
+    c = ch.run_chain(SEED, FakeTeacher(), max_turns=2)
+    real, calls = cv.check_turn, []
+
+    def once(*a, **k):
+        calls.append(1)
+        return "sandbox_error" if len(calls) == 1 else real(*a, **k)
+
+    monkeypatch.setattr(cv, "check_turn", once)
+    assert cv.recheck(c) == (2, "")
+    monkeypatch.setattr(cv, "check_turn", lambda *a, **k: "sandbox_error")
+    assert cv.recheck(c) == (0, "sandbox_error")
