@@ -127,3 +127,74 @@ def check_turn(code: str, new_tests: list[str], old_tests: list[str],
     if not run_tests(code + PRELUDE, new_tests, timeout=timeout).all_passed:
         return "fail_new"
     return "ok"
+
+
+def _fence(code: str) -> str:
+    return "```python\n" + code.rstrip("\n") + "\n```"
+
+
+def request_input(turns: list[dict], code: str) -> str:
+    """What the request writer sees: what the user asked so far and the current code."""
+    asked = "\n".join(f"- {t['user']}" for t in turns)
+    return f"The user has asked, in order:\n{asked}\n\nThe current code:\n{_fence(code)}"
+
+
+def tests_input(request: str, code: str) -> str:
+    """What the test writer sees: the current code and the request, never an answer."""
+    return f"Current code:\n{_fence(code)}\n\nRequested change:\n{request}"
+
+
+def conversation(turns: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for t in turns:
+        out += [{"role": "user", "content": t["user"]},
+                {"role": "assistant", "content": t["assistant"]}]
+    return out
+
+
+def run_chain(seed: dict, chat: Chat, *, max_turns: int = 3, max_new_tokens: int = 1024,
+              timeout: float = 10.0, min_new_tests: int = 2) -> dict:
+    """Grow one seed into a chain. The record keeps every turn tried; the turns before
+    the first non-ok one are the verified chain, and `stop` says why it ended ("" when
+    it reached max_turns)."""
+    entry = seed["entry_point"]
+    turns = [{"user": seed["prompt"], "assistant": seed["response"], "kind": None,
+              "tests": list(seed["tests"]), "status": "ok"}]
+    rec = {"id": "ch-" + seed["id"], "seed_id": seed["id"], "split": seed["split"],
+           "entry_point": entry, "turns": turns, "stop": ""}
+    code = extract_code(seed["response"], entry)
+    if code is None:
+        rec["stop"] = "seed_no_code"
+    for kind in pick_kinds(seed["id"], max_turns - 1) if code is not None else []:
+        text, finish, _ = chat([{"role": "system", "content": REQUEST_SYSTEM.format(kind=kind)},
+                                {"role": "user", "content": request_input(turns, code)}], 200)
+        request = parse_request(text) if finish != "length" else None
+        if request is None:
+            rec["stop"] = "request_bad"
+            break
+        text, _, _ = chat([{"role": "system", "content": TESTS_SYSTEM.format(entry=entry)},
+                           {"role": "user", "content": tests_input(request, code)}], 600)
+        new_tests = failing_on(code, parse_asserts(text, entry), timeout)
+        if len(new_tests) < min_new_tests:
+            rec["stop"] = "tests_too_few"
+            break
+        text, finish, _ = chat([{"role": "system", "content": FOLLOWUP_SYSTEM}]
+                               + conversation(turns) + [{"role": "user", "content": request}],
+                               max_new_tokens)
+        new_code = extract_code(text, entry) if finish != "length" else None
+        if finish == "length":
+            status = "answer_length"
+        elif new_code is None:
+            status = "no_code"
+        elif same_code(new_code, code):
+            status = "copy"
+        else:
+            status = check_turn(new_code, new_tests, [a for t in turns for a in t["tests"]], timeout)
+        turns.append({"user": request, "assistant": text, "kind": kind,
+                      "tests": new_tests, "status": status})
+        if status != "ok":
+            rec["stop"] = status
+            break
+        code = new_code
+    rec["kept_turns"] = next((i for i, t in enumerate(turns) if t["status"] != "ok"), len(turns))
+    return rec
