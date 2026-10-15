@@ -148,3 +148,38 @@ Kaggle or Modal time.
 2. Kaggle: the owner's account is verified for GPUs.
 3. Size (owner didn't pick; Claude's default): 200-chain laptop smoke run, then 5k
    chains, look at the results, then 20k.
+
+## Smoke run (15 Oct, laptop)
+
+Teacher: Qwen2.5-Coder-7B-Instruct Q4_K_M via llama-server, 2 slots x 8,192 tokens,
+RTX 5060 Laptop. Code at eda37f9 (instructions tuned after a first run kept 0 of 12:
+the coder model answered the request itself instead of writing it, and wrote one bare
+`assert not f(x)` instead of five comparisons).
+
+- **Throughput:** ~600 chains/hour (95 chains in 10 min; 100 in the first 10 min of the
+  final run). The final run was stopped by Claude Code at 152 of 200 chains because the
+  laptop ran low on memory; the 152 were verified.
+- **Yield:** 35 of 152 chains kept (23%), 13 of them with all three turns; 33 train, 2 val.
+  The fresh re-check failed none of them (`recheck_failed` 0).
+- **Stops:** tests_too_few 60, fail_new 61, fail_regression 15, max_turns 13,
+  request_bad 2, fail_crash 1.
+
+What 10 chains read by eye showed:
+- Kept chains are good: realistic requests ("add an optional flag that returns the sorted
+  list with the employee count", then "validate the input..."), asserts that test the
+  change, complete functions that keep the earlier behaviour.
+- **Most fail_new are a naming mismatch, not a wrong answer:** the request doesn't name the
+  new parameter, the test writer picks one (`include_sum`), the answer picks another
+  (`return_sum`). Fix: the request writer names any new parameter in backticks, so tests
+  and answer share it. Expected to lift yield noticeably.
+- Some fail_new are wrong tests (anagram sorted-letter lists computed wrongly); filtered
+  correctly.
+- tests_too_few is mostly edge-case requests the code already handles (the old code passes
+  every assert), filtered correctly; it costs teacher time only.
+- Known weak spot: for the optional-parameter kind, asserts sometimes call only with the
+  default value (`print_steps=False`), which proves the parameter is accepted, not that it
+  does anything.
+
+Next: name new parameters in requests; rerun 200 chains; then the Kaggle generation plan.
+At 23% yield, 20k kept chains need ~87k attempts: ~145 laptop-hours, so Kaggle's vLLM
+(batched, fp16) is the realistic route.
