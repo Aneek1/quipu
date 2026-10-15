@@ -393,3 +393,95 @@ def test_run_part_does_not_write_transient_failures_and_a_rerun_retries(tmp_path
                        max_turns=2) == "done"
     rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
     assert [r["id"] for r in rows] == ["ch-dv2-0000000"] and rows[0]["kept_turns"] == 2
+
+
+class _AlwaysRaises:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, messages, max_tokens):
+        self.calls += 1
+        raise ConnectionError("down")
+
+
+class _AnswerPermanent(FakeTeacher):
+    def __call__(self, messages, max_tokens):
+        if not messages[0]["content"].startswith(("You write the next", "You write unit")):
+            raise cg.PermanentRequestError("HTTP 400: context length exceeded")
+        return super().__call__(messages, max_tokens)
+
+
+_META = {"teacher": "t", "revision": "r", "teacher_tag": "q4"}
+
+
+def _seeds(n: int) -> list[dict]:
+    return [{**SEED, "id": f"dv2-{i:07d}"} for i in range(n)]
+
+
+def test_run_part_writes_a_permanent_failure_with_its_verified_turns(tmp_path):
+    out = tmp_path / "gen" / "p.jsonl"
+    st = cg.run_part(_seeds(1), out, _AnswerPermanent(), concurrency=1, pause=tmp_path / "PAUSE",
+                     meta=_META, max_turns=2)
+    assert st == "done"
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["stop"] == "error:PermanentRequestError" and rec["kept_turns"] == 1
+
+
+def test_run_part_retry_ledger_stops_retrying_after_max_attempts(tmp_path):
+    out = tmp_path / "gen" / "p.jsonl"
+    kw = dict(concurrency=1, pause=tmp_path / "PAUSE", meta=_META, max_turns=2, max_attempts=2)
+    for _ in range(2):
+        assert cg.run_part(_seeds(1), out, _AnswerRaises(), **kw) == "incomplete"
+        assert out.read_text(encoding="utf-8") == ""
+    ledger = [json.loads(l) for l in
+              Path(str(out) + ".failures.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert ledger == [{"id": "ch-dv2-0000000", "stop": "error:ConnectionError"}] * 2
+    assert cg.run_part(_seeds(1), out, _AnswerRaises(), **kw) == "done"      # written as-is
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["stop"] == "error:ConnectionError" and rec["kept_turns"] == 1
+
+
+def test_run_part_stops_on_a_failure_streak(tmp_path):
+    t = _AlwaysRaises()
+    out = tmp_path / "gen" / "p.jsonl"
+    st = cg.run_part(_seeds(40), out, t, concurrency=1, pause=tmp_path / "PAUSE", meta=_META)
+    assert st == "error" and 0 < t.calls < 40
+
+
+def test_run_part_records_settings_and_refuses_a_mismatched_resume(tmp_path):
+    out = tmp_path / "gen" / "p.jsonl"
+    kw = dict(concurrency=1, pause=tmp_path / "PAUSE", meta=_META)
+    assert cg.run_part(_seeds(1), out, FakeTeacher(), max_turns=2, **kw) == "done"
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert (rec["max_turns"], rec["min_new_tests"], rec["max_new_tokens"], rec["timeout"]) == \
+        (2, 2, 1024, 10.0)
+    before = out.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match="max_turns"):
+        cg.run_part(_seeds(2), out, FakeTeacher(), max_turns=3, **kw)
+    assert out.read_text(encoding="utf-8") == before
+
+
+def test_make_messages_chat_turns_a_4xx_into_a_permanent_error():
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = b'{"error": "context length exceeded"}'
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        chat = cg.make_messages_chat(f"http://127.0.0.1:{srv.server_port}", retries=3, backoff=0.0)
+        with pytest.raises(cg.PermanentRequestError, match="400.*context length"):
+            chat([{"role": "user", "content": "hi"}], 10)
+    finally:
+        srv.shutdown()
+        srv.server_close()

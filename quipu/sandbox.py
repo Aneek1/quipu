@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -111,9 +112,32 @@ def kill_tree(proc: subprocess.Popen) -> None:
     proc.kill()
 
 
+_limiter: threading.BoundedSemaphore | None = None
+
+
+def set_max_parallel(n: int | None) -> None:
+    """Cap how many run_tests subprocesses run at once, whatever the number of calling
+    threads (None, the default, means no cap). Lets a caller with many threads waiting
+    on a network keep the CPU load of the sandbox separate. Call it before starting
+    threads, not while runs are in flight."""
+    global _limiter
+    if n is not None and n < 1:
+        raise ValueError("n must be >= 1 or None")
+    _limiter = None if n is None else threading.BoundedSemaphore(n)
+
+
 def run_tests(code: str, tests: list[str], timeout: float = 10.0,
               python: str | None = None) -> Result:
-    """Run `code`, then each assert in `tests`, in a fresh interpreter."""
+    """Run `code`, then each assert in `tests`, in a fresh interpreter. With a cap set
+    by set_max_parallel, waits for a free slot first; the timeout covers the run only."""
+    limiter = _limiter
+    if limiter is None:
+        return _run_tests(code, tests, timeout, python)
+    with limiter:
+        return _run_tests(code, tests, timeout, python)
+
+
+def _run_tests(code: str, tests: list[str], timeout: float, python: str | None) -> Result:
     with tempfile.TemporaryDirectory(prefix="quipu-sbx-", ignore_cleanup_errors=True) as tmp:
         Path(tmp, "solution.py").write_text(code, encoding="utf-8")
         Path(tmp, "harness.py").write_text(HARNESS, encoding="utf-8")

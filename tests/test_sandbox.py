@@ -77,3 +77,47 @@ def test_a_failing_test_is_not_infrastructure_trouble():
     from quipu.sandbox import Result
     assert not Result(0, 1, "AssertionError", ["AssertionError"]).infra
     assert Result(0, 1, "crash:1", ["crash:1"]).infra
+
+
+def test_set_max_parallel_serialises_runs_and_none_restores_unlimited():
+    import threading
+    import time
+
+    from quipu import sandbox
+
+    slow = "import time\ntime.sleep(1.0)\n"
+
+    def timed_pair() -> float:
+        t0 = time.monotonic()
+        ts = [threading.Thread(target=run_tests, args=(slow, ["assert True"], 10.0)) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return time.monotonic() - t0
+
+    sandbox.set_max_parallel(1)
+    try:
+        assert timed_pair() >= 2.0              # one at a time
+    finally:
+        sandbox.set_max_parallel(None)
+    assert timed_pair() < 2.0                   # overlapping again
+
+
+def test_timeout_clock_starts_after_the_limiter_is_acquired():
+    import threading
+
+    from quipu import sandbox
+
+    results = []
+    sandbox.set_max_parallel(1)
+    try:
+        ts = [threading.Thread(target=lambda: results.append(
+            run_tests("import time\ntime.sleep(0.5)\n", ["assert True"], 3.0))) for _ in range(2)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+    finally:
+        sandbox.set_max_parallel(None)
+    assert all(r.all_passed for r in results)   # the waiting one did not time out in the queue
