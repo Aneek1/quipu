@@ -39,7 +39,7 @@ sparse model learns under a $20 compute cap, with every A/B result, including th
 ones that lost. Fields marked _not yet measured_ had no result file when this card
 was generated.
 
-Project page: <https://quipu-lm.vercel.app> · Code: <https://github.com/Aneek1/quipu>
+Project page: <https://quipulm.dev> · Code: <https://github.com/Aneek1/quipu>
 
 ## Architecture
 

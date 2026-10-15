@@ -3,7 +3,7 @@
 A small language model trained from scratch on one laptop GPU (RTX 5060 Laptop, 8 GB): own data pipeline, own training loop, own weights.
 
 - **Weights, 7 training milestones and model card:** https://huggingface.co/AneekC/quipu-114m
-- **Loss curve and samples:** https://quipu-lm.vercel.app
+- **Loss curve and samples:** https://quipulm.dev
 
 ## quipu-114m
 

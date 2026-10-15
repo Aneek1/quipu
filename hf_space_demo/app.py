@@ -107,7 +107,7 @@ trained from scratch for under $20, then fine-tuned on human-written chats plus 
 their unit tests. It solves 7.4% of MBPP. **It is small and often wrong**: don't trust its facts or its code.
 Runs on a small CPU machine.
 [Model card](https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill) ·
-[Project page](https://quipu-lm.vercel.app) · [Code](https://github.com/Aneek1/quipu)"""
+[Project page](https://quipulm.dev) · [Code](https://github.com/Aneek1/quipu)"""
 
 EXAMPLES = [
     ["Write a Python function that checks whether a string is a palindrome."],
