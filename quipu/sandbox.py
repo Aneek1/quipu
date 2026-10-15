@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 FENCE = re.compile(r"```[ \t]*(?:python|py|Python)?[ \t]*\r?\n(.*?)```", re.S)
@@ -35,16 +35,18 @@ def _main():
     try:
         exec(compile(open("solution.py", encoding="utf-8").read(), "solution.py", "exec"), ns)
     except BaseException as e:
-        out.write("\n{tag}" + json.dumps({{"passed": 0, "total": len(tests), "error": "solution:" + type(e).__name__}}) + "\n")
+        out.write("\n{tag}" + json.dumps({{"passed": 0, "total": len(tests), "error": "solution:" + type(e).__name__, "errors": ["solution:" + type(e).__name__] * len(tests)}}) + "\n")
         return
-    ok, first = 0, ""
+    ok, first, errors = 0, "", []
     for t in tests:
         try:
             exec(t, ns)
             ok += 1
+            errors.append("")
         except BaseException as e:
             first = first or type(e).__name__
-    out.write("\n{tag}" + json.dumps({{"passed": ok, "total": len(tests), "error": first}}) + "\n")
+            errors.append(type(e).__name__)
+    out.write("\n{tag}" + json.dumps({{"passed": ok, "total": len(tests), "error": first, "errors": errors}}) + "\n")
     out.flush()
 
 
@@ -57,6 +59,13 @@ class Result:
     passed: int
     total: int
     error: str  # "" when every test passed; else the first failure kind
+    errors: list[str] = field(default_factory=list)  # per test, in order: "" or the exception type
+
+    @property
+    def infra(self) -> bool:
+        """True when the run itself failed (timeout, crash, the solution did not load),
+        so the per-test outcomes say nothing about the tests."""
+        return self.error == "timeout" or self.error.startswith(("crash:", "solution:"))
 
     @property
     def all_passed(self) -> bool:
@@ -123,9 +132,11 @@ def run_tests(code: str, tests: list[str], timeout: float = 10.0,
                 proc.communicate(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-            return Result(0, len(tests), "timeout")
+            return Result(0, len(tests), "timeout", ["timeout"] * len(tests))
         for line in reversed(out.splitlines()):
             if line.startswith(RESULT_TAG):
                 d = json.loads(line[len(RESULT_TAG):])
-                return Result(int(d["passed"]), int(d["total"]), d.get("error") or "")
-        return Result(0, len(tests), f"crash:{proc.returncode}")
+                return Result(int(d["passed"]), int(d["total"]), d.get("error") or "",
+                              list(d.get("errors") or []))
+        err = f"crash:{proc.returncode}"
+        return Result(0, len(tests), err, [err] * len(tests))

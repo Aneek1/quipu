@@ -56,3 +56,24 @@ def test_solution_cannot_overwrite_the_harness_counters():
     assert r.passed == 1 and r.total == 2 and r.error == "AssertionError"
     r = run_tests(ADD + "first = [0, 0, 2]\n", ["assert add(1, 2) == 3"])
     assert r.all_passed and r.error == ""
+
+
+def test_run_tests_reports_a_per_test_error_list():
+    r = run_tests(ADD, ["assert add(1, 2) == 3", "assert add(2, 2) == 5", "assert nope(1)"])
+    assert r.errors == ["", "AssertionError", "NameError"]
+    assert not r.infra
+
+
+def test_run_tests_per_test_errors_on_solution_failure_timeout_and_crash():
+    r = run_tests("def add(a, b):\n    return a +\n", ["assert True", "assert True"])
+    assert r.errors == ["solution:SyntaxError"] * 2 and r.infra
+    r = run_tests("while True:\n    pass\n", ["assert True", "assert True"], timeout=2)
+    assert r.errors == ["timeout"] * 2 and r.infra
+    r = run_tests("import os\nos._exit(3)\n", ["assert True"])
+    assert r.error == "crash:3" and r.errors == ["crash:3"] and r.infra
+
+
+def test_a_failing_test_is_not_infrastructure_trouble():
+    from quipu.sandbox import Result
+    assert not Result(0, 1, "AssertionError", ["AssertionError"]).infra
+    assert Result(0, 1, "crash:1", ["crash:1"]).infra
