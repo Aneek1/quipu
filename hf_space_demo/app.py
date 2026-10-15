@@ -3,6 +3,7 @@
 Uses the model repo's own standalone loader (modeling_quipu_moe.py), so the demo runs
 exactly the published weights, with a KV cache added in kv_generate.py (same tokens as the
 loader's own generation, about 6x faster). Replies stream token by token."""
+import dataclasses
 import importlib.util
 import os
 import re
@@ -16,7 +17,8 @@ from huggingface_hub import hf_hub_download
 import kv_generate as kv
 
 REPO = os.environ.get("QUIPU_REPO", "AneekC/quipu-moe-1B-A149M-chat-distill")
-MAX_NEW = 1536            # the context is 2,048 tokens: prompt + history + reply share it
+CONTEXT = 4096            # trained at 2,048; stretched 2x with NTK-aware RoPE scaling (below)
+MAX_NEW = 1536            # prompt + history + reply share the context
 MIN_REPLY = 256           # a long chat keeps at least this much room for the reply
 
 def usable_cpus() -> int:
@@ -40,6 +42,23 @@ kv.bind(mq)
 
 model = mq.load(REPO).eval()
 tok = mq.load_tokenizer(REPO)
+
+
+def stretch_context(model, length: int) -> None:
+    """Serve a longer context than the model was trained on by raising the RoPE base
+    (NTK-aware scaling). Measured on held-out books and code (scripts/context_stretch.py):
+    at 2x the loss on the first 2,048 positions rises under 1% and the positions after
+    2,048 are still predicted well, so the extra text is used. No retraining."""
+    cfg = model.cfg
+    s = length / cfg.context
+    if s <= 1:
+        return
+    base = cfg.rope_base * s ** (cfg.head_dim / (cfg.head_dim - 2))
+    model.rope_cos, model.rope_sin = mq.build_rope_cache(length, cfg.head_dim, base)
+    model.cfg = dataclasses.replace(cfg, context=length, rope_base=base)
+
+
+stretch_context(model, CONTEXT)
 END, EOT = tok.special_id("<|end|>"), tok.eot
 lock = threading.Lock()    # one generation at a time on a 2-vCPU box
 
@@ -86,34 +105,42 @@ def respond(message, history, temperature, repetition_penalty, max_new_tokens):
     ids = encode(msgs)
     ctx = model.cfg.context
     want = int(max_new_tokens)
+    turns = len(msgs)
     while len(ids) + want > ctx and len(msgs) > 1:    # drop the oldest turns first
         msgs = msgs[2:] if len(msgs) > 2 else msgs[1:]
         ids = encode(msgs)
-    ids = ids[-(ctx - MIN_REPLY):]                      # a very long single message
+    notes = []
+    if len(msgs) < turns:
+        notes.append("older messages in this chat were left out to fit the window")
+    if len(ids) > ctx - MIN_REPLY:                      # a very long single message
+        notes.append(f"your message was too long, so only its last {ctx - MIN_REPLY:,} tokens were used")
+        ids = ids[-(ctx - MIN_REPLY):]
     max_new = min(want, ctx - len(ids))                 # stay inside the window (KV-cache path)
+    head = (f"*(The model reads {ctx:,} tokens at most: " + "; ".join(notes) + ".)*\n\n") if notes else ""
 
     with lock:
         new: list[int] = []
         for t in kv.stream(model, ids, max_new, {END, EOT},
                            temperature=float(temperature), repetition_penalty=float(repetition_penalty)):
             new.append(t)
-            yield show(tok.decode(new))
+            yield head + show(tok.decode(new))
         if not new:
-            yield "(no reply)"
+            yield head + "(no reply)"
 
 
 DESCRIPTION = """**quipu-moe-1B-A149M-chat-distill**: a 1B-parameter mixture of experts (149M active per token),
 trained from scratch for under $20, then fine-tuned on human-written chats plus coding answers that passed
 their unit tests. It solves 7.4% of MBPP. **It is small and often wrong**: don't trust its facts or its code.
-Runs on a small CPU machine.
+It does best on short Python functions and simple questions in English; other languages and longer tasks
+such as whole web pages are still beyond it. Runs on a small CPU machine.
 [Model card](https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill) ·
 [Project page](https://quipulm.dev) · [Code](https://github.com/Aneek1/quipu)"""
 
-EXAMPLES = [
+EXAMPLES = [       # chosen by trying them on this model (temperature 0.3, two seeds each)
     ["Write a Python function that checks whether a string is a palindrome."],
-    ["Write a Python function that returns the n-th Fibonacci number."],
-    ["What is photosynthesis? Explain it in two sentences."],
-    ["Apa itu fotosintesis?"],
+    ["Write a Python function that removes duplicates from a list but keeps the order."],
+    ["Write a Python function that counts the vowels in a string."],
+    ["What is the capital of France?"],
 ]
 
 kwargs = dict(
@@ -124,7 +151,7 @@ kwargs = dict(
     additional_inputs=[
         gr.Slider(0.0, 1.2, value=0.3, step=0.1, label="Temperature (0 = greedy)"),
         gr.Slider(1.0, 1.5, value=1.15, step=0.05, label="Repetition penalty (1 = off)"),
-        gr.Slider(64, MAX_NEW, value=768, step=64, label="Max new tokens (the window is 2,048 incl. your message)"),
+        gr.Slider(64, MAX_NEW, value=768, step=64, label=f"Max new tokens (the window is {CONTEXT:,} incl. your message)"),
     ],
     cache_examples=False,
 )
