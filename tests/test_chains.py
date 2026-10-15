@@ -152,10 +152,17 @@ HANGS = "def f(x):\n    while x < 0:\n        pass\n    return x\n"      # hangs
 def test_new_asserts_old_code_hanging_on_a_new_case_is_a_change_target_for_edge_only():
     asserts = ["assert f(3) == 3", "assert f(-1) == 1", "assert f(2) == 3"]
     # Edge kind: the hang is kept (found one by one), as is the wrong result; the passing one is not.
-    assert ch.new_asserts(HANGS, asserts, K_EDGE, timeout=2) == \
+    assert ch.new_asserts(HANGS, asserts, K_EDGE, ["assert f(0) == 0"], timeout=2) == \
         ["assert f(-1) == 1", "assert f(2) == 3"]
     for kind in (K_PARAM, K_FLAG, K_VALIDATE):
         assert ch.new_asserts(HANGS, asserts, kind, timeout=2) == []
+
+
+def test_new_asserts_slow_loading_old_code_is_a_sandbox_error_not_a_hanging_assert():
+    slow = OLD + "import time\ntime.sleep(0.5)\n"
+    asserts = ["assert add(1, 2) == 3", "assert add(5, 5) == 10"]
+    with pytest.raises(ch.SandboxError):       # the control run (earlier tests) is slow too
+        ch.new_asserts(slow, asserts, K_EDGE, ["assert add(1, 2) == 3"], timeout=0.3)
 
 
 def test_new_asserts_finds_raises_checks_by_parsing_not_by_prefix():
@@ -301,6 +308,12 @@ def test_run_chain_ends_with_an_error_stop_when_the_teacher_fails():
 def test_run_chain_ends_with_an_error_stop_when_the_sandbox_cannot_run_the_code():
     crash = "```python\ndef add(a, b):\n    return a + b\nimport os\nos._exit(3)\n```"
     rec = ch.run_chain({**SEED, "response": crash}, FakeTeacher(), max_turns=2)
+    assert rec["stop"] == "error:SandboxError" and rec["kept_turns"] == 1
+
+
+def test_run_chain_slow_loading_seed_code_is_a_sandbox_error():
+    slow = "```python\n" + OLD + "import time\ntime.sleep(0.5)\n```"
+    rec = ch.run_chain({**SEED, "response": slow}, FakeTeacher(), max_turns=2, timeout=0.3)
     assert rec["stop"] == "error:SandboxError" and rec["kept_turns"] == 1
 
 

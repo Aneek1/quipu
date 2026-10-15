@@ -189,16 +189,22 @@ def _tests_the_change(assert_line: str, err: str, kind: str) -> bool:
     return True
 
 
-def new_asserts(code: str, asserts: list[str], kind: str, timeout: float = 10.0) -> list[str]:
+def new_asserts(code: str, asserts: list[str], kind: str,
+                known_passing: list[str] | None = None, timeout: float = 10.0) -> list[str]:
     """The asserts that test the requested change: those the previous turn's code (known
     good) fails for a reason `_tests_the_change` accepts. One sandbox run; if it times
     out, each assert is run alone, since old code that hangs on a new case is a legit
-    target of the change. Raises SandboxError if a run failed in a way that proves
+    target of the change. First a control run of `known_passing` (tests the old code is
+    known to pass; just loading it when there are none) with the same timeout: if that
+    is slow too, the code is slow to load and no hang can be pinned on an assert. Raises SandboxError if a run failed in a way that proves
     nothing about the old code (process crash, code that won't load)."""
     if not asserts:
         return []
     res = run_tests(code + PRELUDE, asserts, timeout=timeout)
     if res.error == "timeout":
+        control = run_tests(code + PRELUDE, known_passing or ["pass"], timeout=timeout)
+        if not control.all_passed:
+            raise SandboxError("control run of earlier tests: " + (control.error or "failed"))
         errors = []
         for a in asserts:
             one = run_tests(code + PRELUDE, [a], timeout=timeout)
@@ -289,7 +295,8 @@ def run_chain(seed: dict, chat: Chat, *, max_turns: int = 3, max_new_tokens: int
             text, _, _ = chat([{"role": "system", "content": TESTS_SYSTEM.format(entry=entry)},
                                {"role": "user", "content": tests_input(request, code)}], 600)
             parsed = parse_asserts(text, entry)
-            new_tests = new_asserts(code, parsed, kind, timeout)
+            new_tests = new_asserts(code, parsed, kind, [a for t in turns for a in t["tests"]],
+                                   timeout=timeout)
             if len(new_tests) < min_new_tests:
                 rec["stop"] = "tests_too_few"
                 rec["rejected"] = {"request": request, "asserts": parsed}
