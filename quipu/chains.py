@@ -30,19 +30,43 @@ CHANGE_KINDS = (
 )
 
 REQUEST_SYSTEM = (
-    "You write the next message a user sends after receiving the Python code below. "
-    "The message asks for exactly one change of this kind: {kind}. Every call that "
-    "worked before must still give the same result. Write it as the user, in one to "
-    "three plain sentences. No code, no tests, and don't mention tests or backward "
-    "compatibility."
+    "You write the next message in a conversation between a user and a coding assistant. "
+    "The assistant has just given the user the Python function shown in the user's "
+    "message. You are the user: write the follow-up message that asks the assistant for "
+    "exactly one change to that function. The change: {kind}. It must be something the "
+    "function does not already do, so read the code before you choose. Calls that work "
+    "now must keep giving the same results. You only write the request. Do not write, "
+    "fix or show any code, and do not answer the request. Don't mention tests or "
+    "backward compatibility. Reply in exactly this format and nothing else: "
+    "REQUEST: <one to three plain sentences, in the user's voice>"
+)
+
+# The same task again at the end of the user turn: small models follow it better there.
+REQUEST_USER = (
+    "{asked}\n\nThe function now:\n{code}\n\n"
+    "Write the user's next message, asking for this change: {kind}. It must be something "
+    "the function does not already do. Do not write any code. Reply in exactly this "
+    "format: REQUEST: <one to three plain sentences>"
 )
 
 TESTS_SYSTEM = (
     "You write unit tests for a requested change to a Python function named {entry}. "
-    "Reply with one ```python block containing only 3 to 6 assert statements, one per "
-    "line, each calling {entry} with literal arguments and comparing with a literal "
-    "expected value. Test only the new behaviour the request describes. To check that "
-    "a call raises an error, write: assert _raises(ValueError, {entry}, arg1, arg2)"
+    "Reply with one ```python block containing exactly 5 assert statements, one per "
+    "line, covering different inputs. Each calls {entry} with literal arguments and "
+    "compares the result with a literal expected value (True and False are literals). "
+    "Every assert must use the new behaviour the request describes: call {entry} with "
+    "the new argument, flag or input, so that the current code, which lacks it, gives a "
+    "different result or an error. Don't write asserts for what the current code "
+    "already does. To check that a call raises an error, write: "
+    "assert _raises(ValueError, {entry}, arg1, arg2)"
+)
+
+TESTS_USER = (
+    "Current code:\n{code}\n\nRequested change:\n{request}\n\n"
+    "Write exactly 5 assert statements for the requested change, one per line, in one "
+    "```python block, covering different inputs. Each calls {entry} with literal "
+    "arguments, uses the new behaviour (the current code must fail it), and compares the "
+    "result with a literal expected value."
 )
 
 FOLLOWUP_SYSTEM = (
@@ -50,6 +74,11 @@ FOLLOWUP_SYSTEM = (
     "one or two sentences what changes, then give the complete updated function in one "
     "```python block, keeping its name. Be direct, don't repeat yourself, no filler."
 )
+
+# Names the instruction texts above, so outputs made with different wording can't be mixed.
+PROMPT_VERSION = hashlib.sha256("\x00".join(
+    (REQUEST_SYSTEM, REQUEST_USER, TESTS_SYSTEM, TESTS_USER, FOLLOWUP_SYSTEM, *CHANGE_KINDS)
+).encode()).hexdigest()[:12]
 
 # Appended to the code under test so `assert _raises(...)` lines can run.
 PRELUDE = (
@@ -66,6 +95,9 @@ PRELUDE = (
 FENCE_ANY = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 # A request that opens like a chat reply, or talks about tests, isn't a user message.
 REQUEST_CHATTER = re.compile(r"^(sure|here is|here's|user:|the user)|\btests?\b", re.I)
+# A line that looks like code, not like a user's sentence.
+CODE_LINE = re.compile(r"^(?:\s*(?:def |class |import |from \S+ import |return\b|@\w)|(?: {4}|\t)\S)",
+                       re.M)
 QUOTES = "\"\u201c\u201d\u2018\u2019"
 
 
@@ -88,9 +120,14 @@ def pick_kinds(seed_id: str, n: int) -> list[str]:
 
 
 def parse_request(text: str) -> str | None:
-    """The teacher's follow-up request, or None if it isn't plain words of a sane length."""
-    t = (text or "").strip().strip(QUOTES).strip()
-    if "```" in t or not 15 <= len(t) <= 600 or REQUEST_CHATTER.search(t):
+    """The follow-up request: the plain words after the first "REQUEST:", or None when
+    the marker is missing or the words aren't a sane length, contain code, or read like
+    chat."""
+    head, marker, rest = (text or "").partition("REQUEST:")
+    if not marker:
+        return None
+    t = rest.strip().strip(QUOTES).strip()
+    if "```" in t or CODE_LINE.search(t) or not 15 <= len(t) <= 600 or REQUEST_CHATTER.search(t):
         return None
     return t
 
@@ -123,7 +160,7 @@ def _literal(node: ast.AST):
 def _checks_entry(test: ast.AST, entry_point: str) -> bool:
     """True for `entry(...) == literal` (either side; `!=` only against a non-trivial
     literal) and for `_raises(ExcClass, entry, ...)`: asserts that pin down a result.
-    A literal that is True, False or None is too weak to pin anything down."""
+    None is too weak a literal, and True or False pin a result only with ==."""
     if isinstance(test, ast.Compare):
         if len(test.ops) != 1 or not isinstance(test.ops[0], (ast.Eq, ast.NotEq)):
             return False
@@ -131,8 +168,10 @@ def _checks_entry(test: ast.AST, entry_point: str) -> bool:
             if not _is_entry_call(call, entry_point):
                 continue
             ok, value = _literal(other)
-            if not ok or value is None or isinstance(value, bool):
+            if not ok or value is None:
                 return False
+            if isinstance(value, bool):          # True and False pin a predicate, with == only
+                return isinstance(test.ops[0], ast.Eq)
             return isinstance(test.ops[0], ast.Eq) or value not in _TRIVIAL
         return False
     if _is_call_of(test, "_raises"):
@@ -153,13 +192,14 @@ def is_raises_check(assert_line: str) -> bool:
 
 def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
     """Single-line asserts that compare a call of `entry_point` with a literal (or check
-    that it raises), in order, without repeats. Reads fenced blocks when there are any,
+    that it raises), in order, without repeats. A bare predicate call is rewritten to
+    an explicit comparison with True or False. Reads fenced blocks when there are any,
     else the whole reply."""
     blocks = FENCE_ANY.findall(text or "") or [text or ""]
     out: list[str] = []
     for line in "\n".join(blocks).splitlines():
         s = line.strip()
-        if not s.startswith("assert ") or len(s) > max_len or s in out:
+        if not s.startswith("assert ") or len(s) > max_len:
             continue
         try:
             body = ast.parse(s).body
@@ -167,7 +207,14 @@ def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
             continue
         if len(body) != 1 or not isinstance(body[0], ast.Assert):
             continue
-        if not _checks_entry(body[0].test, entry_point):
+        test = body[0].test
+        # A predicate called bare, `assert f(x)` / `assert not f(x)`, says what f returns.
+        if _is_call_of(test, entry_point):
+            s = f"assert {ast.get_source_segment(s, test)} == True"
+        elif (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+              and _is_call_of(test.operand, entry_point)):
+            s = f"assert {ast.get_source_segment(s, test.operand)} == False"
+        if s in out or not _checks_entry(ast.parse(s).body[0].test, entry_point):
             continue
         out.append(s)
     return out
@@ -249,15 +296,16 @@ def _fence(code: str) -> str:
     return "```python\n" + code.rstrip("\n") + "\n```"
 
 
-def request_input(turns: list[dict], code: str) -> str:
-    """What the request writer sees: what the user asked so far and the current code."""
-    asked = "\n".join(f"- {t['user']}" for t in turns)
-    return f"The user has asked, in order:\n{asked}\n\nThe current code:\n{_fence(code)}"
+def request_input(turns: list[dict], code: str, kind: str) -> str:
+    """What the request writer sees: what the user asked so far, the current code, and
+    the kind of change to ask for."""
+    asked = "The user has asked, in order:\n" + "\n".join(f"- {t['user']}" for t in turns)
+    return REQUEST_USER.format(asked=asked, code=_fence(code), kind=kind)
 
 
-def tests_input(request: str, code: str) -> str:
+def tests_input(request: str, code: str, entry: str) -> str:
     """What the test writer sees: the current code and the request, never an answer."""
-    return f"Current code:\n{_fence(code)}\n\nRequested change:\n{request}"
+    return TESTS_USER.format(code=_fence(code), request=request, entry=entry)
 
 
 def conversation(turns: list[dict]) -> list[dict]:
@@ -286,14 +334,14 @@ def run_chain(seed: dict, chat: Chat, *, max_turns: int = 3, max_new_tokens: int
     try:
         for kind in kinds if code is not None else []:
             text, finish, _ = chat([{"role": "system", "content": REQUEST_SYSTEM.format(kind=kind)},
-                                    {"role": "user", "content": request_input(turns, code)}], 200)
+                                    {"role": "user", "content": request_input(turns, code, kind)}], 200)
             request = parse_request(text) if finish != "length" else None
             if request is None:
                 rec["stop"] = "request_bad"
                 rec["rejected"] = {"request": text}
                 break
             text, _, _ = chat([{"role": "system", "content": TESTS_SYSTEM.format(entry=entry)},
-                               {"role": "user", "content": tests_input(request, code)}], 600)
+                               {"role": "user", "content": tests_input(request, code, entry)}], 600)
             parsed = parse_asserts(text, entry)
             new_tests = new_asserts(code, parsed, kind, [a for t in turns for a in t["tests"]],
                                    timeout=timeout)

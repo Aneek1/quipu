@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from quipu import sandbox                                                  # noqa: E402
-from quipu.chains import Chat, run_chain                                   # noqa: E402
+from quipu.chains import PROMPT_VERSION, Chat, run_chain                                   # noqa: E402
 from scripts.distill_generate_v2 import TEACHER, _drop_torn_tail, done_ids, part_order  # noqa: E402
 
 SHOW_FAILURES = 5
@@ -131,7 +131,8 @@ def run_part(seeds: list[dict], out: Path, chat: Chat, *, concurrency: int, paus
     `<out>.failures.jsonl`, rerun to retry them). A chain that already failed
     `max_attempts` times is written as it ended instead, so it stops being retried."""
     out = Path(out)
-    settings = SETTING_DEFAULTS | {k: v for k, v in chain_kw.items() if k in SETTINGS}
+    settings = (SETTING_DEFAULTS | {k: v for k, v in chain_kw.items() if k in SETTINGS}
+                | {"prompt_version": PROMPT_VERSION})
     out.parent.mkdir(parents=True, exist_ok=True)
     _drop_torn_tail(out)
     _check_settings(out, settings)

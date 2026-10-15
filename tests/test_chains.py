@@ -25,15 +25,25 @@ def test_pick_kinds_refuses_more_kinds_than_exist():
 
 
 def test_parse_request_accepts_plain_words_only():
-    assert ch.parse_request('  "Let add take an optional third number c."  ') == \
+    assert ch.parse_request('  REQUEST: "Let add take an optional third number c."  ') == \
         "Let add take an optional third number c."
-    assert ch.parse_request("Sure:\n```python\ndef f(): pass\n```") is None   # code
-    assert ch.parse_request("ok") is None                                      # too short
-    assert ch.parse_request("x" * 601) is None                                 # too long
+    assert ch.parse_request("Okay.\nREQUEST: Let add take an optional third number c.") == \
+        "Let add take an optional third number c."                # text after the first marker
+    assert ch.parse_request("Let add take an optional third number c.") is None   # no marker
+    assert ch.parse_request("REQUEST: ok") is None                                  # too short
+    assert ch.parse_request("REQUEST: " + "x" * 601) is None                        # too long
+
+
+def test_parse_request_rejects_code():
+    assert ch.parse_request("REQUEST: Sure:\n```python\ndef f(): pass\n```") is None
+    assert ch.parse_request("REQUEST: Let add take a third number.\n"
+                            "def add(a, b, c=0):\n    return a + b + c") is None   # unfenced code
+    assert ch.parse_request("REQUEST: Please let add take a third number c.\n"
+                            "    return a + b + c") is None
 
 
 def test_parse_request_strips_curly_quotes_and_rejects_chatter():
-    assert ch.parse_request("\u201cLet add take an optional third number c.\u201d") == \
+    assert ch.parse_request("REQUEST: \u201cLet add take an optional third number c.\u201d") == \
         "Let add take an optional third number c."
     for bad in ("Sure! Let add take an optional third number c.",
                 "Here is the message: let add take a third number.",
@@ -41,8 +51,8 @@ def test_parse_request_strips_curly_quotes_and_rejects_chatter():
                 "User: let add take an optional third number c.",
                 "The user wants add to take a third number c.",
                 "Please let add take a third number, and write a test for it."):
-        assert ch.parse_request(bad) is None, bad
-    assert ch.parse_request("Please add a contest flag to add.") is not None   # whole word only
+        assert ch.parse_request("REQUEST: " + bad) is None, bad
+    assert ch.parse_request("REQUEST: Please add a contest flag to add.") is not None   # whole word
 
 
 def test_parse_asserts_keeps_single_line_asserts_about_the_function():
@@ -64,7 +74,6 @@ def test_parse_asserts_keeps_single_line_asserts_about_the_function():
 
 def test_parse_asserts_rejects_weak_or_misleading_asserts():
     text = (
-        "assert add(1, 2, 3)\n"                          # bare truthy
         "assert isinstance(add(1, 2, 3), int)\n"         # type check only
         "assert True, add(1, 2)\n"                       # name only in the message
         "assert add(1, 2, 3) > 5\n"                      # not Eq/NotEq
@@ -75,7 +84,10 @@ def test_parse_asserts_rejects_weak_or_misleading_asserts():
         "assert _raises(ValueError, len, 'a')\n"         # not about add
         "assert add(1, 2, 3) != None\n"                  # trivial literal
         "assert add(1, 2, 3) != 0\n"
-        "assert add(1, 2, 3) == True\n"
+        "assert add(1, 2, 3) != True\n"                  # != never takes a bool
+        "assert add(1, 2, 3) == None\n"
+        "assert not isinstance(add(1, 2, 3), str)\n"      # not, but not a bare call
+        "assert not bool(add(1, 2, 3))\n"
         "assert bool(add(0, 1, 5)) == True\n"            # the call is wrapped in bool()
         "assert isinstance(add(1, 2, 3), int) == True\n"
         "assert str(add(1, 2, 3)) == '6'\n"              # wrapped in str()
@@ -93,6 +105,26 @@ def test_parse_asserts_rejects_weak_or_misleading_asserts():
         "assert add(1, 2, 3) == 0",
         "assert add([1], [2], [3])[0] == 1",
         "assert add(1, 2, 3).real == 6",
+    ]
+
+
+def test_parse_asserts_turns_predicate_asserts_into_comparisons():
+    text = (
+        "assert is_ok(1)\n"
+        "assert not is_ok('')\n"
+        "assert  not  is_ok( 'a b' )\n"
+        "assert is_ok(2) == True\n"                      # already explicit: kept as is
+        "assert is_ok(1)\n"                              # duplicate after normalising
+        "assert is_ok(3), 'with a message'\n"
+        "assert not len('a')\n"                          # not about is_ok
+        "assert not is_ok(4) == True\n"                  # not applies to the comparison: skip
+    )
+    assert ch.parse_asserts(text, "is_ok") == [
+        "assert is_ok(1) == True",
+        "assert is_ok('') == False",
+        "assert is_ok( 'a b' ) == False",
+        "assert is_ok(2) == True",
+        "assert is_ok(3) == True",
     ]
 
 
@@ -220,10 +252,33 @@ class FakeTeacher:
         self.calls.append(messages)
         system = messages[0]["content"]
         if system.startswith("You write the next message"):
-            return self.request, "stop", 20
+            return "REQUEST: " + self.request, "stop", 20
         if system.startswith("You write unit tests"):
             return self.tests, "stop", 40
         return self.answer, self.finish, 60
+
+
+def test_the_teacher_instructions_state_the_task_and_the_output_format():
+    t = FakeTeacher()
+    ch.run_chain(SEED, t, max_turns=2)
+    req_sys, req_user = t.calls[0][0]["content"], t.calls[0][1]["content"]
+    tests_sys, tests_user = t.calls[1][0]["content"], t.calls[1][1]["content"]
+    kind = ch.pick_kinds(SEED["id"], 1)[0]
+    for text in (req_sys, req_user):
+        assert "REQUEST:" in text and "not already" in text.lower()
+    assert kind in req_sys and kind in req_user
+    assert "Do not write any code" in req_user
+    for text in (tests_sys, tests_user):
+        assert "exactly 5" in text and "different inputs" in text
+    assert OLD.strip() in req_user and OLD.strip() in tests_user
+
+
+def test_prompt_version_is_a_short_hash_of_the_instructions():
+    import hashlib
+    assert len(ch.PROMPT_VERSION) == 12 and int(ch.PROMPT_VERSION, 16) >= 0
+    parts = (ch.REQUEST_SYSTEM, ch.REQUEST_USER, ch.TESTS_SYSTEM, ch.TESTS_USER,
+             ch.FOLLOWUP_SYSTEM, *ch.CHANGE_KINDS)
+    assert ch.PROMPT_VERSION == hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:12]
 
 
 def test_run_chain_keeps_a_good_second_turn():
@@ -273,7 +328,7 @@ def test_run_chain_third_turn_needs_tests_the_current_code_fails():
 def test_run_chain_stops_on_a_bad_request_and_keeps_what_was_rejected():
     rec = ch.run_chain(SEED, FakeTeacher(request="Sure! ```x```"), max_turns=2)
     assert rec["stop"] == "request_bad" and rec["kept_turns"] == 1
-    assert rec["rejected"] == {"request": "Sure! ```x```"}
+    assert rec["rejected"] == {"request": "REQUEST: Sure! ```x```"}
 
 
 def test_run_chain_stops_when_the_answer_has_no_code():
@@ -468,10 +523,14 @@ def test_run_part_records_settings_and_refuses_a_mismatched_resume(tmp_path):
     rec = json.loads(out.read_text(encoding="utf-8"))
     assert (rec["max_turns"], rec["min_new_tests"], rec["max_new_tokens"], rec["timeout"]) == \
         (2, 2, 1024, 10.0)
+    assert rec["prompt_version"] == ch.PROMPT_VERSION
     before = out.read_text(encoding="utf-8")
     with pytest.raises(ValueError, match="max_turns"):
         cg.run_part(_seeds(2), out, FakeTeacher(), max_turns=3, **kw)
     assert out.read_text(encoding="utf-8") == before
+    out.write_text(before.replace(ch.PROMPT_VERSION, "000000000000"), encoding="utf-8")
+    with pytest.raises(ValueError, match="prompt_version"):      # other instructions: new file
+        cg.run_part(_seeds(2), out, FakeTeacher(), max_turns=2, **kw)
 
 
 def _serve(status: int, body: bytes):
