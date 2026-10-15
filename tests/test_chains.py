@@ -20,6 +20,8 @@ def test_pick_kinds_is_deterministic_and_distinct():
 def test_pick_kinds_refuses_more_kinds_than_exist():
     with pytest.raises(ValueError):
         ch.pick_kinds("dv2-0000001", len(ch.CHANGE_KINDS) + 1)
+    with pytest.raises(ValueError):
+        ch.pick_kinds("dv2-0000001", -1)
 
 
 def test_parse_request_accepts_plain_words_only():
@@ -71,15 +73,32 @@ def test_parse_asserts_rejects_weak_or_misleading_asserts():
         "assert add(1, 2, 3) in (6,)\n"
         "assert _raises(add, 'a', 1)\n"                  # exception class missing
         "assert _raises(ValueError, len, 'a')\n"         # not about add
+        "assert add(1, 2, 3) != None\n"                  # trivial literal
+        "assert add(1, 2, 3) != 0\n"
+        "assert add(1, 2, 3) == True\n"
+        "assert bool(add(0, 1, 5)) == True\n"            # the call is wrapped in bool()
+        "assert isinstance(add(1, 2, 3), int) == True\n"
+        "assert str(add(1, 2, 3)) == '6'\n"              # wrapped in str()
         "assert add(1, 2, 3) != 7\n"                     # accepted: NotEq with literal
         "assert 6 == add(1, 2, 3)\n"                     # accepted: literal on the left
         "assert add(1, 2, 3) == [6, (1, 'a')]\n"         # accepted: literal container
+        "assert add(1, 2, 3) == 0\n"                     # accepted: == against 0 says something
+        "assert add([1], [2], [3])[0] == 1\n"            # accepted: subscript of the call
+        "assert add(1, 2, 3).real == 6\n"                # accepted: attribute of the call
     )
     assert ch.parse_asserts(text, "add") == [
         "assert add(1, 2, 3) != 7",
         "assert 6 == add(1, 2, 3)",
         "assert add(1, 2, 3) == [6, (1, 'a')]",
+        "assert add(1, 2, 3) == 0",
+        "assert add([1], [2], [3])[0] == 1",
+        "assert add(1, 2, 3).real == 6",
     ]
+
+
+def test_parse_asserts_survives_a_malformed_literal():
+    text = "assert add(1, 2) == {[1]: 2}\nassert add(1,2,3) == 6"
+    assert ch.parse_asserts(text, "add") == ["assert add(1,2,3) == 6"]
 
 
 def test_parse_asserts_reads_unfenced_replies():
@@ -120,11 +139,29 @@ def test_new_asserts_supports_raises_checks_for_the_validation_kind():
 
 
 def test_new_asserts_raises_on_infrastructure_trouble():
-    slow = "def add(a, b):\n    while True:\n        pass\n"
+    crash = "def add(a, b):\n    return a + b\nimport os\nos._exit(3)\n"
     with pytest.raises(ch.SandboxError):
-        ch.new_asserts(slow, ["assert add(1, 2) == 3"], K_PARAM, timeout=2)
+        ch.new_asserts(crash, ["assert add(1, 2) == 3"], K_EDGE)
     with pytest.raises(ch.SandboxError):
         ch.new_asserts("def add(a, b):\n    return a +\n", ["assert add(1, 2) == 3"], K_PARAM)
+
+
+HANGS = "def f(x):\n    while x < 0:\n        pass\n    return x\n"      # hangs on negatives
+
+
+def test_new_asserts_old_code_hanging_on_a_new_case_is_a_change_target_for_edge_only():
+    asserts = ["assert f(3) == 3", "assert f(-1) == 1", "assert f(2) == 3"]
+    # Edge kind: the hang is kept (found one by one), as is the wrong result; the passing one is not.
+    assert ch.new_asserts(HANGS, asserts, K_EDGE, timeout=2) == \
+        ["assert f(-1) == 1", "assert f(2) == 3"]
+    for kind in (K_PARAM, K_FLAG, K_VALIDATE):
+        assert ch.new_asserts(HANGS, asserts, kind, timeout=2) == []
+
+
+def test_new_asserts_finds_raises_checks_by_parsing_not_by_prefix():
+    old = "def half(x):\n    return x / 2\n"
+    spaced = "assert  _raises(ValueError, half, 'a')"      # extra space defeats a prefix test
+    assert ch.new_asserts(old, [spaced], K_VALIDATE) == [spaced]
 
 
 def test_same_code_ignores_blank_lines_and_trailing_spaces():
@@ -141,10 +178,17 @@ def test_check_turn_tells_regressions_from_new_failures():
     assert ch.check_turn(broken, new_tests, old_tests) == "fail_regression"
 
 
-def test_check_turn_reports_infrastructure_trouble_as_sandbox_error():
+def test_check_turn_answer_that_hangs_or_wont_load_is_a_fail_not_a_sandbox_error():
+    new, old = ["assert add(1, 2, 3) == 6"], ["assert add(1, 2) == 3"]
     slow = "def add(a, b, c=0):\n    while True:\n        pass\n"
-    assert ch.check_turn(slow, ["assert add(1, 2, 3) == 6"], ["assert add(1, 2) == 3"],
-                         timeout=2) == "sandbox_error"
+    assert ch.check_turn(slow, new, old, timeout=2) == "fail_crash"
+    assert ch.check_turn("def add(a, b, c=0):\n    return a +\n", new, old) == "fail_crash"
+
+
+def test_check_turn_reports_a_process_crash_as_sandbox_error():
+    crash = "def add(a, b, c=0):\n    return a + b + c\nimport os\nos._exit(3)\n"
+    assert ch.check_turn(crash, ["assert add(1, 2, 3) == 6"], ["assert add(1, 2) == 3"]) == \
+        "sandbox_error"
 
 
 SEED = {
@@ -255,6 +299,18 @@ def test_run_chain_ends_with_an_error_stop_when_the_teacher_fails():
 
 
 def test_run_chain_ends_with_an_error_stop_when_the_sandbox_cannot_run_the_code():
-    slow = {**SEED, "response": "```python\ndef add(a, b):\n    while True:\n        pass\n```"}
-    rec = ch.run_chain(slow, FakeTeacher(), max_turns=2, timeout=2)
+    crash = "```python\ndef add(a, b):\n    return a + b\nimport os\nos._exit(3)\n```"
+    rec = ch.run_chain({**SEED, "response": crash}, FakeTeacher(), max_turns=2)
     assert rec["stop"] == "error:SandboxError" and rec["kept_turns"] == 1
+
+
+def test_run_chain_answer_that_hangs_is_a_fail_crash():
+    hang = "def add(a, b, c=0):\n    while True:\n        pass\n"
+    rec = ch.run_chain(SEED, FakeTeacher(answer="```python\n" + hang + "```"), max_turns=2,
+                       timeout=2)
+    assert rec["stop"] == "fail_crash" and rec["kept_turns"] == 1
+
+
+def test_run_chain_rejects_a_bad_config_instead_of_failing_every_chain():
+    with pytest.raises(ValueError):
+        ch.run_chain(SEED, FakeTeacher(), max_turns=len(ch.CHANGE_KINDS) + 2)

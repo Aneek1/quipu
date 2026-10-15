@@ -81,8 +81,8 @@ Chat = Callable[[list[dict], int], "tuple[str, str, int]"]
 
 def pick_kinds(seed_id: str, n: int) -> list[str]:
     """n distinct change kinds for a seed, the same on every run (no global RNG)."""
-    if n > len(CHANGE_KINDS):
-        raise ValueError(f"only {len(CHANGE_KINDS)} change kinds, asked for {n}")
+    if not 0 <= n <= len(CHANGE_KINDS):
+        raise ValueError(f"need 0 to {len(CHANGE_KINDS)} change kinds, asked for {n}")
     start = hashlib.sha256(seed_id.encode()).digest()[0] % len(CHANGE_KINDS)
     return [CHANGE_KINDS[(start + i) % len(CHANGE_KINDS)] for i in range(n)]
 
@@ -95,33 +95,60 @@ def parse_request(text: str) -> str | None:
     return t
 
 
-def _calls(node: ast.AST, name: str) -> bool:
-    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
-               for n in ast.walk(node))
+def _is_call_of(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
 
 
-def _literal(node: ast.AST) -> bool:
+def _is_entry_call(node: ast.AST, entry_point: str) -> bool:
+    """The call `entry_point(...)` itself, or an index or attribute of it (`f(...)[0]`,
+    `f(...).x`). Any other wrapper (bool(), str(), isinstance()) hides the real value."""
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return _is_call_of(node, entry_point)
+
+
+# A != against one of these is true for almost any result, so it tests nothing.
+_TRIVIAL = (0, 0.0, "", [], (), {}, set())
+
+
+def _literal(node: ast.AST):
+    """(True, value) when the node is a literal, else (False, None). Anything the
+    evaluator rejects, including odd literals like {[1]: 2}, just isn't a literal."""
     try:
-        ast.literal_eval(ast.unparse(node))
-    except (ValueError, SyntaxError):
-        return False
-    return True
+        return True, ast.literal_eval(ast.unparse(node))
+    except Exception:
+        return False, None
 
 
 def _checks_entry(test: ast.AST, entry_point: str) -> bool:
-    """True for `call(entry) == literal` (or !=, either side) and for
-    `_raises(ExcClass, entry, ...)`: asserts that compare a result with a fixed value."""
+    """True for `entry(...) == literal` (either side; `!=` only against a non-trivial
+    literal) and for `_raises(ExcClass, entry, ...)`: asserts that pin down a result.
+    A literal that is True, False or None is too weak to pin anything down."""
     if isinstance(test, ast.Compare):
         if len(test.ops) != 1 or not isinstance(test.ops[0], (ast.Eq, ast.NotEq)):
             return False
-        left, right = test.left, test.comparators[0]
-        return ((_calls(left, entry_point) and _literal(right))
-                or (_calls(right, entry_point) and _literal(left)))
-    if isinstance(test, ast.Call) and isinstance(test.func, ast.Name) and test.func.id == "_raises":
+        for call, other in ((test.left, test.comparators[0]), (test.comparators[0], test.left)):
+            if not _is_entry_call(call, entry_point):
+                continue
+            ok, value = _literal(other)
+            if not ok or value is None or isinstance(value, bool):
+                return False
+            return isinstance(test.ops[0], ast.Eq) or value not in _TRIVIAL
+        return False
+    if _is_call_of(test, "_raises"):
         a = test.args
         return (len(a) >= 2 and isinstance(a[0], ast.Name)
                 and isinstance(a[1], ast.Name) and a[1].id == entry_point)
     return False
+
+
+def is_raises_check(assert_line: str) -> bool:
+    """True when the assert is a `_raises(...)` check."""
+    try:
+        body = ast.parse(assert_line.strip()).body
+    except SyntaxError:
+        return False
+    return len(body) == 1 and isinstance(body[0], ast.Assert) and _is_call_of(body[0].test, "_raises")
 
 
 def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
@@ -146,29 +173,43 @@ def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
     return out
 
 
+def _tests_the_change(assert_line: str, err: str, kind: str) -> bool:
+    """Whether the old code failing this assert with `err` means it tests the change.
+    "" (passes) and NameError (typo'd name) never do. A wrong result (AssertionError)
+    does only where the change is meant to alter results: the edge-case kind, and
+    `_raises` checks of the validation kind. A hang does only for the edge-case kind.
+    For the other kinds old calls must keep working, so a wrong result or a hang on the
+    old code means the teacher's assert contradicts it."""
+    if not err or err == "NameError":
+        return False
+    if err == "timeout":
+        return kind == CHANGE_KINDS[1]
+    if err == "AssertionError":
+        return kind == CHANGE_KINDS[1] or (kind == CHANGE_KINDS[3] and is_raises_check(assert_line))
+    return True
+
+
 def new_asserts(code: str, asserts: list[str], kind: str, timeout: float = 10.0) -> list[str]:
     """The asserts that test the requested change: those the previous turn's code (known
-    good) fails, in one sandbox run. An assert that fails because of a typo'd name is
-    dropped. A wrong result (AssertionError) counts only where the change is meant to
-    alter results: the edge-case kind, and `_raises` checks of the validation kind.
-    For the other kinds old calls must keep working, so a wrong result on the old code
-    means the teacher's assert contradicts it. Raises SandboxError if the run itself
-    failed, since that proves nothing about the old code."""
+    good) fails for a reason `_tests_the_change` accepts. One sandbox run; if it times
+    out, each assert is run alone, since old code that hangs on a new case is a legit
+    target of the change. Raises SandboxError if a run failed in a way that proves
+    nothing about the old code (process crash, code that won't load)."""
     if not asserts:
         return []
     res = run_tests(code + PRELUDE, asserts, timeout=timeout)
-    if res.infra:
+    if res.error == "timeout":
+        errors = []
+        for a in asserts:
+            one = run_tests(code + PRELUDE, [a], timeout=timeout)
+            if one.infra and one.error != "timeout":
+                raise SandboxError(one.error)
+            errors.append(one.errors[0])
+    elif res.infra:
         raise SandboxError(res.error)
-    keep = []
-    for a, err in zip(asserts, res.errors):
-        if not err or err == "NameError":
-            continue
-        if err == "AssertionError" and not (
-                kind == CHANGE_KINDS[1]
-                or (kind == CHANGE_KINDS[3] and a.startswith("assert _raises("))):
-            continue
-        keep.append(a)
-    return keep
+    else:
+        errors = res.errors
+    return [a for a, err in zip(asserts, errors) if _tests_the_change(a, err, kind)]
 
 
 def _normal(code: str) -> list[str]:
@@ -183,11 +224,13 @@ def same_code(a: str, b: str) -> bool:
 def check_turn(code: str, new_tests: list[str], old_tests: list[str],
                timeout: float = 10.0) -> str:
     """"ok" | "fail_regression" (an earlier turn's test breaks) | "fail_new" |
-    "sandbox_error" (the run itself failed, so there is no verdict). One sandbox run
-    over the earlier tests followed by the new ones."""
+    "fail_crash" (the answer won't load or hangs) | "sandbox_error" (the process
+    itself crashed, so there is no verdict). One sandbox run over the earlier tests
+    followed by the new ones. The earlier code already ran fine, so a load failure or
+    timeout here is the answer's fault."""
     res = run_tests(code + PRELUDE, old_tests + new_tests, timeout=timeout)
     if res.infra:
-        return "sandbox_error"
+        return "sandbox_error" if res.error.startswith("crash:") else "fail_crash"
     errors = res.errors
     if any(errors[:len(old_tests)]):
         return "fail_regression"
@@ -230,11 +273,12 @@ def run_chain(seed: dict, chat: Chat, *, max_turns: int = 3, max_new_tokens: int
               "tests": list(seed["tests"]), "status": "ok"}]
     rec = {"id": "ch-" + seed["id"], "seed_id": seed["id"], "split": seed["split"],
            "entry_point": entry, "turns": turns, "stop": ""}
+    kinds = pick_kinds(seed["id"], max_turns - 1)   # a bad max_turns raises here, once
     code = extract_code(seed["response"], entry)
     if code is None:
         rec["stop"] = "seed_no_code"
     try:
-        for kind in pick_kinds(seed["id"], max_turns - 1) if code is not None else []:
+        for kind in kinds if code is not None else []:
             text, finish, _ = chat([{"role": "system", "content": REQUEST_SYSTEM.format(kind=kind)},
                                     {"role": "user", "content": request_input(turns, code)}], 200)
             request = parse_request(text) if finish != "length" else None
