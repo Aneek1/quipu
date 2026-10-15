@@ -1,4 +1,4 @@
-# Amber (DGX B200 trial node): day-1 checklist
+# DGX B200 trial node: day-1 checklist
 
 Date: 14 Oct 2026. For an 8x B200 Linux node with SSH or container access. Goal of day 1:
 prove the multi-GPU path on real GPUs (2 GPUs, then 8), measure tokens/s, then start the
