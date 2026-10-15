@@ -64,6 +64,16 @@ PRELUDE = (
 )
 
 FENCE_ANY = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+# A request that opens like a chat reply, or talks about tests, isn't a user message.
+REQUEST_CHATTER = re.compile(r"^(sure|here is|here's|user:|the user)|\btests?\b", re.I)
+QUOTES = "\"\u201c\u201d\u2018\u2019"
+
+
+
+class SandboxError(RuntimeError):
+    """The sandbox couldn't run code (timeout, crash, code that won't load). That says
+    nothing about the code's tests, so it must never be read as a pass or a fail."""
+
 
 # chat(messages, max_tokens) -> (text, finish_reason, completion_tokens)
 Chat = Callable[[list[dict], int], "tuple[str, str, int]"]
@@ -71,21 +81,53 @@ Chat = Callable[[list[dict], int], "tuple[str, str, int]"]
 
 def pick_kinds(seed_id: str, n: int) -> list[str]:
     """n distinct change kinds for a seed, the same on every run (no global RNG)."""
+    if n > len(CHANGE_KINDS):
+        raise ValueError(f"only {len(CHANGE_KINDS)} change kinds, asked for {n}")
     start = hashlib.sha256(seed_id.encode()).digest()[0] % len(CHANGE_KINDS)
     return [CHANGE_KINDS[(start + i) % len(CHANGE_KINDS)] for i in range(n)]
 
 
 def parse_request(text: str) -> str | None:
     """The teacher's follow-up request, or None if it isn't plain words of a sane length."""
-    t = (text or "").strip().strip('"').strip()
-    if "```" in t or not 15 <= len(t) <= 600:
+    t = (text or "").strip().strip(QUOTES).strip()
+    if "```" in t or not 15 <= len(t) <= 600 or REQUEST_CHATTER.search(t):
         return None
     return t
 
 
+def _calls(node: ast.AST, name: str) -> bool:
+    return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name
+               for n in ast.walk(node))
+
+
+def _literal(node: ast.AST) -> bool:
+    try:
+        ast.literal_eval(ast.unparse(node))
+    except (ValueError, SyntaxError):
+        return False
+    return True
+
+
+def _checks_entry(test: ast.AST, entry_point: str) -> bool:
+    """True for `call(entry) == literal` (or !=, either side) and for
+    `_raises(ExcClass, entry, ...)`: asserts that compare a result with a fixed value."""
+    if isinstance(test, ast.Compare):
+        if len(test.ops) != 1 or not isinstance(test.ops[0], (ast.Eq, ast.NotEq)):
+            return False
+        left, right = test.left, test.comparators[0]
+        return ((_calls(left, entry_point) and _literal(right))
+                or (_calls(right, entry_point) and _literal(left)))
+    if isinstance(test, ast.Call) and isinstance(test.func, ast.Name) and test.func.id == "_raises":
+        a = test.args
+        return (len(a) >= 2 and isinstance(a[0], ast.Name)
+                and isinstance(a[1], ast.Name) and a[1].id == entry_point)
+    return False
+
+
 def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
-    """Single-line assert statements that use `entry_point`, in order, without repeats.
-    Reads fenced blocks when there are any, else the whole reply."""
+    """Single-line asserts that compare a call of `entry_point` with a literal (or check
+    that it raises), in order, without repeats. Reads fenced blocks when there are any,
+    else the whole reply."""
     blocks = FENCE_ANY.findall(text or "") or [text or ""]
     out: list[str] = []
     for line in "\n".join(blocks).splitlines():
@@ -98,16 +140,35 @@ def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
             continue
         if len(body) != 1 or not isinstance(body[0], ast.Assert):
             continue
-        if not any(isinstance(n, ast.Name) and n.id == entry_point for n in ast.walk(body[0])):
+        if not _checks_entry(body[0].test, entry_point):
             continue
         out.append(s)
     return out
 
 
-def failing_on(code: str, asserts: list[str], timeout: float = 10.0) -> list[str]:
-    """The asserts that fail on `code`, one sandbox run each: an assert the previous
-    turn's code already passes doesn't test the requested change."""
-    return [a for a in asserts if run_tests(code + PRELUDE, [a], timeout=timeout).passed == 0]
+def new_asserts(code: str, asserts: list[str], kind: str, timeout: float = 10.0) -> list[str]:
+    """The asserts that test the requested change: those the previous turn's code (known
+    good) fails, in one sandbox run. An assert that fails because of a typo'd name is
+    dropped. A wrong result (AssertionError) counts only where the change is meant to
+    alter results: the edge-case kind, and `_raises` checks of the validation kind.
+    For the other kinds old calls must keep working, so a wrong result on the old code
+    means the teacher's assert contradicts it. Raises SandboxError if the run itself
+    failed, since that proves nothing about the old code."""
+    if not asserts:
+        return []
+    res = run_tests(code + PRELUDE, asserts, timeout=timeout)
+    if res.infra:
+        raise SandboxError(res.error)
+    keep = []
+    for a, err in zip(asserts, res.errors):
+        if not err or err == "NameError":
+            continue
+        if err == "AssertionError" and not (
+                kind == CHANGE_KINDS[1]
+                or (kind == CHANGE_KINDS[3] and a.startswith("assert _raises("))):
+            continue
+        keep.append(a)
+    return keep
 
 
 def _normal(code: str) -> list[str]:
@@ -121,10 +182,16 @@ def same_code(a: str, b: str) -> bool:
 
 def check_turn(code: str, new_tests: list[str], old_tests: list[str],
                timeout: float = 10.0) -> str:
-    """"ok" | "fail_regression" (an earlier turn's test breaks) | "fail_new"."""
-    if old_tests and not run_tests(code + PRELUDE, old_tests, timeout=timeout).all_passed:
+    """"ok" | "fail_regression" (an earlier turn's test breaks) | "fail_new" |
+    "sandbox_error" (the run itself failed, so there is no verdict). One sandbox run
+    over the earlier tests followed by the new ones."""
+    res = run_tests(code + PRELUDE, old_tests + new_tests, timeout=timeout)
+    if res.infra:
+        return "sandbox_error"
+    errors = res.errors
+    if any(errors[:len(old_tests)]):
         return "fail_regression"
-    if not run_tests(code + PRELUDE, new_tests, timeout=timeout).all_passed:
+    if any(errors[len(old_tests):]):
         return "fail_new"
     return "ok"
 
@@ -156,7 +223,8 @@ def run_chain(seed: dict, chat: Chat, *, max_turns: int = 3, max_new_tokens: int
               timeout: float = 10.0, min_new_tests: int = 2) -> dict:
     """Grow one seed into a chain. The record keeps every turn tried; the turns before
     the first non-ok one are the verified chain, and `stop` says why it ended ("" when
-    it reached max_turns)."""
+    it reached max_turns). Any exception from the teacher or the sandbox ends the chain
+    with stop "error:<ExceptionName>"; turns already verified stay in the record."""
     entry = seed["entry_point"]
     turns = [{"user": seed["prompt"], "assistant": seed["response"], "kind": None,
               "tests": list(seed["tests"]), "status": "ok"}]
@@ -165,36 +233,43 @@ def run_chain(seed: dict, chat: Chat, *, max_turns: int = 3, max_new_tokens: int
     code = extract_code(seed["response"], entry)
     if code is None:
         rec["stop"] = "seed_no_code"
-    for kind in pick_kinds(seed["id"], max_turns - 1) if code is not None else []:
-        text, finish, _ = chat([{"role": "system", "content": REQUEST_SYSTEM.format(kind=kind)},
-                                {"role": "user", "content": request_input(turns, code)}], 200)
-        request = parse_request(text) if finish != "length" else None
-        if request is None:
-            rec["stop"] = "request_bad"
-            break
-        text, _, _ = chat([{"role": "system", "content": TESTS_SYSTEM.format(entry=entry)},
-                           {"role": "user", "content": tests_input(request, code)}], 600)
-        new_tests = failing_on(code, parse_asserts(text, entry), timeout)
-        if len(new_tests) < min_new_tests:
-            rec["stop"] = "tests_too_few"
-            break
-        text, finish, _ = chat([{"role": "system", "content": FOLLOWUP_SYSTEM}]
-                               + conversation(turns) + [{"role": "user", "content": request}],
-                               max_new_tokens)
-        new_code = extract_code(text, entry) if finish != "length" else None
-        if finish == "length":
-            status = "answer_length"
-        elif new_code is None:
-            status = "no_code"
-        elif same_code(new_code, code):
-            status = "copy"
-        else:
-            status = check_turn(new_code, new_tests, [a for t in turns for a in t["tests"]], timeout)
-        turns.append({"user": request, "assistant": text, "kind": kind,
-                      "tests": new_tests, "status": status})
-        if status != "ok":
-            rec["stop"] = status
-            break
-        code = new_code
+    try:
+        for kind in pick_kinds(seed["id"], max_turns - 1) if code is not None else []:
+            text, finish, _ = chat([{"role": "system", "content": REQUEST_SYSTEM.format(kind=kind)},
+                                    {"role": "user", "content": request_input(turns, code)}], 200)
+            request = parse_request(text) if finish != "length" else None
+            if request is None:
+                rec["stop"] = "request_bad"
+                rec["rejected"] = {"request": text}
+                break
+            text, _, _ = chat([{"role": "system", "content": TESTS_SYSTEM.format(entry=entry)},
+                               {"role": "user", "content": tests_input(request, code)}], 600)
+            parsed = parse_asserts(text, entry)
+            new_tests = new_asserts(code, parsed, kind, timeout)
+            if len(new_tests) < min_new_tests:
+                rec["stop"] = "tests_too_few"
+                rec["rejected"] = {"request": request, "asserts": parsed}
+                break
+            text, finish, _ = chat([{"role": "system", "content": FOLLOWUP_SYSTEM}]
+                                   + conversation(turns) + [{"role": "user", "content": request}],
+                                   max_new_tokens)
+            new_code = extract_code(text, entry) if finish != "length" else None
+            if finish == "length":
+                status = "answer_length"
+            elif new_code is None:
+                status = "no_code"
+            elif same_code(new_code, code):
+                status = "copy"
+            else:
+                status = check_turn(new_code, new_tests, [a for t in turns for a in t["tests"]],
+                                    timeout)
+            turns.append({"user": request, "assistant": text, "kind": kind,
+                          "tests": new_tests, "status": status})
+            if status != "ok":
+                rec["stop"] = status
+                break
+            code = new_code
+    except Exception as e:  # a dead teacher or sandbox ends this chain, not the whole run
+        rec["stop"] = "error:" + type(e).__name__
     rec["kept_turns"] = next((i for i, t in enumerate(turns) if t["status"] != "ok"), len(turns))
     return rec
