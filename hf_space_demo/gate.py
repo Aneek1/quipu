@@ -56,7 +56,10 @@ class Gate:
             data["remoteip"] = ip
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.post(SITEVERIFY, data=data)
-        return bool(r.json().get("success"))
+        out = r.json()
+        if not out.get("success"):    # e.g. invalid-input-secret after a key rotation
+            print("turnstile check failed:", out.get("error-codes"), out.get("hostname"), flush=True)
+        return bool(out.get("success"))
 
     def issue(self) -> str:
         sid, exp = secrets.token_hex(8), int(self.now()) + PASS_SECONDS
