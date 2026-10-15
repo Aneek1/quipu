@@ -75,12 +75,17 @@ def encode(messages: list[dict]) -> list[int]:
 
 
 TAG = re.compile(r"</?[A-Za-z!][^>]*>")
+# A first line like this means the reply opened with code but no ``` fence (the model
+# often does that, then closes the fence): fence it, or `# comments` render as headings.
+CODE_START = re.compile(r"(def |class |import |from \S+ import |#|@|for |while |if |print\(|[A-Za-z_]\w*\s*=[^=])")
 
 
 def show(reply: str) -> str:
     """Markdown for the chat window that shows code as code. Text outside ``` fences that
     contains HTML tags is put in an ```html fence: rendered as-is the tags would vanish,
     and escaping them breaks inside Markdown's indented code blocks."""
+    if CODE_START.match(reply.lstrip()):
+        reply = "```python\n" + reply.lstrip("\n")
     parts = reply.split("```")
     for i in range(0, len(parts), 2):          # even pieces are outside fences
         if TAG.search(parts[i]):
@@ -96,9 +101,9 @@ def text_of(content) -> str:
     return str(content or "")
 
 
-def respond(message, history, temperature, repetition_penalty, max_new_tokens):
+def respond(message, history, temperature, repetition_penalty, max_new_tokens, use_history=False):
     msgs = []
-    for h in history or []:
+    for h in (history or []) if use_history else []:     # small models copy earlier answers
         if isinstance(h, dict) and h.get("role") in ("user", "assistant"):
             msgs.append({"role": h["role"], "content": text_of(h.get("content"))})
     msgs.append({"role": "user", "content": text_of(message)})
@@ -152,6 +157,8 @@ kwargs = dict(
         gr.Slider(0.0, 1.2, value=0.3, step=0.1, label="Temperature (0 = greedy)"),
         gr.Slider(1.0, 1.5, value=1.15, step=0.05, label="Repetition penalty (1 = off)"),
         gr.Slider(64, MAX_NEW, value=768, step=64, label=f"Max new tokens (the window is {CONTEXT:,} incl. your message)"),
+        gr.Checkbox(value=False, label="Use earlier messages in this chat (off: each message starts fresh; "
+                                       "the model tends to copy its earlier answers)"),
     ],
     cache_examples=False,
 )
