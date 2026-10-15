@@ -327,3 +327,69 @@ def test_run_chain_answer_that_hangs_is_a_fail_crash():
 def test_run_chain_rejects_a_bad_config_instead_of_failing_every_chain():
     with pytest.raises(ValueError):
         ch.run_chain(SEED, FakeTeacher(), max_turns=len(ch.CHANGE_KINDS) + 2)
+
+
+from scripts import chain_generate as cg
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def _distill_part(root: Path, n: int = 3) -> None:
+    kept, prompts = [], []
+    for i in range(n):
+        sid = f"dv2-{i:07d}"
+        kept.append({"id": sid, "split": "val" if i == 0 else "train", "entry_point": "add",
+                     "prompt": SEED["prompt"], "response": SEED["response"],
+                     "teacher": "t", "revision": "r", "teacher_tag": "q4"})
+        prompts.append({"id": sid, "tests": SEED["tests"], "entry_point": "add"})
+    prompts.append({"id": "dv2-9999999", "tests": [], "entry_point": "add"})   # not kept
+    _write_jsonl(root / "kept" / "part-0000.jsonl", kept)
+    _write_jsonl(root / "prompts" / "part-0000.jsonl", prompts)
+
+
+def test_load_seeds_joins_tests_by_id_and_filters_split(tmp_path):
+    _distill_part(tmp_path)
+    seeds = cg.load_seeds(tmp_path, 0)
+    assert [s["id"] for s in seeds] == ["dv2-0000000", "dv2-0000001", "dv2-0000002"]
+    assert seeds[1]["tests"] == SEED["tests"]
+    assert [s["id"] for s in cg.load_seeds(tmp_path, 0, split="val")] == ["dv2-0000000"]
+
+
+def test_run_part_writes_resumes_and_pauses(tmp_path):
+    _distill_part(tmp_path / "distill")
+    seeds = cg.load_seeds(tmp_path / "distill", 0)
+    out = tmp_path / "chains" / "gen" / "part-0000.q4.jsonl"
+    meta = {"teacher": "t", "revision": "r", "teacher_tag": "q4"}
+    pause = tmp_path / "chains" / "PAUSE"
+    st = cg.run_part(seeds[:2], out, FakeTeacher(), concurrency=2, pause=pause, meta=meta, max_turns=2)
+    assert st == "done"
+    rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert sorted(r["id"] for r in rows) == ["ch-dv2-0000000", "ch-dv2-0000001"]
+    assert rows[0]["teacher_tag"] == "q4" and rows[0]["kept_turns"] == 2
+    t = FakeTeacher()
+    assert cg.run_part(seeds, out, t, concurrency=2, pause=pause, meta=meta, max_turns=2) == "done"
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 3      # only the new seed ran
+    assert len(t.calls) == 3                                           # 3 calls for one chain
+    pause.parent.mkdir(parents=True, exist_ok=True)
+    pause.write_text("")
+    fresh = tmp_path / "chains" / "gen" / "part-0001.q4.jsonl"
+    assert cg.run_part(seeds, fresh, FakeTeacher(), concurrency=2, pause=pause, meta=meta) == "paused"
+    assert not fresh.exists() or fresh.read_text(encoding="utf-8") == ""
+
+
+def test_run_part_does_not_write_transient_failures_and_a_rerun_retries(tmp_path):
+    _distill_part(tmp_path / "distill", n=1)
+    seeds = cg.load_seeds(tmp_path / "distill", 0)
+    out = tmp_path / "chains" / "gen" / "part-0000.q4.jsonl"
+    meta = {"teacher": "t", "revision": "r", "teacher_tag": "q4"}
+    pause = tmp_path / "chains" / "PAUSE"
+    st = cg.run_part(seeds, out, _AnswerRaises(), concurrency=1, pause=pause, meta=meta, max_turns=2)
+    assert st == "incomplete"
+    assert out.read_text(encoding="utf-8") == ""                       # error record not written
+    assert cg.run_part(seeds, out, FakeTeacher(), concurrency=1, pause=pause, meta=meta,
+                       max_turns=2) == "done"
+    rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
+    assert [r["id"] for r in rows] == ["ch-dv2-0000000"] and rows[0]["kept_turns"] == 2
