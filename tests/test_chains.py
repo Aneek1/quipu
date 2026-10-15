@@ -427,18 +427,31 @@ def test_run_part_writes_a_permanent_failure_with_its_verified_turns(tmp_path):
     assert rec["stop"] == "error:PermanentRequestError" and rec["kept_turns"] == 1
 
 
-def test_run_part_retry_ledger_stops_retrying_after_max_attempts(tmp_path):
+_CRASH_CODE = "def add(a, b):\n    return a + b\nimport os\nos._exit(3)\n"
+_CRASH_SEED = {**SEED, "response": "```python\n" + _CRASH_CODE + "```"}
+
+
+def test_run_part_retry_ledger_stops_retrying_a_deterministic_failure(tmp_path):
     out = tmp_path / "gen" / "p.jsonl"
     kw = dict(concurrency=1, pause=tmp_path / "PAUSE", meta=_META, max_turns=2, max_attempts=2)
     for _ in range(2):
-        assert cg.run_part(_seeds(1), out, _AnswerRaises(), **kw) == "incomplete"
+        assert cg.run_part([_CRASH_SEED], out, FakeTeacher(), **kw) == "incomplete"
         assert out.read_text(encoding="utf-8") == ""
     ledger = [json.loads(l) for l in
               Path(str(out) + ".failures.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert ledger == [{"id": "ch-dv2-0000000", "stop": "error:ConnectionError"}] * 2
-    assert cg.run_part(_seeds(1), out, _AnswerRaises(), **kw) == "done"      # written as-is
+    assert ledger == [{"id": "ch-dv2-0000007", "stop": "error:SandboxError"}] * 2
+    assert cg.run_part([_CRASH_SEED], out, FakeTeacher(), **kw) == "done"      # written as-is
     rec = json.loads(out.read_text(encoding="utf-8"))
-    assert rec["stop"] == "error:ConnectionError" and rec["kept_turns"] == 1
+    assert rec["stop"] == "error:SandboxError" and rec["kept_turns"] == 1
+
+
+def test_run_part_connection_failures_never_use_up_attempts(tmp_path):
+    out = tmp_path / "gen" / "p.jsonl"
+    kw = dict(concurrency=1, pause=tmp_path / "PAUSE", meta=_META, max_turns=2, max_attempts=2)
+    for _ in range(4):                                  # a dead server, restarted 4 times
+        assert cg.run_part(_seeds(2), out, _AnswerRaises(), **kw) == "incomplete"
+        assert out.read_text(encoding="utf-8") == ""
+    assert not Path(str(out) + ".failures.jsonl").read_text(encoding="utf-8")
 
 
 def test_run_part_stops_on_a_failure_streak(tmp_path):
@@ -461,14 +474,14 @@ def test_run_part_records_settings_and_refuses_a_mismatched_resume(tmp_path):
     assert out.read_text(encoding="utf-8") == before
 
 
-def test_make_messages_chat_turns_a_4xx_into_a_permanent_error():
+def _serve(status: int, body: bytes):
     import http.server
     import threading
 
     class H(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
-            body = b'{"error": "context length exceeded"}'
-            self.send_response(400)
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -478,10 +491,53 @@ def test_make_messages_chat_turns_a_4xx_into_a_permanent_error():
 
     srv = http.server.HTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _chat_error(status: int, body: bytes):
+    srv = _serve(status, body)
     try:
         chat = cg.make_messages_chat(f"http://127.0.0.1:{srv.server_port}", retries=3, backoff=0.0)
-        with pytest.raises(cg.PermanentRequestError, match="400.*context length"):
+        with pytest.raises(RuntimeError) as e:
             chat([{"role": "user", "content": "hi"}], 10)
+        return e.value
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_make_messages_chat_only_a_context_overflow_400_is_permanent():
+    e = _chat_error(400, b'{"error": "This model: Maximum Context Length is 4096 tokens"}')
+    assert type(e) is cg.PermanentRequestError and "400" in str(e)
+    for status, body in ((400, b'{"error": "bad json"}'), (401, b"no"), (403, b"no"),
+                         (404, b'{"error": "model does not exist"}')):
+        assert type(_chat_error(status, body)) is cg.FatalRequestError, status
+
+
+class _AnswerFatal(FakeTeacher):
+    def __call__(self, messages, max_tokens):
+        self.calls.append(messages)
+        raise cg.FatalRequestError("HTTP 404: model does not exist")
+
+
+def test_run_part_a_fatal_request_error_writes_nothing_and_stops(tmp_path):
+    out = tmp_path / "gen" / "p.jsonl"
+    t = _AnswerFatal()
+    st = cg.run_part(_seeds(30), out, t, concurrency=1, pause=tmp_path / "PAUSE", meta=_META)
+    assert st == "error" and len(t.calls) == 1
+    assert out.read_text(encoding="utf-8") == ""
+
+
+def test_run_part_permanent_records_do_not_reset_the_failure_streak(tmp_path):
+    class Mixed(FakeTeacher):
+        n = 0
+
+        def __call__(self, messages, max_tokens):
+            Mixed.n += 1
+            if Mixed.n % 2:                            # every other call is a dead connection
+                raise ConnectionError("down")
+            raise cg.PermanentRequestError("HTTP 400: context")
+
+    out = tmp_path / "gen" / "p.jsonl"
+    st = cg.run_part(_seeds(200), out, Mixed(), concurrency=1, pause=tmp_path / "PAUSE", meta=_META)
+    assert st == "error" and Mixed.n < 200

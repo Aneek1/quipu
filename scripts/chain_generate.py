@@ -51,8 +51,24 @@ def load_seeds(distill_root: Path, part: int, split: str = "all") -> list[dict]:
 
 
 class PermanentRequestError(RuntimeError):
-    """The server rejected the request itself (HTTP 4xx, e.g. context overflow).
-    Retrying cannot help, so such a chain is recorded rather than retried."""
+    """The server rejected this one request because it is too long (HTTP 400, context
+    overflow). It would fail the same way every time, so the chain is recorded."""
+
+
+class FatalRequestError(RuntimeError):
+    """The server rejected the request for a reason that affects every request (wrong
+    endpoint or model, bad credentials: 401/403/404, or any other non-retryable 4xx).
+    The whole run stops; nothing is written."""
+
+
+OVERFLOW_WORDS = ("context", "exceed", "maximum context length", "too long")
+
+# Stops caused by the connection, not the seed: never written, never counted against
+# --max-attempts; only the failure streak ends a run that keeps hitting them.
+CONNECTION_STOPS = frozenset("error:" + n for n in (
+    "URLError", "HTTPError", "TimeoutError", "ConnectionError", "RemoteDisconnected",
+    "ConnectionResetError", "ConnectionRefusedError", "ConnectionAbortedError", "OSError",
+    "IncompleteRead", "BadStatusLine", "JSONDecodeError"))
 
 
 SETTINGS = ("max_turns", "min_new_tests", "max_new_tokens", "timeout")
@@ -62,12 +78,18 @@ SETTING_DEFAULTS = {k: v.default for k, v in inspect.signature(run_chain).parame
 
 def _transient(rec: dict) -> bool:
     """A chain that ended on a teacher/sandbox exception says nothing about the seed,
-    so it is not recorded: a rerun retries it. A rejected request (PermanentRequestError)
+    so it is not recorded: a rerun retries it. A too-long request (PermanentRequestError)
     would fail the same way every time, so that record is kept."""
     stop = rec.get("stop", "")
     if stop == "error:PermanentRequestError":
         return False
     return stop.startswith("error:") or stop == "sandbox_error"
+
+
+def _counts_as_attempt(rec: dict) -> bool:
+    """Transient failures that repeat for the same seed (a sandbox crash) use up
+    --max-attempts; connection trouble does not."""
+    return rec["stop"] not in CONNECTION_STOPS
 
 
 def _attempts(ledger: Path) -> dict[str, int]:
@@ -120,7 +142,7 @@ def run_part(seeds: list[dict], out: Path, chat: Chat, *, concurrency: int, paus
     todo = iter(pending)
     failed = written = streak = 0
     max_streak = max(20, 2 * concurrency)
-    stop, running = "", set()
+    stop, running, fatal = "", set(), False
     t0 = time.monotonic()
     with open(out, "a", encoding="utf-8", newline="\n") as f, \
             open(ledger, "a", encoding="utf-8", newline="\n") as lf, \
@@ -146,16 +168,25 @@ def run_part(seeds: list[dict], out: Path, chat: Chat, *, concurrency: int, paus
                         print(f"chain failed: {fut.exception()!r}", flush=True)
                     continue
                 rec = fut.result()
-                if _transient(rec) and attempts.get(rec["id"], 0) < max_attempts:
+                if rec["stop"] == "error:FatalRequestError":
+                    print(f"fatal: {rec['stop']} on {rec['id']}; check --endpoint and the server",
+                          flush=True)
+                    fatal = True
+                    stop = "error"
+                    continue
+                if _transient(rec) and (not _counts_as_attempt(rec)
+                                        or attempts.get(rec["id"], 0) < max_attempts):
                     failed += 1
                     streak += 1
-                    attempts[rec["id"]] = attempts.get(rec["id"], 0) + 1
-                    lf.write(json.dumps({"id": rec["id"], "stop": rec["stop"]}) + "\n")
-                    lf.flush()
+                    if _counts_as_attempt(rec):
+                        attempts[rec["id"]] = attempts.get(rec["id"], 0) + 1
+                        lf.write(json.dumps({"id": rec["id"], "stop": rec["stop"]}) + "\n")
+                        lf.flush()
                     if failed <= SHOW_FAILURES:
                         print(f"chain {rec['id']} not written: {rec['stop']}", flush=True)
                     continue
-                streak = 0
+                if not rec["stop"].startswith("error:"):
+                    streak = 0              # only clean records show the server is healthy
                 f.write(json.dumps(rec | meta | settings, ensure_ascii=True) + "\n")
                 f.flush()
                 written += 1
@@ -193,12 +224,15 @@ def make_messages_chat(endpoint: str, model: str = "teacher", timeout: float = 6
                         int(d.get("usage", {}).get("completion_tokens", 0)))
             except urllib.error.HTTPError as e:
                 try:
-                    detail = e.read(200).decode("utf-8", "replace")
+                    detail = e.read(1000).decode("utf-8", "replace")
                 except Exception:
                     detail = ""
                 e.close()
                 if e.code < 500 and e.code not in (408, 429):
-                    raise PermanentRequestError(f"HTTP {e.code}: {detail}") from e
+                    msg = f"HTTP {e.code}: {detail}"
+                    if e.code == 400 and any(w in detail.lower() for w in OVERFLOW_WORDS):
+                        raise PermanentRequestError(msg) from e
+                    raise FatalRequestError(msg) from e
                 if attempt == retries - 1:
                     raise
             except (urllib.error.URLError, TimeoutError, ConnectionError,
