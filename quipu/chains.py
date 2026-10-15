@@ -1,0 +1,104 @@
+"""Verified multi-turn code chains.
+
+Spec: docs/superpowers/specs/2026-10-15-multiturn-verified-chat-design.md, section A.
+
+A chain starts from a solved distill v2 problem (turn 1: the problem and the teacher's
+answer that passed its tests) and adds follow-up turns. For each follow-up the teacher,
+in three separate calls: writes a change request of a named, backward-compatible kind;
+writes asserts for that change seeing only the request and the current code (never an
+answer); then answers with the whole conversation in view. A turn is kept only if its
+code passes the new asserts and every earlier turn's asserts.
+
+The instruction strings below describe each task to the teacher. They are not training
+text: training data is the requests and answers the teacher writes."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import re
+from typing import Callable
+
+from quipu.sandbox import extract_code, run_tests
+
+CHANGE_KINDS = (
+    "add an optional parameter whose default keeps the current behaviour",
+    "handle an input or edge case the current code does not handle yet, without "
+    "changing the results for inputs it already handles",
+    "return extra information, but only when a new optional flag asks for it",
+    "validate the input and raise ValueError with a clear message for invalid input, "
+    "without changing the results for valid input",
+)
+
+REQUEST_SYSTEM = (
+    "You write the next message a user sends after receiving the Python code below. "
+    "The message asks for exactly one change of this kind: {kind}. Every call that "
+    "worked before must still give the same result. Write it as the user, in one to "
+    "three plain sentences. No code, no tests, and don't mention tests or backward "
+    "compatibility."
+)
+
+TESTS_SYSTEM = (
+    "You write unit tests for a requested change to a Python function named {entry}. "
+    "Reply with one ```python block containing only 3 to 6 assert statements, one per "
+    "line, each calling {entry} with literal arguments and comparing with a literal "
+    "expected value. Test only the new behaviour the request describes. To check that "
+    "a call raises an error, write: assert _raises(ValueError, {entry}, arg1, arg2)"
+)
+
+FOLLOWUP_SYSTEM = (
+    "When the user asks for a change to code from earlier in the conversation, say in "
+    "one or two sentences what changes, then give the complete updated function in one "
+    "```python block, keeping its name. Be direct, don't repeat yourself, no filler."
+)
+
+# Appended to the code under test so `assert _raises(...)` lines can run.
+PRELUDE = (
+    "\n\ndef _raises(exc, fn, *args, **kwargs):\n"
+    "    try:\n"
+    "        fn(*args, **kwargs)\n"
+    "    except exc:\n"
+    "        return True\n"
+    "    except Exception:\n"
+    "        return False\n"
+    "    return False\n"
+)
+
+FENCE_ANY = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+
+# chat(messages, max_tokens) -> (text, finish_reason, completion_tokens)
+Chat = Callable[[list[dict], int], "tuple[str, str, int]"]
+
+
+def pick_kinds(seed_id: str, n: int) -> list[str]:
+    """n distinct change kinds for a seed, the same on every run (no global RNG)."""
+    start = hashlib.sha256(seed_id.encode()).digest()[0] % len(CHANGE_KINDS)
+    return [CHANGE_KINDS[(start + i) % len(CHANGE_KINDS)] for i in range(n)]
+
+
+def parse_request(text: str) -> str | None:
+    """The teacher's follow-up request, or None if it isn't plain words of a sane length."""
+    t = (text or "").strip().strip('"').strip()
+    if "```" in t or not 15 <= len(t) <= 600:
+        return None
+    return t
+
+
+def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
+    """Single-line assert statements that use `entry_point`, in order, without repeats.
+    Reads fenced blocks when there are any, else the whole reply."""
+    blocks = FENCE_ANY.findall(text or "") or [text or ""]
+    out: list[str] = []
+    for line in "\n".join(blocks).splitlines():
+        s = line.strip()
+        if not s.startswith("assert ") or len(s) > max_len or s in out:
+            continue
+        try:
+            body = ast.parse(s).body
+        except SyntaxError:
+            continue
+        if len(body) != 1 or not isinstance(body[0], ast.Assert):
+            continue
+        if not any(isinstance(n, ast.Name) and n.id == entry_point for n in ast.walk(body[0])):
+            continue
+        out.append(s)
+    return out
