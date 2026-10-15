@@ -34,6 +34,18 @@ def test_parse_request_accepts_plain_words_only():
     assert ch.parse_request("REQUEST: " + "x" * 601) is None                        # too long
 
 
+def test_parse_request_takes_only_the_first_paragraph_and_nothing_after_it():
+    ok = "Let add take an optional third number c."
+    assert ch.parse_request("REQUEST: " + ok + "\n\n") == ok               # trailing blanks are fine
+    assert ch.parse_request("REQUEST: " + ok + "\n\nI have updated add to take c.") is None
+    assert ch.parse_request("REQUEST: " + ok + "\nx = s.lower() if c else s") is None   # ` = `
+    assert ch.parse_request("REQUEST: Let add take a third number c, like this:") is None
+    assert ch.parse_request("REQUEST: " + ok + "\nREQUEST: Let add also take d.") is None
+    assert ch.parse_request("REQUEST: <" + ok + ">") == ok                   # one <...> pair
+    assert ch.parse_request("REQUEST: <Let add take c.> and then <more>") is None   # not a pair
+    assert ch.parse_request("REQUEST: <" + ok + "\n\nSure, here you go.>") is None
+
+
 def test_parse_request_rejects_code():
     assert ch.parse_request("REQUEST: Sure:\n```python\ndef f(): pass\n```") is None
     assert ch.parse_request("REQUEST: Let add take a third number.\n"
@@ -74,6 +86,8 @@ def test_parse_asserts_keeps_single_line_asserts_about_the_function():
 
 def test_parse_asserts_rejects_weak_or_misleading_asserts():
     text = (
+        "assert add(1, 2, 3)\n"                          # bare truthy: old code may pass it too
+        "assert not add(1, 2, 3)\n"
         "assert isinstance(add(1, 2, 3), int)\n"         # type check only
         "assert True, add(1, 2)\n"                       # name only in the message
         "assert add(1, 2, 3) > 5\n"                      # not Eq/NotEq
@@ -108,24 +122,17 @@ def test_parse_asserts_rejects_weak_or_misleading_asserts():
     ]
 
 
-def test_parse_asserts_turns_predicate_asserts_into_comparisons():
+def test_parse_asserts_wants_predicates_compared_with_true_or_false_explicitly():
+    # A bare `assert f(x)` also passes on a truthy non-True result (first_word returns
+    # 'hello'), so it would look like a new requirement; it is not rewritten, it is dropped.
     text = (
         "assert is_ok(1)\n"
         "assert not is_ok('')\n"
-        "assert  not  is_ok( 'a b' )\n"
-        "assert is_ok(2) == True\n"                      # already explicit: kept as is
-        "assert is_ok(1)\n"                              # duplicate after normalising
-        "assert is_ok(3), 'with a message'\n"
-        "assert not len('a')\n"                          # not about is_ok
-        "assert not is_ok(4) == True\n"                  # not applies to the comparison: skip
+        "assert is_ok(2) == True\n"
+        "assert is_ok('') == False\n"
+        "assert not is_ok(4) == True\n"
     )
-    assert ch.parse_asserts(text, "is_ok") == [
-        "assert is_ok(1) == True",
-        "assert is_ok('') == False",
-        "assert is_ok( 'a b' ) == False",
-        "assert is_ok(2) == True",
-        "assert is_ok(3) == True",
-    ]
+    assert ch.parse_asserts(text, "is_ok") == ["assert is_ok(2) == True", "assert is_ok('') == False"]
 
 
 def test_parse_asserts_survives_a_malformed_literal():
@@ -269,16 +276,17 @@ def test_the_teacher_instructions_state_the_task_and_the_output_format():
     assert kind in req_sys and kind in req_user
     assert "Do not write any code" in req_user
     for text in (tests_sys, tests_user):
-        assert "exactly 5" in text and "different inputs" in text
+        assert "exactly 5" in text and "different inputs" in text and "==" in text
     assert OLD.strip() in req_user and OLD.strip() in tests_user
 
 
-def test_prompt_version_is_a_short_hash_of_the_instructions():
+def test_prompt_version_is_a_short_hash_of_the_module_source():
     import hashlib
+    import inspect
     assert len(ch.PROMPT_VERSION) == 12 and int(ch.PROMPT_VERSION, 16) >= 0
-    parts = (ch.REQUEST_SYSTEM, ch.REQUEST_USER, ch.TESTS_SYSTEM, ch.TESTS_USER,
-             ch.FOLLOWUP_SYSTEM, *ch.CHANGE_KINDS)
-    assert ch.PROMPT_VERSION == hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:12]
+    # The whole module: prompts, parsers, filters and token limits all shape the data.
+    source = inspect.getsource(ch).replace("\r\n", "\n")
+    assert ch.PROMPT_VERSION == hashlib.sha256(source.encode()).hexdigest()[:12]
 
 
 def test_run_chain_keeps_a_good_second_turn():

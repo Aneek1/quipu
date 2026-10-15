@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import re
+import sys
 from typing import Callable
 
 from quipu.sandbox import extract_code, run_tests
@@ -53,7 +55,8 @@ TESTS_SYSTEM = (
     "You write unit tests for a requested change to a Python function named {entry}. "
     "Reply with one ```python block containing exactly 5 assert statements, one per "
     "line, covering different inputs. Each calls {entry} with literal arguments and "
-    "compares the result with a literal expected value (True and False are literals). "
+    "compares the result with a literal expected value using ==, also when the "
+    "expected value is True or False (never a bare assert of the call). "
     "Every assert must use the new behaviour the request describes: call {entry} with "
     "the new argument, flag or input, so that the current code, which lacks it, gives a "
     "different result or an error. Don't write asserts for what the current code "
@@ -66,7 +69,7 @@ TESTS_USER = (
     "Write exactly 5 assert statements for the requested change, one per line, in one "
     "```python block, covering different inputs. Each calls {entry} with literal "
     "arguments, uses the new behaviour (the current code must fail it), and compares the "
-    "result with a literal expected value."
+    "result with a literal expected value using ==, also for True or False."
 )
 
 FOLLOWUP_SYSTEM = (
@@ -75,10 +78,12 @@ FOLLOWUP_SYSTEM = (
     "```python block, keeping its name. Be direct, don't repeat yourself, no filler."
 )
 
-# Names the instruction texts above, so outputs made with different wording can't be mixed.
-PROMPT_VERSION = hashlib.sha256("\x00".join(
-    (REQUEST_SYSTEM, REQUEST_USER, TESTS_SYSTEM, TESTS_USER, FOLLOWUP_SYSTEM, *CHANGE_KINDS)
-).encode()).hexdigest()[:12]
+# Names this whole module: instructions, parsers, filters and token limits all shape the
+# chains, so outputs made with any other version must not be mixed. Any edit to this file
+# changes the version, by design. Line endings are normalised so a checkout on another
+# platform gets the same one.
+PROMPT_VERSION = hashlib.sha256(
+    inspect.getsource(sys.modules[__name__]).replace("\r\n", "\n").encode()).hexdigest()[:12]
 
 # Appended to the code under test so `assert _raises(...)` lines can run.
 PRELUDE = (
@@ -120,14 +125,24 @@ def pick_kinds(seed_id: str, n: int) -> list[str]:
 
 
 def parse_request(text: str) -> str | None:
-    """The follow-up request: the plain words after the first "REQUEST:", or None when
-    the marker is missing or the words aren't a sane length, contain code, or read like
-    chat."""
-    head, marker, rest = (text or "").partition("REQUEST:")
-    if not marker:
+    """The follow-up request: the first paragraph after the first "REQUEST:" (one pair
+    of <...> around it is removed), or None when the marker is missing or repeated, text
+    follows that paragraph, or the words aren't a sane length, contain code, or read
+    like chat."""
+    _, marker, rest = (text or "").partition("REQUEST:")
+    if not marker or "REQUEST:" in rest:
         return None
-    t = rest.strip().strip(QUOTES).strip()
+    paragraphs = re.split(r"\n\s*\n", rest.strip())
+    if len(paragraphs) > 1:          # anything after the request is the assistant talking on
+        return None
+    t = paragraphs[0].strip().strip(QUOTES).strip()
+    if t.startswith("<"):            # the format placeholder copied with its brackets
+        if not (t.endswith(">") and t.count("<") == 1 and t.count(">") == 1):
+            return None
+        t = t[1:-1].strip().strip(QUOTES).strip()
     if "```" in t or CODE_LINE.search(t) or not 15 <= len(t) <= 600 or REQUEST_CHATTER.search(t):
+        return None
+    if any(" = " in line or line.rstrip().endswith(":") for line in t.splitlines()):
         return None
     return t
 
@@ -192,8 +207,7 @@ def is_raises_check(assert_line: str) -> bool:
 
 def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
     """Single-line asserts that compare a call of `entry_point` with a literal (or check
-    that it raises), in order, without repeats. A bare predicate call is rewritten to
-    an explicit comparison with True or False. Reads fenced blocks when there are any,
+    that it raises), in order, without repeats. Reads fenced blocks when there are any,
     else the whole reply."""
     blocks = FENCE_ANY.findall(text or "") or [text or ""]
     out: list[str] = []
@@ -207,14 +221,7 @@ def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
             continue
         if len(body) != 1 or not isinstance(body[0], ast.Assert):
             continue
-        test = body[0].test
-        # A predicate called bare, `assert f(x)` / `assert not f(x)`, says what f returns.
-        if _is_call_of(test, entry_point):
-            s = f"assert {ast.get_source_segment(s, test)} == True"
-        elif (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
-              and _is_call_of(test.operand, entry_point)):
-            s = f"assert {ast.get_source_segment(s, test.operand)} == False"
-        if s in out or not _checks_entry(ast.parse(s).body[0].test, entry_point):
+        if s in out or not _checks_entry(body[0].test, entry_point):
             continue
         out.append(s)
     return out
