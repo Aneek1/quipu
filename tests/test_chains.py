@@ -541,3 +541,44 @@ def test_run_part_permanent_records_do_not_reset_the_failure_streak(tmp_path):
     out = tmp_path / "gen" / "p.jsonl"
     st = cg.run_part(_seeds(200), out, Mixed(), concurrency=1, pause=tmp_path / "PAUSE", meta=_META)
     assert st == "error" and Mixed.n < 200
+
+
+from scripts import chain_verify as cv
+
+
+def test_verify_rechecks_turns_and_writes_chat_messages(tmp_path):
+    good = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4", "max_turns": 2}
+    lying = json.loads(json.dumps(good))                    # says ok, but its code is broken
+    lying["id"], lying["seed_id"] = "ch-dv2-0000008", "dv2-0000008"
+    lying["turns"][1]["assistant"] = "```python\ndef add(a, b, c=0):\n    return 0\n```"
+    short = ch.run_chain(SEED | {"id": "dv2-0000009"},
+                         FakeTeacher(answer="```python\n" + OLD + "```"), max_turns=2) | {"teacher_tag": "q4"}
+    _write_jsonl(tmp_path / "gen" / "part-0000.q4.jsonl", [good, lying, short])
+
+    summary = cv.verify(tmp_path, workers=2)
+
+    kept = [json.loads(l) for l in (tmp_path / "kept" / "part-0000.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [k["id"] for k in kept] == ["ch-dv2-0000007"]
+    assert [m["role"] for m in kept[0]["messages"]] == ["user", "assistant", "user", "assistant"]
+    assert kept[0]["turns"] == 2 and kept[0]["max_turns"] == 2
+    assert summary["chains"] == 3 and summary["kept"] == 1
+    assert summary["recheck_failed"] == 1                   # the lying chain
+    assert summary["recheck_sandbox_error"] == 0
+    assert summary["stop"]["copy"] == 1
+    assert json.loads((tmp_path / "verify_summary.json").read_text(encoding="utf-8")) == summary
+
+
+def test_verify_counts_sandbox_errors_apart_from_real_failures(tmp_path, monkeypatch):
+    good = ch.run_chain(SEED, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    marked = ch.run_chain(SEED | {"id": "dv2-0000008"}, FakeTeacher(), max_turns=2) | {"teacher_tag": "q4"}
+    marked["turns"][1]["assistant"] = "```python\n# MARK\n" + NEW + "```"
+    _write_jsonl(tmp_path / "gen" / "part-0000.q4.jsonl", [good, marked])
+    real = cv.check_turn
+
+    def flaky(code, new_tests, old_tests, timeout):
+        return "sandbox_error" if "MARK" in code else real(code, new_tests, old_tests, timeout)
+
+    monkeypatch.setattr(cv, "check_turn", flaky)
+    summary = cv.verify(tmp_path, workers=1)
+    assert summary["chains"] == 2 and summary["kept"] == 1
+    assert summary["recheck_sandbox_error"] == 1 and summary["recheck_failed"] == 0
