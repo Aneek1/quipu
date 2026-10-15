@@ -7,7 +7,11 @@ scales to zero when idle.
 The model weights are baked into the image at build time, and the container's memory is
 snapshotted after the model has loaded (enable_memory_snapshot): a cold start restores
 that snapshot instead of importing torch and reading 4 GB of weights again. One
-container at most: Gradio needs sticky sessions."""
+container at most: Gradio needs sticky sessions.
+
+Cloudflare Turnstile guards every path (gate.py). Its keys come from the Modal secret
+"turnstile" (TURNSTILE_SITE_KEY, TURNSTILE_SECRET_KEY), which the owner creates."""
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +35,7 @@ image = (
     .env({"QUIPU_REPO": MODEL_DIR})
     .add_local_file(HERE / "app.py", "/root/app.py")
     .add_local_file(HERE / "kv_generate.py", "/root/kv_generate.py")
+    .add_local_file(HERE / "gate.py", "/root/gate.py")
 )
 
 app = modal.App("quipu-chat", image=image)
@@ -43,13 +48,16 @@ with image.imports():
     from fastapi import FastAPI
 
     import app as chat
+    import gate
 
 
 @app.function(cpu=4.0, memory=8192, max_containers=1, scaledown_window=600, timeout=600,
-              enable_memory_snapshot=True)
+              enable_memory_snapshot=True, secrets=[modal.Secret.from_name("turnstile")])
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app()
 def ui():
     chat.torch.set_num_threads(chat.usable_cpus())   # thread pools are not restored from a snapshot
     chat.demo.queue(default_concurrency_limit=1)
-    return gr.mount_gradio_app(FastAPI(), chat.demo, path="/")
+    web = FastAPI()
+    gate.Gate(os.environ["TURNSTILE_SITE_KEY"], os.environ["TURNSTILE_SECRET_KEY"]).install(web)
+    return gr.mount_gradio_app(web, chat.demo, path="/")
