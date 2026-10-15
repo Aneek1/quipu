@@ -1,6 +1,6 @@
 # Multi-turn, verified chat data: building small things step by step (design)
 
-Date: 15 Oct 2026. Status: draft, awaiting the owner's review.
+Date: 15 Oct 2026. Status: approved by the owner on 15 Oct (answers at the end).
 
 ## Goal
 
@@ -102,7 +102,7 @@ Held out by seed problem (no seed appears in both train and eval):
 | Smoke run: 200 chains through the whole loop | Laptop, 4-bit teacher via llama-server (as distill v2) | free |
 | Generation (target ~20k verified Python chains, ~1k pages) | Kaggle 2x T4 with vLLM in fp16 (30 GPU-hours a week, free); laptop overnight as backup | free; the smoke run measures chains per hour, and the target is cut to fit two weeks of Kaggle quota |
 | Verification | Laptop CPU | free |
-| Fine-tune at 4,096 tokens | Modal (L40S or B200), November credit | ~$3-6 |
+| Fine-tune at 4,096 tokens | **Kaggle 2x T4** (owner, 15 Oct), fp16 with loss scaling; Modal only as a fallback if fp16 proves unstable | free (fallback ~$3-6 of Modal credit) |
 
 **Budget clash for November (needs the owner's call):** November's ~$27 of Modal credit
 was planned for the 3.5-hour B200 continued-pretraining run (~$24). This fine-tune
@@ -139,9 +139,12 @@ Kaggle or Modal time.
 - Whole apps in one turn; multi-file projects beyond what stepbuild covers.
 - Any Claude-written training text.
 
-## Open questions for the owner
+## Answered (15 Oct)
 
-1. November budget: option 1, 2 or 3 above?
-2. Kaggle: the account needs phone verification for GPUs; is it set up?
-3. Is ~20k Python chains plus ~1k pages the right first size, or start smaller
-   (5k) and look at results first?
+1. November budget: **option 3**, the fine-tune runs on Kaggle; Modal's November credit
+   stays for the B200 continued-pretraining run. Before the real fine-tune, a short
+   fp16 run on Kaggle must match a bf16 run of the same steps (loss within 1%, no
+   inf/NaN, router balance unchanged); if not, the fine-tune falls back to Modal.
+2. Kaggle: the owner's account is verified for GPUs.
+3. Size (owner didn't pick; Claude's default): 200-chain laptop smoke run, then 5k
+   chains, look at the results, then 20k.
