@@ -42,3 +42,32 @@ def test_parse_asserts_keeps_single_line_asserts_about_the_function():
 
 def test_parse_asserts_reads_unfenced_replies():
     assert ch.parse_asserts("assert add(2, 2) == 4", "add") == ["assert add(2, 2) == 4"]
+
+
+OLD = "def add(a, b):\n    return a + b\n"
+NEW = "def add(a, b, c=0):\n    return a + b + c\n"
+
+
+def test_failing_on_keeps_only_asserts_the_old_code_fails():
+    asserts = ["assert add(1, 2, 3) == 6", "assert add(1, 2) == 3", "assert add(0, 0, 5) == 5"]
+    assert ch.failing_on(OLD, asserts) == ["assert add(1, 2, 3) == 6", "assert add(0, 0, 5) == 5"]
+
+
+def test_failing_on_supports_raises_checks():
+    old = "def half(x):\n    return x / 2\n"
+    assert ch.failing_on(old, ["assert _raises(ValueError, half, 'a')"]) == \
+        ["assert _raises(ValueError, half, 'a')"]       # old code raises TypeError, not ValueError
+
+
+def test_same_code_ignores_blank_lines_and_trailing_spaces():
+    assert ch.same_code("def f():\n\n    return 1   \n", "def f():\n    return 1")
+    assert not ch.same_code(OLD, NEW)
+
+
+def test_check_turn_tells_regressions_from_new_failures():
+    new_tests = ["assert add(1, 2, 3) == 6"]
+    old_tests = ["assert add(1, 2) == 3"]
+    assert ch.check_turn(NEW, new_tests, old_tests) == "ok"
+    assert ch.check_turn(OLD, new_tests, old_tests) == "fail_new"
+    broken = "def add(a, b, c=0):\n    return a + b + c if c else 0\n"
+    assert ch.check_turn(broken, new_tests, old_tests) == "fail_regression"

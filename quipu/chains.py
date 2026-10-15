@@ -102,3 +102,28 @@ def parse_asserts(text: str, entry_point: str, max_len: int = 300) -> list[str]:
             continue
         out.append(s)
     return out
+
+
+def failing_on(code: str, asserts: list[str], timeout: float = 10.0) -> list[str]:
+    """The asserts that fail on `code`, one sandbox run each: an assert the previous
+    turn's code already passes doesn't test the requested change."""
+    return [a for a in asserts if run_tests(code + PRELUDE, [a], timeout=timeout).passed == 0]
+
+
+def _normal(code: str) -> list[str]:
+    return [line.rstrip() for line in code.splitlines() if line.strip()]
+
+
+def same_code(a: str, b: str) -> bool:
+    """True when two pieces of code differ only in blank lines and trailing spaces."""
+    return _normal(a) == _normal(b)
+
+
+def check_turn(code: str, new_tests: list[str], old_tests: list[str],
+               timeout: float = 10.0) -> str:
+    """"ok" | "fail_regression" (an earlier turn's test breaks) | "fail_new"."""
+    if old_tests and not run_tests(code + PRELUDE, old_tests, timeout=timeout).all_passed:
+        return "fail_regression"
+    if not run_tests(code + PRELUDE, new_tests, timeout=timeout).all_passed:
+        return "fail_new"
+    return "ok"
