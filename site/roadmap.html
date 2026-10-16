@@ -48,7 +48,7 @@
 <main class="wrap">
   <section id="next">
     <p class="label"><span class="idx">01</span> Next</p>
-    <h1 class="sec">Where it goes from here.</h1>
+    <h1 class="sec">What's next.</h1>
     <ol class="roadmap">
       <li class="done"><span class="st">done</span><div><b>Pretraining at 114M</b><span class="d">3B tokens in 45 hours on one laptop GPU. Weights are public.</span></div></li>
       <li class="done"><span class="st">done</span><div><b>1B mixture of experts with a code-aware tokenizer</b><span class="d">4.26B tokens, ten languages and code, $18.75 in total. The whitespace result above is why the tokenizer changed.</span></div></li>
@@ -57,7 +57,7 @@
       <li class="done"><span class="st">done</span><div><b>Data v3 and multi-GPU training</b><span class="d">10B tokens from 42 open sources for $2.51; data-parallel training verified on 2 GPUs; MoE dispatch 3.24x faster.</span></div></li>
       <li class="next"><span class="st">next</span><div><b>Continued pretraining on data v3</b><span class="d">Monthly runs on free compute credits, with a decayed checkpoint released every two months.</span></div></li>
       <li class="next"><span class="st">next</span><div><b>Chat fine-tune on the verified answers</b><span class="d">All 498k execution-verified answers from distillation v2.</span></div></li>
-      <li><span class="st">planned</span><div><b>Long-context phase: 2,048 → 8,192 tokens</b><span class="d">About 1B tokens of training at 8k context with a larger RoPE base (~500k). The demo already stretches to 4,096 without retraining, at under 0.3% loss cost on the first 2,048 positions; this makes longer context something the model actually learned.</span></div></li>
+      <li><span class="st">planned</span><div><b>Long-context phase: 2,048 → 8,192 tokens</b><span class="d">About 1B tokens of training at 8k context with a larger RoPE base (~500k). The demo already stretches to 4,096 without retraining, at under 0.3% loss cost on the first 2,048 positions; this trains the model on longer text instead of only stretching it.</span></div></li>
       <li><span class="st">later</span><div><b>A ~1B-active model</b><span class="d">When bigger compute is available.</span></div></li>
     </ol>
   </section>

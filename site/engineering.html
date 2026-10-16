@@ -48,7 +48,7 @@
 <main class="wrap">
   <section id="scale">
     <p class="label"><span class="idx">01</span> Training code</p>
-    <h1 class="sec">Ready for more than one GPU.</h1>
+    <h1 class="sec">Multi-GPU training and faster experts.</h1>
     <p class="intro muted">Everything so far was trained on one GPU. These two changes are for the runs after that.</p>
     <div class="grid g2">
       <div class="card"><span class="n acc">verified · 14 Oct 2026</span><h3>Multi-GPU data-parallel training.</h3><p>Verified on real GPUs: the 2-GPU test passed. The same training code runs on one GPU or several.</p></div>
@@ -62,8 +62,8 @@
   </section>
   <section id="failures">
     <p class="label"><span class="idx">02</span> Engineering</p>
-    <h2>The failures that don't announce themselves.</h2>
-    <p class="intro muted">Most of the work in a long unattended run is catching things that fail silently. Each of these was found in review, before the run.</p>
+    <h2>Bugs found before the long runs.</h2>
+    <p class="intro muted">These bugs would not have shown an error. Each one was found while reviewing the code, before the run.</p>
     <div class="grid g2">
       <div class="card"><span class="n acc">01 · speed</span><h3>Attention was quietly using a slow kernel.</h3><p>Fixing the fallback took the projected run for the original budget from ~65 hours to ~39.</p></div>
       <div class="card"><span class="n acc">02 · I/O</span><h3>About 1 in 130 file renames fails transiently.</h3><p>That is enough to kill a 50-hour run over a log write. Every atomic write now retries.</p></div>

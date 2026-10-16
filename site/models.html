@@ -101,7 +101,7 @@
   </section>
   <section id="results">
     <p class="label"><span class="idx">03</span> Results · quipu-114m</p>
-    <h2>It learned the shape of language in 45 hours.</h2>
+    <h2>45 hours of training: what it learned.</h2>
     <p class="intro muted">All 5,722 steps ran unattended over a weekend: no restarts, no skipped steps, no data repeated. Validation loss on held-out FineWeb-Edu text, measured every 100 steps:</p>
     <figure class="panel chart">
       <div class="panel-h"><span>fig. 02 · text validation loss</span><span>step</span></div>
@@ -115,7 +115,7 @@
     <div class="sample" id="sample" aria-live="polite"></div>
 
     <div class="grid g2" style="margin-top:36px">
-      <div class="card"><span class="n">verdict</span><h3>Fluent, on topic, and often wrong.</h3><p>The final model says the printing press was invented "in 1848 by the French printer Pierre-Louis Leclerc". That is the honest result for a 114M base model: it has learned the form of knowledge without reliable facts, and it still repeats itself under greedy decoding.</p></div>
+      <div class="card"><span class="n">verdict</span><h3>It sounds right but often isn&#x27;t.</h3><p>The final model says the printing press was invented "in 1848 by the French printer Pierre-Louis Leclerc". That is normal for a 114M base model: it writes fluent sentences, but the facts are often wrong, and it still repeats itself under greedy decoding.</p></div>
       <div class="card"><span class="n">caveat · code</span><h3>The code loss of 0.97 flatters it.</h3><p>GPT-2's tokenizer splits indentation into single spaces: 36.5% of the code validation tokens are pure whitespace, against 2.0% for text. They are easy to predict, and greedy code output collapses into runs of spaces. That measurement is why the next model gets a code-aware tokenizer.</p></div>
     </div>
     <div class="links-row"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-114m">Weights, milestones and model card on Hugging Face <span class="arr">↗</span></a></div>
