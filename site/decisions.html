@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design decisions · Quipu</title>
+<meta name="description" content="Every major design choice in Quipu as a decision tree: what was chosen, what was rejected, and the measurement behind it.">
+<link rel="canonical" href="https://quipulm.dev/decisions">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://quipulm.dev/decisions">
+<meta property="og:title" content="Design decisions · Quipu">
+<meta property="og:description" content="Every major design choice in Quipu as a decision tree: what was chosen, what was rejected, and the measurement behind it.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Design decisions · Quipu">
+<meta name="twitter:description" content="Every major design choice in Quipu as a decision tree: what was chosen, what was rejected, and the measurement behind it.">
+<meta name="theme-color" content="#09090b">
+<meta name="color-scheme" content="dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<div class="navbar">
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="/">
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M1 3.5 Q9 1.5 17 3.5" stroke="#fafafa" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M4 3 V16 M9 2.5 V14 M14 3 V16" stroke="#71717a" stroke-width="1.3" stroke-linecap="round"/><circle cx="4" cy="8" r="1.7" fill="#fafafa"/><circle cx="9" cy="6.5" r="1.7" fill="#f0a646"/><circle cx="9" cy="10" r="1.7" fill="#f0a646"/><circle cx="14" cy="11" r="1.7" fill="#fafafa"/></svg>
+        quipu
+      </a>
+      <div class="links">
+        <a href="/models">Models</a>
+        <a href="/distillation">Distillation</a>
+        <a href="/data">Data</a>
+        <a href="/engineering">Engineering</a>
+        <a href="/decisions" aria-current="page">Decisions</a>
+        <a href="/roadmap">Roadmap</a>
+        <span class="sep"></span>
+        <a class="ext" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Demo</a>
+        <a class="ext" href="https://huggingface.co/AneekC">Hugging Face</a>
+        <a class="ext" href="https://github.com/Aneek1/quipu">GitHub</a>
+        <a class="ext" href="/contact">Contact</a>
+      </div>
+    </nav>
+  </div>
+</div>
+
+<main class="wrap">
+  <section id="decisions" style="border-bottom:0;padding-bottom:72px">
+    <p class="label"><span class="idx">01</span> Design decisions</p>
+    <h1 class="sec">Every choice, and what it was chosen over.</h1>
+    <p class="intro muted">Each step below is a question I had to answer while building Quipu. The amber branch is what I picked; the grey ones are what I turned down, with the measurement or rule that decided it. Where an A/B test was run, the rule for winning was written down before the result came in.</p>
+    <ul class="path" aria-label="The chosen path"><li><a href="#scratch">From scratch</a></li><li><a href="#size">114M on a laptop</a></li><li><a href="#context">Short context</a></li><li><a href="#tokenizer">Own tokenizer</a></li><li><a href="#moe">Mixture of experts</a></li><li><a href="#balance">No auxiliary loss</a></li><li><a href="#muon">Muon</a></li><li><a href="#attnres">No AttnRes</a></li><li><a href="#swiglu">SwiGLU</a></li><li><a href="#bf16">bf16, not FP8</a></li><li><a href="#gpu">One RTX 5090</a></li><li><a href="#licences">Permissive code only</a></li><li><a href="#languages">Ten languages</a></li><li><a href="#sources">Clean terms</a></li><li><a href="#teacher">Open teacher</a></li><li><a href="#verify">Run the tests</a></li><li><a href="#teacher-size">7B for v2</a></li><li><a href="#next-compute">Free credits</a></li></ul>
+    <div class="tree-tools"><button type="button" id="toggle-rejected" aria-pressed="false">Show only what was chosen</button></div>
+    <div id="tree">
+  <div class="stage">
+    <div class="stage-h"><span class="idx">01</span><h2>Starting point</h2></div>
+    <ol class="spine">
+      <li class="node" id="scratch">
+        <p class="q"><small>Base model</small>Fine-tune an existing model, or train one from scratch?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Train from scratch</b><p>Own weights, own tokenizer, own data pipeline. Every number on this site comes from a run I set up, so I can explain all of it.</p><span class="ev">No fine-tuned base anywhere in Quipu</span></div><div class="br no"><span class="tag">not chosen</span><b>Fine-tune an open model</b><p>Much faster to a good chatbot, but the interesting parts (data, tokenizer, pretraining) would belong to someone else.</p></div></div>
+      </li>
+      <li class="node" id="size">
+        <p class="q"><small>First model</small>How big should the first model be?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>114M parameters, 3B tokens</b><p>Sized for what the 8 GB laptop GPU could finish over one weekend. The point was to prove the whole pipeline before spending money.</p><span class="ev">45 h 22 m, zero restarts, no rented compute</span></div><div class="br no"><span class="tag">not chosen</span><b>350M first</b><p>Would have been a better model, but about 8 days of laptop GPU with no proof the pipeline worked.</p><span class="ev">~8 days estimated</span></div></div>
+      </li>
+      <li class="node" id="context">
+        <p class="q"><small>Context</small>How long should the context window be?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>1,024 tokens</b><p>On an 8 GB card a long window&#x27;s key/value cache eats the memory the weights need. Long-range recall is meant to come from retrieval instead.</p><span class="ev">The demo stretches it to 4,096 with RoPE scaling</span></div><div class="br no"><span class="tag">not chosen</span><b>A long window (32k+)</b><p>Does not fit next to the weights on the training GPU.</p></div></div>
+      </li>
+    </ol>
+  </div>
+  <div class="stage">
+    <div class="stage-h"><span class="idx">02</span><h2>Tokenizer</h2></div>
+    <ol class="spine">
+      <li class="node" id="tokenizer">
+        <p class="q"><small>Tokenizer</small>Keep GPT-2&#x27;s tokenizer for the second model?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Train a new 49,152-token tokenizer</b><p>GPT-2&#x27;s tokenizer splits code indentation into single spaces, so the first model&#x27;s code loss looked better than it was. The new one keeps indentation together and covers ten languages.</p><span class="ev">Code: 3.79 characters per token, vs 2.32 for GPT-2</span></div><div class="br no"><span class="tag">not chosen</span><b>Keep GPT-2&#x27;s</b><p>No extra work, but 36.5% of code tokens were pure whitespace, and greedy code output collapsed into runs of spaces.</p><span class="ev">36.5% whitespace tokens in code, 2.0% in text</span></div></div>
+      </li>
+    </ol>
+  </div>
+  <div class="stage">
+    <div class="stage-h"><span class="idx">03</span><h2>Architecture and optimiser</h2></div>
+    <ol class="spine">
+      <li class="node" id="moe">
+        <p class="q"><small>Model shape</small>Dense model or mixture of experts for the 1B run?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Mixture of experts: 998M total, 149M per token</b><p>16 layers, each with one shared expert and 64 small routed experts, of which each token uses 4. A 1B model&#x27;s capacity at roughly the per-token cost of a 150M one, which kept the run under $20.</p><span class="ev">$18.75 total compute</span></div><div class="br no"><span class="tag">not chosen</span><b>Dense 1B</b><p>Every token pays for every parameter: far fewer training tokens for the same money.</p></div></div>
+      </li>
+      <li class="node" id="balance">
+        <p class="q"><small>Expert routing</small>How should the experts be kept evenly used?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Quantile Balancing</b><p>Balances the routing directly, with no extra loss term pulling against the language-modelling loss.</p><span class="ev">No auxiliary loss to tune</span></div><div class="br no"><span class="tag">not chosen</span><b>Auxiliary balancing loss</b><p>The common approach, but it adds a weight to tune and can trade model quality for balance.</p></div></div>
+      </li>
+      <li class="node" id="muon">
+        <p class="q"><small>Optimiser</small>Muon or AdamW?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Muon</b><p>A/B tested at 200M tokens before the full run. The gap was more than 20 times the seed noise.</p><span class="ev">Loss 3.32 vs 4.06, seed noise 0.03</span></div><div class="br no"><span class="tag">not chosen</span><b>AdamW</b><p>The standard choice, and clearly worse here.</p><span class="ev">Loss 4.06</span></div></div>
+      </li>
+      <li class="node" id="attnres">
+        <p class="q"><small>Attention residuals</small>Add Block AttnRes?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Leave it out</b><p>It had better loss, but the rule written down before the test said: adopt only if it fits in memory and is at most 25% slower at full size. It failed the memory check.</p><span class="ev">Full-size probe: 31.87 GB, over the 30.98 GB limit</span></div><div class="br no"><span class="tag">not chosen</span><b>Use Block AttnRes</b><p>Loss 3.03 against 3.32 in the A/B, but 15.5% slower, and too big at full size.</p><span class="ev">15.5% slower</span></div></div>
+      </li>
+      <li class="node" id="swiglu">
+        <p class="q"><small>Activation</small>SiTU-GLU or SwiGLU?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>SwiGLU</b><p>SiTU-GLU won the A/B, but by less than the same money spent on more training tokens was expected to buy. This override is documented in the model card.</p><span class="ev">SiTU-GLU gain 0.047; tokens worth ~0.10</span></div><div class="br no"><span class="tag">not chosen</span><b>SiTU-GLU</b><p>A real but small gain that did not pay for itself.</p></div></div>
+      </li>
+      <li class="node" id="bf16">
+        <p class="q"><small>Precision</small>Train in FP8 to go faster?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Stay in bf16</b><p>FP8 only helps if it is clearly faster. On this GPU there is no FP8 grouped matmul for the experts, and the measured result was slower.</p><span class="ev">FP8 at 0.79–0.89x the speed of bf16; rule needed 1.2x</span></div><div class="br no"><span class="tag">not chosen</span><b>FP8</b><p>Saves memory and can be faster on the right hardware, but not here.</p></div></div>
+      </li>
+    </ol>
+  </div>
+  <div class="stage">
+    <div class="stage-h"><span class="idx">04</span><h2>Hardware</h2></div>
+    <ol class="spine">
+      <li class="node" id="gpu">
+        <p class="q"><small>Compute</small>Which GPU for the 1B pretraining run?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>One rented RTX 5090</b><p>Measured as the most tokens per dollar for this small model. Results were copied back and the machine destroyed right after.</p><span class="ev">~$0.52/h, 44.3k tokens/s</span></div><div class="br no"><span class="tag">not chosen</span><b>H100 / H200 / B200</b><p>Faster per GPU but much more per hour for a model this size.</p><span class="ev">$1.95 / $2.95 / $7.81 per hour (rental prices, 30 Sep)</span></div><div class="br no"><span class="tag">not chosen</span><b>GB10 desktop boxes</b><p>Cheap, but roughly the same speed as the laptop.</p><span class="ev">29.5 TFLOPS</span></div></div>
+      </li>
+    </ol>
+  </div>
+  <div class="stage">
+    <div class="stage-h"><span class="idx">05</span><h2>Data</h2></div>
+    <ol class="spine">
+      <li class="node" id="licences">
+        <p class="q"><small>Code licences</small>Which code is allowed in the training data?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Permissive licences only</b><p>MIT, Apache-2.0, BSD, ISC, CC0 and Unlicense. Minified files, vendored folders and huge files are dropped, and HTML is capped at 10% so markup doesn&#x27;t crowd out real languages.</p><span class="ev">HumanEval and MBPP filtered out of training data</span></div><div class="br no"><span class="tag">not chosen</span><b>Any public code</b><p>More data, but unclear rights to train on it.</p></div></div>
+      </li>
+      <li class="node" id="languages">
+        <p class="q"><small>Languages</small>English only, or more languages?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>English plus nine Asian languages</b><p>Indonesian, Malay, Chinese, Japanese, Korean, Tamil, Hindi and Urdu. Each document is checked by my own language-ID model before it goes in.</p><span class="ev">Mix: 60% code, 28% English, 12% the other languages</span></div><div class="br no"><span class="tag">not chosen</span><b>English only</b><p>Simpler, but the tokenizer and model would be poor at the languages around me.</p></div></div>
+      </li>
+      <li class="node" id="sources">
+        <p class="q"><small>Data v3 sources</small>Which sources go into the 10B-token set?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>42 open sources, licences checked</b><p>Stack Exchange is used only from an older dump, because newer dumps forbid training language models. Large synthetic sets made by other companies&#x27; models were left out.</p><span class="ev">Built for $2.51 on CPUs</span></div><div class="br no"><span class="tag">not chosen</span><b>Newest dumps and synthetic sets</b><p>Bigger and more recent, but with terms that do not allow this use.</p></div></div>
+      </li>
+    </ol>
+  </div>
+  <div class="stage">
+    <div class="stage-h"><span class="idx">06</span><h2>Distillation</h2></div>
+    <ol class="spine">
+      <li class="node" id="teacher">
+        <p class="q"><small>Teacher model</small>Which model should teach Quipu to code?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Qwen2.5-Coder (Apache-2.0)</b><p>An open-weight model whose licence allows training on its outputs.</p><span class="ev">1.5B for v1, 7B for v2</span></div><div class="br no"><span class="tag">not chosen</span><b>Closed API models</b><p>Often stronger, but their terms forbid using their outputs to train other models.</p></div></div>
+      </li>
+      <li class="node" id="verify">
+        <p class="q"><small>Quality check</small>How do we know a teacher answer is good?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Run it against the problem&#x27;s unit tests</b><p>Every answer runs in a sandbox and only passing ones are kept. A bug where the harness shared variables with the answer was found and fixed, and every part was checked again.</p><span class="ev">v2: 498,813 of 638,342 kept (78.1%)</span></div><div class="br no"><span class="tag">not chosen</span><b>Ask another model to grade it</b><p>Cheaper to set up, but a grade is an opinion; a passing test is a fact.</p></div></div>
+      </li>
+      <li class="node" id="teacher-size">
+        <p class="q"><small>Scaling up</small>Keep the small teacher for v2?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Move to the 7B teacher</b><p>The bigger teacher passes its own tests more often, so more of the compute ends up as kept answers.</p><span class="ev">Pass rate 65.5% (1.5B) → 78.1% (7B)</span></div><div class="br no"><span class="tag">not chosen</span><b>Stay on 1.5B</b><p>Cheaper per answer, but a third of answers were thrown away.</p></div></div>
+      </li>
+    </ol>
+  </div>
+  <div class="stage">
+    <div class="stage-h"><span class="idx">07</span><h2>Scaling</h2></div>
+    <ol class="spine">
+      <li class="node" id="next-compute">
+        <p class="q"><small>Next runs</small>How to keep training without a budget?</p>
+        <div class="branches"><div class="br yes"><span class="tag">chosen</span><b>Monthly runs on free compute credits</b><p>Multi-GPU training was built and verified on 2 real GPUs before asking for any bigger machine, and the expert dispatch was made 3.24x faster first so every credit goes further.</p><span class="ev">113k → 366k tokens/s on a B200</span></div><div class="br no"><span class="tag">not chosen</span><b>Rent a big cluster now</b><p>Fastest, but not affordable for a personal project.</p></div></div>
+      </li>
+    </ol>
+  </div>
+    </div>
+  </section>
+</main>
+
+<div class="wrap">
+  <a class="next-page" href="/roadmap"><span><small>Next</small><b>Roadmap</b></span><span class="arr" aria-hidden="true">&rarr;</span></a>
+</div>
+<div style="border-top:1px solid var(--line)">
+  <footer class="wrap">
+    <span>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands.</span>
+    <span class="mono">Code: <a href="https://github.com/Aneek1/quipu">github.com/Aneek1/quipu</a> · Weights: <a href="https://huggingface.co/AneekC">huggingface.co/AneekC</a></span>
+  </footer>
+</div>
+
+<script src="/site.js"></script>
+<!-- Cloudflare Web Analytics: visitors and page views, no cookies -->
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "60f38792070543da81da7b7b615f7ecb"}'></script>
+</body>
+</html>

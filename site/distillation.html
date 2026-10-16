@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distillation · Quipu</title>
+<meta name="description" content="Teacher answers kept only if they pass their unit tests: 498,813 of 638,342 kept.">
+<link rel="canonical" href="https://quipulm.dev/distillation">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://quipulm.dev/distillation">
+<meta property="og:title" content="Distillation · Quipu">
+<meta property="og:description" content="Teacher answers kept only if they pass their unit tests: 498,813 of 638,342 kept.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Distillation · Quipu">
+<meta name="twitter:description" content="Teacher answers kept only if they pass their unit tests: 498,813 of 638,342 kept.">
+<meta name="theme-color" content="#09090b">
+<meta name="color-scheme" content="dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<div class="navbar">
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="/">
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M1 3.5 Q9 1.5 17 3.5" stroke="#fafafa" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M4 3 V16 M9 2.5 V14 M14 3 V16" stroke="#71717a" stroke-width="1.3" stroke-linecap="round"/><circle cx="4" cy="8" r="1.7" fill="#fafafa"/><circle cx="9" cy="6.5" r="1.7" fill="#f0a646"/><circle cx="9" cy="10" r="1.7" fill="#f0a646"/><circle cx="14" cy="11" r="1.7" fill="#fafafa"/></svg>
+        quipu
+      </a>
+      <div class="links">
+        <a href="/models">Models</a>
+        <a href="/distillation" aria-current="page">Distillation</a>
+        <a href="/data">Data</a>
+        <a href="/engineering">Engineering</a>
+        <a href="/decisions">Decisions</a>
+        <a href="/roadmap">Roadmap</a>
+        <span class="sep"></span>
+        <a class="ext" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Demo</a>
+        <a class="ext" href="https://huggingface.co/AneekC">Hugging Face</a>
+        <a class="ext" href="https://github.com/Aneek1/quipu">GitHub</a>
+        <a class="ext" href="/contact">Contact</a>
+      </div>
+    </nav>
+  </div>
+</div>
+
+<main class="wrap">
+  <section id="distill">
+    <p class="label"><span class="idx">01</span> Distillation</p>
+    <h1 class="sec">Keep only the answers that pass their tests.</h1>
+    <p class="intro">The chat model could barely write code: greedy decoding solved 5 of MBPP's 257 problems. So an open-weight teacher, <a href="https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct">Qwen2.5-Coder-1.5B-Instruct</a> (Apache-2.0), answered 5,000 coding problems, and every answer was run against the problem's unit tests in a sandbox. Only the 3,277 that passed were kept. The chat fine-tune was then repeated with those added.</p>
+    <div class="grid g2">
+      <div class="stat"><b>1.9% → 7.4%</b><span>MBPP pass@1, greedy (5 → 19 of 257)</span></div>
+      <div class="stat"><b>0% → 0.6%</b><span>HumanEval pass@1, greedy (0 → 1 of 164)</span></div>
+    </div>
+    <div class="grid g2" style="margin-top:16px">
+      <div class="card"><span class="n">honest scale</span><h3>About 4x better, and still low.</h3><p>SantaCoder (1.1B) reports around 35% on MBPP and Qwen2.5-Coder-1.5B about 69%, with different settings. Quipu uses 149M parameters per token and saw 4.26B tokens. It is not competing with them yet.</p></div>
+      <div class="card"><span class="n acc">done · v2</span><h3>The same idea, at a much bigger scale.</h3><p>A 7B teacher, Qwen2.5-Coder-7B-Instruct (Apache-2.0), generated 638,342 answers, and every one was run against its unit tests in a sandbox. 498,813 passed and were kept: 78.1%.</p><p>Generation ran on a rented RTX 3090, the laptop and Modal H100s; verification ran on Modal CPUs.</p></div>
+    </div>
+    <div class="grid g3" style="margin-top:16px">
+      <div class="stat"><b>638,342</b><span>teacher answers generated (v2)</span></div>
+      <div class="stat"><b class="acc">498,813</b><span>passed their unit tests and kept</span></div>
+      <div class="stat"><b>78.1%</b><span>pass rate</span></div>
+    </div>
+    <div class="links-row"><a class="btn primary" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Try it in the chat demo <span class="arr">→</span></a><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Distilled model and model card on Hugging Face <span class="arr">↗</span></a></div>
+    <p class="note" style="margin-top:16px">The demo runs on a small CPU machine that sleeps when idle: the first visit can take about 15 seconds to wake it.</p>
+  </section>
+</main>
+
+<div class="wrap">
+  <a class="next-page" href="/data"><span><small>Next</small><b>The data</b></span><span class="arr" aria-hidden="true">&rarr;</span></a>
+</div>
+<div style="border-top:1px solid var(--line)">
+  <footer class="wrap">
+    <span>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands.</span>
+    <span class="mono">Code: <a href="https://github.com/Aneek1/quipu">github.com/Aneek1/quipu</a> · Weights: <a href="https://huggingface.co/AneekC">huggingface.co/AneekC</a></span>
+  </footer>
+</div>
+
+<script src="/site.js"></script>
+<!-- Cloudflare Web Analytics: visitors and page views, no cookies -->
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "60f38792070543da81da7b7b615f7ecb"}'></script>
+</body>
+</html>

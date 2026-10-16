@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data · Quipu</title>
+<meta name="description" content="A 10B-token pretraining set from 42 open, licence-checked sources, built for $2.51.">
+<link rel="canonical" href="https://quipulm.dev/data">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://quipulm.dev/data">
+<meta property="og:title" content="Data · Quipu">
+<meta property="og:description" content="A 10B-token pretraining set from 42 open, licence-checked sources, built for $2.51.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Data · Quipu">
+<meta name="twitter:description" content="A 10B-token pretraining set from 42 open, licence-checked sources, built for $2.51.">
+<meta name="theme-color" content="#09090b">
+<meta name="color-scheme" content="dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/site.css">
+</head>
+<body>
+<div class="navbar">
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="/">
+        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M1 3.5 Q9 1.5 17 3.5" stroke="#fafafa" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M4 3 V16 M9 2.5 V14 M14 3 V16" stroke="#71717a" stroke-width="1.3" stroke-linecap="round"/><circle cx="4" cy="8" r="1.7" fill="#fafafa"/><circle cx="9" cy="6.5" r="1.7" fill="#f0a646"/><circle cx="9" cy="10" r="1.7" fill="#f0a646"/><circle cx="14" cy="11" r="1.7" fill="#fafafa"/></svg>
+        quipu
+      </a>
+      <div class="links">
+        <a href="/models">Models</a>
+        <a href="/distillation">Distillation</a>
+        <a href="/data" aria-current="page">Data</a>
+        <a href="/engineering">Engineering</a>
+        <a href="/decisions">Decisions</a>
+        <a href="/roadmap">Roadmap</a>
+        <span class="sep"></span>
+        <a class="ext" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Demo</a>
+        <a class="ext" href="https://huggingface.co/AneekC">Hugging Face</a>
+        <a class="ext" href="https://github.com/Aneek1/quipu">GitHub</a>
+        <a class="ext" href="/contact">Contact</a>
+      </div>
+    </nav>
+  </div>
+</div>
+
+<main class="wrap">
+  <section id="data-v3">
+    <p class="label"><span class="idx">01</span> Data v3</p>
+    <h1 class="sec">Ten billion tokens of pretraining data, built for $2.51.</h1>
+    <p class="intro">The next pretraining batch: 10,000,003,101 tokens from 42 open, licence-checked sources, built on Modal CPUs. Benchmark problems (HumanEval and MBPP) were filtered out, as before.</p>
+    <div class="grid g4">
+      <div class="stat"><b>10.0B</b><span>tokens (10,000,003,101)</span></div>
+      <div class="stat"><b class="acc">$2.51</b><span>to build, on Modal CPUs</span></div>
+      <div class="stat"><b>42</b><span>open, licence-checked sources</span></div>
+      <div class="stat"><b>45%</b><span>code from starcoderdata</span></div>
+    </div>
+    <div class="two">
+      <div>
+        <h3 class="h-sm">What's in it</h3>
+        <p>Mostly code and educational text, with maths, reference text, nine languages from FineWeb-2, and a small slice of the verified teacher answers from distillation v2.</p>
+        <div class="mixbar" aria-hidden="true">
+          <div style="flex:45;background:var(--accent)"></div>
+          <div style="flex:20;background:#d4d4d8"></div>
+          <div style="flex:10;background:#a1a1aa"></div>
+          <div style="flex:7;background:#71717a"></div>
+          <div style="flex:5;background:#52525b"></div>
+          <div style="flex:5;background:#52525b"></div>
+          <div style="flex:4;background:#3f3f46"></div>
+          <div style="flex:3;background:#3f3f46"></div>
+          <div style="flex:1;background:var(--accent)"></div>
+        </div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>code + verified answers</span><span><i style="background:#a1a1aa"></i>text, maths, languages</span></div>
+      </div>
+      <div class="panel src" aria-label="Data v3 source mix">
+        <div class="src-row"><span class="name">Code<small>starcoderdata</small></span><span class="p">45%</span><span class="bar"><i class="acc" style="width:100%"></i></span></div>
+        <div class="src-row"><span class="name">Educational web text<small>FineWeb-Edu</small></span><span class="p">20%</span><span class="bar"><i style="width:44.4%"></i></span></div>
+        <div class="src-row"><span class="name">Nine languages<small>FineWeb-2</small></span><span class="p">10%</span><span class="bar"><i style="width:22.2%"></i></span></div>
+        <div class="src-row"><span class="name">Maths</span><span class="p">7%</span><span class="bar"><i style="width:15.6%"></i></span></div>
+        <div class="src-row"><span class="name">Stack Exchange<small>dump of March 2023</small></span><span class="p">5%</span><span class="bar"><i style="width:11.1%"></i></span></div>
+        <div class="src-row"><span class="name">Older code<small>github-code-clean</small></span><span class="p">5%</span><span class="bar"><i class="acc" style="width:11.1%"></i></span></div>
+        <div class="src-row"><span class="name">Reference<small>Wikipedia, peS2o, arXiv</small></span><span class="p">4%</span><span class="bar"><i style="width:8.9%"></i></span></div>
+        <div class="src-row"><span class="name">Code-related web</span><span class="p">3%</span><span class="bar"><i style="width:6.7%"></i></span></div>
+        <div class="src-row"><span class="name">Verified answers<small>distillation v2</small></span><span class="p">1%</span><span class="bar"><i class="acc" style="width:2.2%"></i></span></div>
+      </div>
+    </div>
+  </section>
+  <section id="data-114m">
+    <p class="label"><span class="idx">02</span> Data · quipu-114m</p>
+    <h2>Three billion tokens: mostly text, one-fifth code.</h2>
+    <p class="intro">80% <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a>, 20% code from <a href="https://huggingface.co/datasets/codeparrot/github-code-clean">github-code-clean</a>. Only permissive licences are kept: MIT, Apache-2.0, BSD, ISC, CC0 and Unlicense. Minified files, vendored directories and files over 16k tokens are filtered out. That filter alone removed as many tokens as the entire code budget.</p>
+    <div class="mixbar" aria-hidden="true" style="max-width:720px">
+      <div style="flex:80;background:#a1a1aa"></div>
+      <div style="flex:20;background:var(--accent)"></div>
+    </div>
+    <div class="legend"><span><i style="background:#a1a1aa"></i>Educational web text · 80%</span><span><i style="background:var(--accent)"></i>Code · 20%</span></div>
+
+    <div class="rows" id="langs" aria-label="Share of code by language" style="margin-top:36px;max-width:720px"></div>
+    <p class="note" style="margin-top:16px">HTML is capped at 10% so markup doesn't crowd out the languages the model should actually learn to write.</p>
+  </section>
+</main>
+
+<div class="wrap">
+  <a class="next-page" href="/engineering"><span><small>Next</small><b>Engineering</b></span><span class="arr" aria-hidden="true">&rarr;</span></a>
+</div>
+<div style="border-top:1px solid var(--line)">
+  <footer class="wrap">
+    <span>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands.</span>
+    <span class="mono">Code: <a href="https://github.com/Aneek1/quipu">github.com/Aneek1/quipu</a> · Weights: <a href="https://huggingface.co/AneekC">huggingface.co/AneekC</a></span>
+  </footer>
+</div>
+
+<script src="/site.js"></script>
+<!-- Cloudflare Web Analytics: visitors and page views, no cookies -->
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "60f38792070543da81da7b7b615f7ecb"}'></script>
+</body>
+</html>

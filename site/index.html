@@ -9,259 +9,37 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://quipulm.dev/">
 <meta property="og:title" content="Quipu: small language models, trained from scratch on a tight budget">
-<meta property="og:description" content="A 1B mixture of experts for under $20, execution-verified distillation, and a 10B-token pretraining set built for $2.51.">
+<meta property="og:description" content="Small language models trained from scratch on a tight budget: a 1B mixture of experts for under $20, execution-verified distillation, and a 10B-token pretraining set built for $2.51.">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Quipu: small language models, trained from scratch on a tight budget">
-<meta name="twitter:description" content="A 1B mixture of experts for under $20, execution-verified distillation, and a 10B-token pretraining set built for $2.51.">
+<meta name="twitter:description" content="Small language models trained from scratch on a tight budget: a 1B mixture of experts for under $20, execution-verified distillation, and a 10B-token pretraining set built for $2.51.">
 <meta name="theme-color" content="#09090b">
 <meta name="color-scheme" content="dark">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #09090b;        /* near-black */
-    --bg2: #0f0f12;       /* raised surface */
-    --bg3: #151518;       /* hover / track */
-    --line: #27272a;      /* hairline, zinc-800 */
-    --line2: #3f3f46;     /* stronger hairline, zinc-700 */
-    --fg: #fafafa;
-    --fg2: #d4d4d8;       /* zinc-300 */
-    --muted: #a1a1aa;     /* zinc-400 */
-    --dim: #71717a;       /* zinc-500 */
-    --accent: #f0a646;    /* single accent: dyed-cord amber */
-    --accent-soft: rgba(240, 166, 70, .12);
-    --sans: Geist, Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
-    --mono: "Geist Mono", "JetBrains Mono", ui-monospace, Consolas, monospace;
-    color-scheme: dark;
-  }
-  * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
-  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
-  body {
-    margin: 0; background: var(--bg); color: var(--fg2);
-    font: 16px/1.65 var(--sans); -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
-  }
-  ::selection { background: var(--accent); color: #09090b; }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
-  a { color: var(--fg); text-decoration: underline; text-decoration-color: var(--line2); text-underline-offset: 3px; transition: text-decoration-color .15s; }
-  a:hover { text-decoration-color: var(--accent); }
-  .mono { font-family: var(--mono); font-size: .92em; }
-  .muted { color: var(--muted); }
-  p { margin: 0 0 14px; }
-  b, strong { color: var(--fg); font-weight: 500; }
-
-  /* nav */
-  .navbar { position: sticky; top: 0; z-index: 10; background: rgba(9, 9, 11, .82); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
-  nav { display: flex; justify-content: space-between; align-items: center; height: 56px; gap: 16px; }
-  .brand { display: inline-flex; align-items: center; gap: 10px; font-family: var(--mono); font-weight: 500; font-size: 15px; color: var(--fg); text-decoration: none; letter-spacing: -.01em; }
-  .brand svg { flex: none; }
-  nav .links { display: flex; align-items: center; gap: 22px; min-width: 0; }
-  nav .links a { color: var(--muted); text-decoration: none; font-size: 14px; white-space: nowrap; }
-  nav .links a:hover { color: var(--fg); }
-  nav .links .sep { width: 1px; height: 16px; background: var(--line); }
-  nav .links a.ext { font-family: var(--mono); font-size: 13px; }
-
-  /* hero */
-  .hero-bg { position: relative; border-bottom: 1px solid var(--line); overflow: hidden; }
-  .hero-bg::before { content: ""; position: absolute; inset: 0; pointer-events: none;
-    background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
-    background-size: 56px 56px; background-position: -1px -1px; opacity: .45;
-    -webkit-mask-image: radial-gradient(ellipse 70% 80% at 70% 30%, #000 20%, transparent 75%);
-            mask-image: radial-gradient(ellipse 70% 80% at 70% 30%, #000 20%, transparent 75%); }
-  .hero { position: relative; display: grid; grid-template-columns: 1.15fr 1fr; gap: 56px; align-items: center; padding: 96px 0 104px; }
-  .hero > * { min-width: 0; }
-  .status { display: inline-flex; align-items: center; gap: 10px; font: 500 13.5px/1.4 var(--sans); color: var(--muted);
-    padding: 5px 14px 5px 5px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg2); max-width: 100%;
-    text-decoration: none; transition: border-color .15s, color .15s; }
-  .status:hover { border-color: var(--line2, #3f3f46); color: var(--fg); }
-  .status .tag { flex: none; font: 500 11.5px/1 var(--sans); color: var(--fg); padding: 5px 9px; border-radius: 999px; background: #27272a; }
-  .status .arr { flex: none; color: var(--dim); transition: transform .15s; }
-  .status:hover .arr { transform: translateX(2px); color: var(--fg); }
-  .contact-lede { color: var(--muted); font-size: 17px; max-width: 56ch; margin: 0 0 28px; }
-  .contact-mail { display: inline-flex; align-items: center; gap: 12px; font: 500 clamp(20px, 3.4vw, 28px)/1.2 var(--mono); color: var(--fg);
-    text-decoration: none; padding: 14px 20px; border: 1px solid var(--line2); border-radius: 10px; background: var(--bg2);
-    max-width: 100%; overflow-wrap: anywhere; transition: border-color .15s; }
-  .contact-mail:hover { border-color: var(--accent); }
-  .contact-mail .arr { color: var(--dim); transition: transform .15s, color .15s; }
-  .contact-mail:hover .arr { transform: translateX(3px); color: var(--accent); }
-  .contact-alt { color: var(--dim); font-size: 14.5px; margin: 22px 0 0; }
-  h1 { font-family: var(--sans); font-weight: 600; color: var(--fg); font-size: clamp(38px, 5.6vw, 64px); line-height: 1.02; letter-spacing: -0.035em; margin: 26px 0 22px; }
-  h1 .dim { color: var(--dim); }
-  .sub { color: var(--muted); font-size: 17px; margin: 0 0 32px; max-width: 52ch; }
-  .cta { display: flex; gap: 10px; flex-wrap: wrap; }
-  .btn { display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 16px; border-radius: 8px; font-weight: 500; font-size: 14px; text-decoration: none; white-space: nowrap; transition: background .15s, border-color .15s; }
-  .btn.primary { background: var(--fg); color: var(--bg); border: 1px solid var(--fg); }
-  .btn.primary:hover { background: var(--fg2); }
-  .btn.ghost { border: 1px solid var(--line2); color: var(--fg); background: transparent; }
-  .btn.ghost:hover { border-color: var(--muted); background: var(--bg2); }
-  .btn .arr { font-family: var(--mono); color: var(--dim); }
-
-  .panel { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-  .panel-h { display: flex; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); font: 11.5px/1.4 var(--mono); color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
-  .quipu-fig { margin: 0; }
-  .quipu-fig svg { width: 100%; height: auto; display: block; padding: 18px 14px 4px; }
-  .quipu-fig figcaption { font-size: 13px; color: var(--muted); padding: 12px 16px 14px; line-height: 1.55; border-top: 1px solid var(--line); }
-
-  /* sections */
-  section { padding: 104px 0; border-bottom: 1px solid var(--line); }
-  .label { display: flex; align-items: center; gap: 10px; font: 500 12px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 0 0 22px; }
-  .label .idx { color: var(--accent); }
-  .label::after { content: ""; flex: 1; height: 1px; background: var(--line); }
-  h2 { font-family: var(--sans); font-weight: 600; color: var(--fg); font-size: clamp(28px, 3.6vw, 40px); line-height: 1.1; margin: 0 0 18px; letter-spacing: -0.03em; max-width: 22ch; }
-  h3 { color: var(--fg); font-weight: 500; letter-spacing: -0.01em; }
-  .intro { max-width: 68ch; }
-  .intro.muted, .intro .muted { color: var(--muted); }
-
-  /* hairline grids */
-  .grid { display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-top: 36px; }
-  .grid > * { background: var(--bg); min-width: 0; }
-  .g4 { grid-template-columns: repeat(4, 1fr); }
-  .g3 { grid-template-columns: repeat(3, 1fr); }
-  .g2 { grid-template-columns: repeat(2, 1fr); }
-  .stat { padding: 26px 24px 24px; }
-  .stat b { display: block; font: 500 clamp(22px, 2.6vw, 30px)/1.15 var(--mono); color: var(--fg); letter-spacing: -0.03em; overflow-wrap: anywhere; }
-  .stat b.acc { color: var(--accent); }
-  .stat span { display: block; margin-top: 10px; color: var(--muted); font-size: 13.5px; line-height: 1.5; }
-  .card { padding: 28px 26px; }
-  .card .n { font: 11.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
-  .card .n.acc { color: var(--accent); }
-  .card h3 { font-size: 17px; margin: 14px 0 10px; line-height: 1.35; }
-  .card p { color: var(--muted); font-size: 14.5px; margin: 0; }
-  .card p + p { margin-top: 10px; }
-
-  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; align-items: start; margin-top: 64px; }
-  .two > * { min-width: 0; }
-  .h-sm { font-size: 20px; margin: 0 0 14px; letter-spacing: -0.02em; }
-  .note { color: var(--muted); font-size: 14px; }
-  .links-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 32px; }
-
-  /* architecture stack */
-  .stack { display: flex; flex-direction: column; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-  .layer { background: var(--bg2); padding: 13px 16px; display: flex; justify-content: space-between; gap: 12px; font-size: 14.5px; color: var(--fg); }
-  .layer small { color: var(--dim); font-family: var(--mono); font-size: 12px; text-align: right; }
-  .layer.block { box-shadow: inset 2px 0 0 var(--accent); }
-  .layer.io { box-shadow: inset 2px 0 0 var(--line2); }
-  .repeat { background: var(--bg); font: 12px var(--mono); color: var(--dim); text-align: center; padding: 6px 0; letter-spacing: .06em; }
-
-  /* bar rows */
-  .rows { display: grid; gap: 10px; margin-top: 8px; }
-  .lang { display: grid; grid-template-columns: 168px 1fr 58px; gap: 14px; align-items: center; font-size: 14px; color: var(--fg2); }
-  .lang > span:first-child { min-width: 0; overflow-wrap: anywhere; }
-  .lang .track { height: 6px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
-  .lang .fill { display: block; height: 100%; border-radius: 2px; background: var(--fg2); }
-  .lang .fill.acc { background: var(--accent); }
-  .lang .pct { font: 12.5px var(--mono); text-align: right; color: var(--muted); }
-
-  .mixbar { display: flex; gap: 2px; height: 10px; margin: 28px 0 12px; }
-  .mixbar div { height: 100%; border-radius: 2px; }
-  .legend { display: flex; gap: 20px; flex-wrap: wrap; font: 12.5px var(--mono); color: var(--muted); }
-  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 8px; }
-
-  /* source table (data v3) */
-  .src { padding: 0; }
-  .src-row { display: grid; grid-template-columns: 1fr 56px; gap: 6px 16px; padding: 14px 20px; border-top: 1px solid var(--line); align-items: center; }
-  .src-row:first-child { border-top: 0; }
-  .src-row .name { color: var(--fg2); font-size: 14.5px; min-width: 0; }
-  .src-row .name small { display: block; color: var(--dim); font-size: 12.5px; }
-  .src-row .p { font: 13px var(--mono); color: var(--fg); text-align: right; }
-  .src-row .bar { grid-column: 1 / -1; height: 3px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
-  .src-row .bar i { display: block; height: 100%; background: var(--fg2); }
-  .src-row .bar i.acc { background: var(--accent); }
-
-  /* speed comparison */
-  .speed { margin-top: 18px; display: grid; gap: 10px; }
-  .speed .lang { grid-template-columns: 92px 1fr 72px; }
-
-  /* chart */
-  .chart { margin: 36px 0 8px; }
-  .chart svg { width: 100%; height: auto; display: block; padding: 18px 16px 6px; }
-  .chart figcaption { font-size: 14px; color: var(--muted); padding: 14px 18px; border-top: 1px solid var(--line); }
-
-  /* watch it learn */
-  .stepper { display: flex; flex-wrap: wrap; gap: 0; margin: 18px 0 0; border: 1px solid var(--line); border-bottom: 0; border-radius: 12px 12px 0 0; overflow: hidden; background: var(--line); }
-  .stepper button { flex: 1 1 auto; font: 500 12.5px var(--mono); padding: 11px 12px; border: 0; margin: 0 1px 1px 0; background: var(--bg2); color: var(--muted); cursor: pointer; transition: color .15s, background .15s; }
-  .stepper button:last-child { margin-right: 0; }
-  .stepper button:hover { color: var(--fg); background: var(--bg3); }
-  .stepper button[aria-selected="true"] { background: var(--bg); color: var(--accent); }
-  .stepper button:focus-visible, .btn:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .sample { background: var(--bg); border: 1px solid var(--line); border-radius: 0 0 12px 12px; padding: 22px 24px; min-height: 112px; font-size: 16px; color: var(--fg2); }
-  .sample b { color: var(--fg); font-weight: 500; }
-  .sample .loss { display: block; margin-top: 14px; font: 12.5px var(--mono); color: var(--dim); }
-
-  /* roadmap */
-  .roadmap { list-style: none; padding: 0; margin: 36px 0 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-  .roadmap li { display: grid; grid-template-columns: 96px 1fr; gap: 20px; padding: 20px 24px; border-top: 1px solid var(--line); align-items: baseline; }
-  .roadmap li:first-child { border-top: 0; }
-  .roadmap .st { font: 500 11.5px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--dim); display: inline-flex; align-items: center; gap: 8px; }
-  .roadmap .st::before { content: ""; width: 7px; height: 7px; border-radius: 50%; border: 1px solid var(--dim); flex: none; }
-  .roadmap li.done .st::before { background: var(--fg2); border-color: var(--fg2); }
-  .roadmap li.next .st { color: var(--accent); }
-  .roadmap li.next .st::before { border-color: var(--accent); }
-  .roadmap li.next { background: var(--bg2); }
-  .roadmap b { display: block; color: var(--fg); font-weight: 500; margin-bottom: 2px; }
-  .roadmap span.d { color: var(--muted); font-size: 14.5px; }
-
-  footer { padding: 40px 0 64px; color: var(--dim); font-size: 13.5px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px 40px; }
-  footer span { max-width: 60ch; }
-  footer a { color: var(--muted); }
-
-  @media (max-width: 920px) {
-    .hero { grid-template-columns: 1fr; gap: 48px; padding: 64px 0 72px; }
-    .two { grid-template-columns: 1fr; gap: 48px; }
-    .g4 { grid-template-columns: repeat(2, 1fr); }
-    .g3 { grid-template-columns: 1fr; }
-    section { padding: 80px 0; }
-  }
-  @media (max-width: 760px) {
-    nav .links .hide-m { display: none; }
-  }
-  @media (max-width: 640px) {
-    .wrap { padding: 0 16px; }
-    .g2 { grid-template-columns: 1fr; }
-    .stat { padding: 20px 16px; }
-    .stat b { font-size: 20px; }
-    .card { padding: 22px 18px; }
-    .lang { grid-template-columns: 112px 1fr 48px; gap: 10px; font-size: 13px; }
-    .speed .lang { grid-template-columns: 72px 1fr 62px; }
-    .roadmap li { grid-template-columns: 1fr; gap: 6px; padding: 18px 16px; }
-    .src-row { padding: 12px 16px; }
-    .sample { padding: 18px 16px; }
-    section { padding: 64px 0; }
-    .hero { padding: 48px 0 56px; }
-    h1 { margin-top: 22px; }
-    .sub { font-size: 16px; }
-    nav .links { gap: 14px; }
-  }
-  @media (max-width: 640px) {
-    .btn { white-space: normal; height: auto; min-height: 40px; padding: 8px 14px; }
-  }
-  @media (max-width: 400px) {
-    .g4 { grid-template-columns: 1fr; }
-    nav .links .hide-s { display: none; }
-  }
-</style>
+<link rel="stylesheet" href="/site.css">
 </head>
 <body>
 <div class="navbar">
   <div class="wrap">
     <nav>
-      <a class="brand" href="#">
+      <a class="brand" href="/">
         <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M1 3.5 Q9 1.5 17 3.5" stroke="#fafafa" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M4 3 V16 M9 2.5 V14 M14 3 V16" stroke="#71717a" stroke-width="1.3" stroke-linecap="round"/><circle cx="4" cy="8" r="1.7" fill="#fafafa"/><circle cx="9" cy="6.5" r="1.7" fill="#f0a646"/><circle cx="9" cy="10" r="1.7" fill="#f0a646"/><circle cx="14" cy="11" r="1.7" fill="#fafafa"/></svg>
         quipu
       </a>
       <div class="links">
-        <a class="hide-s" href="#latest">Latest</a>
-        <a class="hide-m" href="#distill">Distillation</a>
-        <a class="hide-m" href="#data-v3">Data</a>
-        <a class="hide-m" href="#model">114M</a>
-        <a class="hide-s" href="#next">Next</a>
-        <span class="sep hide-s"></span>
+        <a href="/models">Models</a>
+        <a href="/distillation">Distillation</a>
+        <a href="/data">Data</a>
+        <a href="/engineering">Engineering</a>
+        <a href="/decisions">Decisions</a>
+        <a href="/roadmap">Roadmap</a>
+        <span class="sep"></span>
         <a class="ext" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Demo</a>
-        <a class="ext hide-m" href="https://huggingface.co/AneekC">Hugging Face</a>
+        <a class="ext" href="https://huggingface.co/AneekC">Hugging Face</a>
         <a class="ext" href="https://github.com/Aneek1/quipu">GitHub</a>
-        <a class="ext" href="#contact">Contact</a>
+        <a class="ext" href="/contact">Contact</a>
       </div>
     </nav>
   </div>
@@ -271,12 +49,12 @@
   <div class="wrap">
     <header class="hero">
       <div>
-        <a class="status" href="#data-v3"><span class="tag">New</span>A 10B-token pretraining set from 42 open sources<span class="arr" aria-hidden="true">&rarr;</span></a>
+        <a class="status" href="/data"><span class="tag">New</span>A 10B-token pretraining set from 42 open sources<span class="arr" aria-hidden="true">&rarr;</span></a>
         <h1>Small language models, <span class="dim">trained from scratch on a tight budget.</span></h1>
         <p class="sub">Own weights, own tokenizer, own data pipeline, no fine-tuned base. It started on an 8&nbsp;GB laptop GPU; the current model is a 1B mixture of experts that cost under $20 to train on one rented GPU.</p>
         <div class="cta">
           <a class="btn primary" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Try the chat demo</a>
-          <a class="btn ghost" href="#distill">See the latest result</a>
+          <a class="btn ghost" href="/distillation">See the latest result</a>
           <a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Download the weights <span class="arr">↗</span></a>
         </div>
       </div>
@@ -290,210 +68,23 @@
 </div>
 
 <main class="wrap">
-  <section id="latest">
-    <p class="label"><span class="idx">01</span> Latest · quipu-moe-1B-A149M</p>
-    <h2>A 1B mixture of experts that uses 149M parameters per token.</h2>
-    <p class="intro muted">Pretrained from scratch on one rented RTX 5090. Cost from the spend ledger, including the A/B tests, the chat fine-tune and evaluation.</p>
-    <div class="grid g4">
-      <div class="stat"><b>998M / 149M</b><span>parameters, total / active</span></div>
-      <div class="stat"><b>4.26B</b><span>training tokens</span></div>
-      <div class="stat"><b>44.3k</b><span>tokens / second, bf16</span></div>
-      <div class="stat"><b class="acc">$18.75</b><span>total compute cost</span></div>
+  <section id="pages" style="border-bottom:0;padding-bottom:72px">
+    <p class="label"><span class="idx">00</span> On this site</p>
+    <h2>Read it a page at a time.</h2>
+    <div class="grid g3">
+      <a class="card" href="/models"><span class="n acc">01 · models</span><h3>A 1B mixture of experts for $18.75.<span class="arr" aria-hidden="true">&rarr;</span></h3><p>998M parameters, 149M used per token, pretrained on one rented GPU. Plus the first model, trained on a laptop.</p></a>
+      <a class="card" href="/distillation"><span class="n acc">02 · distillation</span><h3>Keep only answers that pass their tests.<span class="arr" aria-hidden="true">&rarr;</span></h3><p>498,813 of 638,342 teacher answers passed in a sandbox. MBPP went from 1.9% to 7.4%.</p></a>
+      <a class="card" href="/data"><span class="n acc">03 · data</span><h3>Ten billion tokens for $2.51.<span class="arr" aria-hidden="true">&rarr;</span></h3><p>42 open, licence-checked sources, benchmarks filtered out.</p></a>
+      <a class="card" href="/engineering"><span class="n acc">04 · engineering</span><h3>Silent failures, caught before the run.<span class="arr" aria-hidden="true">&rarr;</span></h3><p>Multi-GPU training verified, expert dispatch 3.24x faster, and four bugs that would have failed quietly.</p></a>
+      <a class="card" href="/decisions"><span class="n acc">05 · decisions</span><h3>Why each choice was made.<span class="arr" aria-hidden="true">&rarr;</span></h3><p>Every major design choice as a decision tree: what was picked, what was rejected, and the number behind it.</p></a>
+      <a class="card" href="/roadmap"><span class="n acc">06 · roadmap</span><h3>Where it goes next.<span class="arr" aria-hidden="true">&rarr;</span></h3><p>Continued pretraining on free compute credits, then a chat fine-tune on all the verified answers.</p></a>
     </div>
-
-    <div class="two">
-      <div>
-        <h3 class="h-sm">What changed from 114M</h3>
-        <p>16 layers, each with one shared expert and 64 small routed experts, of which every token uses 4. Routing is balanced without an auxiliary loss (Quantile Balancing). A new 49,152-token tokenizer, trained for this model, keeps code indentation intact and covers ten languages.</p>
-        <p>Every design switch was A/B tested at 200M tokens before the full run, and the losers are published too. Muon beat AdamW clearly: <span class="mono">3.32</span> vs <span class="mono">4.06</span> loss, against seed noise of <span class="mono">0.03</span>.</p>
-        <p class="note">Data: 60% permissively licensed code, 28% English, 12% Indonesian, Malay, Chinese, Japanese, Korean, Tamil, Hindi and Urdu, each document checked with my own language-ID model. HumanEval and MBPP were filtered out of the training data.</p>
-      </div>
-      <div>
-        <h3 class="h-sm">Bits per byte at the end of pretraining</h3>
-        <p class="note">Lower is better, comparable across tokenizers. Held-out text per language, and held-out code.</p>
-        <div class="rows" id="bpb" aria-label="Bits per byte per language at the final pretraining step"></div>
-      </div>
-    </div>
-    <div class="links-row"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M">Base model and full model card on Hugging Face <span class="arr">↗</span></a></div>
-  </section>
-
-  <section id="distill">
-    <p class="label"><span class="idx">02</span> Distillation</p>
-    <h2>Keep only the answers that pass their tests.</h2>
-    <p class="intro">The chat model could barely write code: greedy decoding solved 5 of MBPP's 257 problems. So an open-weight teacher, <a href="https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct">Qwen2.5-Coder-1.5B-Instruct</a> (Apache-2.0), answered 5,000 coding problems, and every answer was run against the problem's unit tests in a sandbox. Only the 3,277 that passed were kept. The chat fine-tune was then repeated with those added.</p>
-    <div class="grid g2">
-      <div class="stat"><b>1.9% → 7.4%</b><span>MBPP pass@1, greedy (5 → 19 of 257)</span></div>
-      <div class="stat"><b>0% → 0.6%</b><span>HumanEval pass@1, greedy (0 → 1 of 164)</span></div>
-    </div>
-    <div class="grid g2" style="margin-top:16px">
-      <div class="card"><span class="n">honest scale</span><h3>About 4x better, and still low.</h3><p>SantaCoder (1.1B) reports around 35% on MBPP and Qwen2.5-Coder-1.5B about 69%, with different settings. Quipu uses 149M parameters per token and saw 4.26B tokens. It is not competing with them yet.</p></div>
-      <div class="card"><span class="n acc">done · v2</span><h3>The same idea, at a much bigger scale.</h3><p>A 7B teacher, Qwen2.5-Coder-7B-Instruct (Apache-2.0), generated 638,342 answers, and every one was run against its unit tests in a sandbox. 498,813 passed and were kept: 78.1%.</p><p>Generation ran on a rented RTX 3090, the laptop and Modal H100s; verification ran on Modal CPUs.</p></div>
-    </div>
-    <div class="grid g3" style="margin-top:16px">
-      <div class="stat"><b>638,342</b><span>teacher answers generated (v2)</span></div>
-      <div class="stat"><b class="acc">498,813</b><span>passed their unit tests and kept</span></div>
-      <div class="stat"><b>78.1%</b><span>pass rate</span></div>
-    </div>
-    <div class="links-row"><a class="btn primary" href="https://aneek1--quipu-chat-ui.us-east.modal.run">Try it in the chat demo <span class="arr">→</span></a><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-moe-1B-A149M-chat-distill">Distilled model and model card on Hugging Face <span class="arr">↗</span></a></div>
-    <p class="note" style="margin-top:16px">The demo runs on a small CPU machine that sleeps when idle: the first visit can take about 15 seconds to wake it.</p>
-  </section>
-
-  <section id="data-v3">
-    <p class="label"><span class="idx">03</span> Data v3</p>
-    <h2>Ten billion tokens of pretraining data, built for $2.51.</h2>
-    <p class="intro">The next pretraining batch: 10,000,003,101 tokens from 42 open, licence-checked sources, built on Modal CPUs. Benchmark problems (HumanEval and MBPP) were filtered out, as before.</p>
-    <div class="grid g4">
-      <div class="stat"><b>10.0B</b><span>tokens (10,000,003,101)</span></div>
-      <div class="stat"><b class="acc">$2.51</b><span>to build, on Modal CPUs</span></div>
-      <div class="stat"><b>42</b><span>open, licence-checked sources</span></div>
-      <div class="stat"><b>45%</b><span>code from starcoderdata</span></div>
-    </div>
-    <div class="two">
-      <div>
-        <h3 class="h-sm">What's in it</h3>
-        <p>Mostly code and educational text, with maths, reference text, nine languages from FineWeb-2, and a small slice of the verified teacher answers from distillation v2.</p>
-        <div class="mixbar" aria-hidden="true">
-          <div style="flex:45;background:var(--accent)"></div>
-          <div style="flex:20;background:#d4d4d8"></div>
-          <div style="flex:10;background:#a1a1aa"></div>
-          <div style="flex:7;background:#71717a"></div>
-          <div style="flex:5;background:#52525b"></div>
-          <div style="flex:5;background:#52525b"></div>
-          <div style="flex:4;background:#3f3f46"></div>
-          <div style="flex:3;background:#3f3f46"></div>
-          <div style="flex:1;background:var(--accent)"></div>
-        </div>
-        <div class="legend"><span><i style="background:var(--accent)"></i>code + verified answers</span><span><i style="background:#a1a1aa"></i>text, maths, languages</span></div>
-      </div>
-      <div class="panel src" aria-label="Data v3 source mix">
-        <div class="src-row"><span class="name">Code<small>starcoderdata</small></span><span class="p">45%</span><span class="bar"><i class="acc" style="width:100%"></i></span></div>
-        <div class="src-row"><span class="name">Educational web text<small>FineWeb-Edu</small></span><span class="p">20%</span><span class="bar"><i style="width:44.4%"></i></span></div>
-        <div class="src-row"><span class="name">Nine languages<small>FineWeb-2</small></span><span class="p">10%</span><span class="bar"><i style="width:22.2%"></i></span></div>
-        <div class="src-row"><span class="name">Maths</span><span class="p">7%</span><span class="bar"><i style="width:15.6%"></i></span></div>
-        <div class="src-row"><span class="name">Stack Exchange<small>dump of March 2023</small></span><span class="p">5%</span><span class="bar"><i style="width:11.1%"></i></span></div>
-        <div class="src-row"><span class="name">Older code<small>github-code-clean</small></span><span class="p">5%</span><span class="bar"><i class="acc" style="width:11.1%"></i></span></div>
-        <div class="src-row"><span class="name">Reference<small>Wikipedia, peS2o, arXiv</small></span><span class="p">4%</span><span class="bar"><i style="width:8.9%"></i></span></div>
-        <div class="src-row"><span class="name">Code-related web</span><span class="p">3%</span><span class="bar"><i style="width:6.7%"></i></span></div>
-        <div class="src-row"><span class="name">Verified answers<small>distillation v2</small></span><span class="p">1%</span><span class="bar"><i class="acc" style="width:2.2%"></i></span></div>
-      </div>
-    </div>
-  </section>
-
-  <section id="scale">
-    <p class="label"><span class="idx">04</span> Training code</p>
-    <h2>Ready for more than one GPU.</h2>
-    <p class="intro muted">Everything so far was trained on one GPU. These two changes are for the runs after that.</p>
-    <div class="grid g2">
-      <div class="card"><span class="n acc">verified · 14 Oct 2026</span><h3>Multi-GPU data-parallel training.</h3><p>Verified on real GPUs: the 2-GPU test passed. The same training code runs on one GPU or several.</p></div>
-      <div class="card"><span class="n">mixture of experts</span><h3>Expert dispatch rewritten with grouped matmuls: 3.24x faster.</h3><p>Measured on a B200, in tokens per second.</p>
-        <div class="speed" aria-label="Throughput on a B200: 113k tokens per second before, 366k after">
-          <div class="lang"><span>before</span><span class="track"><span class="fill" style="width:30.9%;background:var(--dim)"></span></span><span class="pct">113k/s</span></div>
-          <div class="lang"><span>grouped</span><span class="track"><span class="fill acc" style="width:100%"></span></span><span class="pct">366k/s</span></div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="model">
-    <p class="label"><span class="idx">05</span> First model · quipu-114m</p>
-    <h2>A 114M-parameter decoder, sized for one laptop.</h2>
-    <p class="intro muted">Every number here was measured on the machine that trained it, an RTX 5060 Laptop GPU with 8 GB.</p>
-    <div class="grid g4">
-      <div class="stat"><b>114,114,048</b><span>parameters</span></div>
-      <div class="stat"><b>3B</b><span>training tokens</span></div>
-      <div class="stat"><b>18.4k</b><span>tokens / second, bf16</span></div>
-      <div class="stat"><b>45 h 22 m</b><span>training time, zero restarts</span></div>
-    </div>
-
-    <div class="two">
-      <div>
-        <h3 class="h-sm">Architecture</h3>
-        <p>Decoder-only transformer in the modern style: RMSNorm, rotary position embeddings, SwiGLU feed-forward, and grouped-query attention with 12 query heads sharing 4 key/value heads. Input and output embeddings are tied, and the context is 1,024 tokens.</p>
-        <p class="note">Short context by design. Long-range recall is meant to come from memory rather than a longer attention window.</p>
-      </div>
-      <div class="stack" aria-label="Model layer stack">
-        <div class="layer io">Token embedding <small>tied with output</small></div>
-        <div class="layer block">RMSNorm → Attention <small>GQA 12q / 4kv · RoPE</small></div>
-        <div class="layer block">RMSNorm → Feed-forward <small>SwiGLU</small></div>
-        <div class="repeat">× N blocks</div>
-        <div class="layer">Final RMSNorm</div>
-        <div class="layer io">Output head <small>shares embedding weights</small></div>
-      </div>
-    </div>
-  </section>
-
-  <section id="data">
-    <p class="label"><span class="idx">06</span> Data · quipu-114m</p>
-    <h2>Three billion tokens: mostly text, one-fifth code.</h2>
-    <p class="intro">80% <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a>, 20% code from <a href="https://huggingface.co/datasets/codeparrot/github-code-clean">github-code-clean</a>. Only permissive licences are kept: MIT, Apache-2.0, BSD, ISC, CC0 and Unlicense. Minified files, vendored directories and files over 16k tokens are filtered out. That filter alone removed as many tokens as the entire code budget.</p>
-    <div class="mixbar" aria-hidden="true" style="max-width:720px">
-      <div style="flex:80;background:#a1a1aa"></div>
-      <div style="flex:20;background:var(--accent)"></div>
-    </div>
-    <div class="legend"><span><i style="background:#a1a1aa"></i>Educational web text · 80%</span><span><i style="background:var(--accent)"></i>Code · 20%</span></div>
-
-    <div class="rows" id="langs" aria-label="Share of code by language" style="margin-top:36px;max-width:720px"></div>
-    <p class="note" style="margin-top:16px">HTML is capped at 10% so markup doesn't crowd out the languages the model should actually learn to write.</p>
-  </section>
-
-  <section id="engineering">
-    <p class="label"><span class="idx">07</span> Engineering</p>
-    <h2>The failures that don't announce themselves.</h2>
-    <p class="intro muted">Most of the work in a long unattended run is catching things that fail silently. Each of these was found in review, before the run.</p>
-    <div class="grid g2">
-      <div class="card"><span class="n acc">01 · speed</span><h3>Attention was quietly using a slow kernel.</h3><p>Fixing the fallback took the projected run for the original budget from ~65 hours to ~39.</p></div>
-      <div class="card"><span class="n acc">02 · I/O</span><h3>About 1 in 130 file renames fails transiently.</h3><p>That is enough to kill a 50-hour run over a log write. Every atomic write now retries.</p></div>
-      <div class="card"><span class="n acc">03 · resume</span><h3>A resume could restart from zero, silently.</h3><p>After days of training, with no error. It now refuses unless nothing could have been saved.</p></div>
-      <div class="card"><span class="n acc">04 · numerics</span><h3>One bad batch could have deleted every clean checkpoint.</h3><p>Non-finite steps are now skipped, and three in a row stop the run before retention prunes the good ones.</p></div>
-    </div>
-  </section>
-
-  <section id="results">
-    <p class="label"><span class="idx">08</span> Results · quipu-114m</p>
-    <h2>It learned the shape of language in 45 hours.</h2>
-    <p class="intro muted">All 5,722 steps ran unattended over a weekend: no restarts, no skipped steps, no data repeated. Validation loss on held-out FineWeb-Edu text, measured every 100 steps:</p>
-    <figure class="panel chart">
-      <div class="panel-h"><span>fig. 02 · text validation loss</span><span>step</span></div>
-      <svg id="curve" viewBox="0 0 640 300" role="img" aria-label="Validation loss falls from 6.38 at step 100 to 3.27 at step 5,700"></svg>
-      <figcaption><span class="mono" style="color:var(--fg)">6.38 → 3.27</span> text validation loss. Most of the gain comes in the first 1,000 steps (0.5B tokens); after that it is slow and steady, and nearly flat by the last few hundred steps.</figcaption>
-    </figure>
-
-    <h3 class="h-sm" style="margin-top:64px">Watch it learn</h3>
-    <p class="note">Same prompt, greedy decoding, at each saved milestone.</p>
-    <div class="stepper" role="tablist" id="stepper"></div>
-    <div class="sample" id="sample" aria-live="polite"></div>
-
-    <div class="grid g2" style="margin-top:36px">
-      <div class="card"><span class="n">verdict</span><h3>Fluent, on topic, and often wrong.</h3><p>The final model says the printing press was invented "in 1848 by the French printer Pierre-Louis Leclerc". That is the honest result for a 114M base model: it has learned the form of knowledge without reliable facts, and it still repeats itself under greedy decoding.</p></div>
-      <div class="card"><span class="n">caveat · code</span><h3>The code loss of 0.97 flatters it.</h3><p>GPT-2's tokenizer splits indentation into single spaces: 36.5% of the code validation tokens are pure whitespace, against 2.0% for text. They are easy to predict, and greedy code output collapses into runs of spaces. That measurement is why the next model gets a code-aware tokenizer.</p></div>
-    </div>
-    <div class="links-row"><a class="btn ghost" href="https://huggingface.co/AneekC/quipu-114m">Weights, milestones and model card on Hugging Face <span class="arr">↗</span></a></div>
-  </section>
-
-  <section id="next">
-    <p class="label"><span class="idx">09</span> Next</p>
-    <h2>Where it goes from here.</h2>
-    <ol class="roadmap">
-      <li class="done"><span class="st">done</span><div><b>Pretraining at 114M</b><span class="d">3B tokens in 45 hours on one laptop GPU. Weights are public.</span></div></li>
-      <li class="done"><span class="st">done</span><div><b>1B mixture of experts with a code-aware tokenizer</b><span class="d">4.26B tokens, ten languages and code, $18.75 in total. The whitespace result above is why the tokenizer changed.</span></div></li>
-      <li class="done"><span class="st">done</span><div><b>Chat fine-tune and execution-verified distillation</b><span class="d">Human-written conversations, then teacher answers that pass their tests: MBPP 1.9% → 7.4%.</span></div></li>
-      <li class="done"><span class="st">done</span><div><b>Distillation v2</b><span class="d">A 7B teacher, 638,342 answers, every one tested; 498,813 verified answers kept (78.1%).</span></div></li>
-      <li class="done"><span class="st">done</span><div><b>Data v3 and multi-GPU training</b><span class="d">10B tokens from 42 open sources for $2.51; data-parallel training verified on 2 GPUs; MoE dispatch 3.24x faster.</span></div></li>
-      <li class="next"><span class="st">next</span><div><b>Continued pretraining on data v3</b><span class="d">Monthly runs on free compute credits, with a decayed checkpoint released every two months.</span></div></li>
-      <li class="next"><span class="st">next</span><div><b>Chat fine-tune on the verified answers</b><span class="d">All 498k execution-verified answers from distillation v2.</span></div></li>
-      <li><span class="st">later</span><div><b>A ~1B-active model</b><span class="d">When bigger compute is available.</span></div></li>
-    </ol>
-  </section>
-
-  <section id="contact" style="border-bottom:0">
-    <p class="label"><span class="idx">10</span> Contact</p>
-    <h2>Get in touch.</h2>
-    <p class="contact-lede">Questions about the models or the data, bug reports, research collaboration, or compute for bigger runs.</p>
-    <a class="contact-mail" href="mailto:hello@quipulm.dev">hello@quipulm.dev<span class="arr" aria-hidden="true">&rarr;</span></a>
-    <p class="contact-alt">Issues and pull requests are welcome on <a href="https://github.com/Aneek1/quipu/issues">GitHub</a>.</p>
   </section>
 </main>
 
+<div class="wrap">
+  <a class="next-page" href="/models"><span><small>Next</small><b>The models</b></span><span class="arr" aria-hidden="true">&rarr;</span></a>
+</div>
 <div style="border-top:1px solid var(--line)">
   <footer class="wrap">
     <span>A <em>quipu</em> is the Incan recording device: knotted cords that stored records, read by running them through the hands.</span>
@@ -501,122 +92,7 @@
   </footer>
 </div>
 
-<script>
-  const NS = "http://www.w3.org/2000/svg";
-  const MONO = "Geist Mono, JetBrains Mono, ui-monospace, monospace";
-
-  // Code-share data, from the build manifest.
-  const LANGS = [
-    ["Java", 34.69], ["JavaScript", 17.19], ["Python", 14.51], ["PHP", 12.38],
-    ["HTML (capped)", 10.00], ["Go", 4.24], ["TypeScript", 2.78], ["CSS", 2.76],
-    ["Shell", 0.84], ["SQL", 0.53], ["Dockerfile", 0.08]
-  ];
-
-  function barRow(parent, name, width, value, acc) {
-    const row = document.createElement("div"); row.className = "lang";
-    const label = document.createElement("span"); label.textContent = name;
-    const track = document.createElement("span"); track.className = "track";
-    const fill = document.createElement("span"); fill.className = "fill" + (acc ? " acc" : "");
-    fill.style.width = width.toFixed(1) + "%";
-    track.appendChild(fill);
-    const pct = document.createElement("span"); pct.className = "pct"; pct.textContent = value;
-    row.append(label, track, pct);
-    parent.appendChild(row);
-  }
-
-  const langs = document.getElementById("langs");
-  const max = LANGS[0][1];
-  LANGS.forEach(([name, pct], i) => barRow(langs, name, Math.max(pct / max * 100, 0.8), pct.toFixed(pct < 1 ? 2 : 1) + "%", i === 0));
-
-  // Quipu: a main cord with pendant cords; knots encode the rounded share in tens and units.
-  const svg = document.getElementById("quipu");
-  const el = (tag, attrs) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); svg.appendChild(n); return n; };
-  const cordShades = ["#71717a", "#52525b", "#a1a1aa", "#52525b", "#71717a", "#52525b", "#a1a1aa", "#52525b"];
-
-  const cords = LANGS.slice(0, 8);
-  const x0 = 38, gap = (440 - 2 * x0) / (cords.length - 1), cordTop = 34;
-  // faint guide lines for the tens and units registers
-  el("line", { x1: 14, x2: 426, y1: 140, y2: 140, stroke: "#27272a", "stroke-width": 1, "stroke-dasharray": "2 4" });
-  el("path", { d: `M10 ${cordTop} Q220 ${cordTop - 16} 430 ${cordTop}`, stroke: "#e4e4e7", "stroke-width": 3.5, fill: "none", "stroke-linecap": "round" });
-  cords.forEach(([name, pct], i) => {
-    const x = x0 + i * gap, v = Math.round(pct), tens = Math.floor(v / 10), units = v % 10;
-    const hi = i === 0;
-    const cord = hi ? "#f0a646" : cordShades[i];
-    const knot = hi ? "#f0a646" : "#d4d4d8";
-    const sway = (i % 2 ? 1 : -1) * 3;
-    el("path", { d: `M${x} ${cordTop - 2} C${x + sway} 110 ${x - sway} 200 ${x} 262`, stroke: cord, "stroke-width": hi ? 2.4 : 1.8, fill: "none", "stroke-linecap": "round" });
-    for (let k = 0; k < tens; k++) el("circle", { cx: x, cy: 78 + k * 11, r: 4.6, fill: knot });
-    for (let k = 0; k < units; k++) el("ellipse", { cx: x, cy: 152 + k * 10, rx: 3.8, ry: 3, fill: knot, opacity: hi ? 1 : .8 });
-    const t = el("text", { x, y: 286, "text-anchor": "middle", "font-size": 10.5, fill: hi ? "#f0a646" : "#a1a1aa", "font-family": MONO });
-    t.textContent = name.replace(" (capped)", "").replace("JavaScript", "JS").replace("TypeScript", "TS");
-  });
-
-  // Bits per byte at step 8,129, from the quipu-moe-1B-A149M model card.
-  const BPB = [["Code", 0.448], ["Tamil", 0.491], ["Hindi (Devanagari)", 0.568], ["English", 0.959],
-    ["Indonesian", 1.157], ["Malay", 1.162], ["Korean", 1.199], ["Japanese", 1.234],
-    ["Hindi (romanised)", 1.255], ["Urdu (romanised)", 1.582], ["Chinese (Trad.)", 1.728], ["Chinese (Simp.)", 1.768]];
-  const bpbEl = document.getElementById("bpb");
-  BPB.forEach(([name, v]) => barRow(bpbEl, name, v / 2 * 100, v.toFixed(2), name === "Code"));
-
-  // Validation loss every 100 steps, from results/runs/quipu-114m-weekend.json.
-  const VAL = [[100, 6.378], [200, 5.471], [300, 4.926], [400, 4.612], [500, 4.364], [600, 4.17], [700, 4.047], [800, 3.959], [900, 3.879], [1000, 3.819], [1100, 3.774], [1200, 3.744], [1300, 3.708], [1400, 3.676], [1500, 3.648], [1600, 3.63], [1700, 3.601], [1800, 3.579], [1900, 3.567], [2000, 3.55], [2100, 3.529], [2200, 3.514], [2300, 3.509], [2400, 3.485], [2500, 3.472], [2600, 3.468], [2700, 3.452], [2800, 3.441], [2900, 3.441], [3000, 3.424], [3100, 3.41], [3200, 3.402], [3300, 3.393], [3400, 3.385], [3500, 3.376], [3600, 3.369], [3700, 3.362], [3800, 3.353], [3900, 3.348], [4000, 3.346], [4100, 3.332], [4200, 3.326], [4300, 3.323], [4400, 3.317], [4500, 3.312], [4600, 3.308], [4700, 3.303], [4800, 3.299], [4900, 3.293], [5000, 3.29], [5100, 3.286], [5200, 3.281], [5300, 3.282], [5400, 3.281], [5500, 3.276], [5600, 3.274], [5700, 3.275]];
-  (function drawCurve() {
-    const svg = document.getElementById("curve");
-    const W = 640, H = 300, L = 44, R = 14, T = 14, B = 34;
-    const xmax = 5722, ymin = 3.0, ymax = 6.6;
-    const X = s => L + (s / xmax) * (W - L - R);
-    const Y = v => T + (ymax - v) / (ymax - ymin) * (H - T - B);
-    const add = (tag, attrs, text) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (text) n.textContent = text; svg.appendChild(n); return n; };
-    const defs = add("defs", {});
-    const g = document.createElementNS(NS, "linearGradient");
-    g.setAttribute("id", "fade"); g.setAttribute("x1", "0"); g.setAttribute("x2", "0"); g.setAttribute("y1", "0"); g.setAttribute("y2", "1");
-    for (const [o, a] of [["0", .22], ["1", 0]]) { const s = document.createElementNS(NS, "stop"); s.setAttribute("offset", o); s.setAttribute("stop-color", "#f0a646"); s.setAttribute("stop-opacity", a); g.appendChild(s); }
-    defs.appendChild(g);
-    for (const v of [3, 4, 5, 6]) {
-      add("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: "#27272a", "stroke-width": 1 });
-      add("text", { x: L - 8, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "#71717a", "font-family": MONO }, v.toFixed(1));
-    }
-    for (const s of [0, 1000, 2000, 3000, 4000, 5000]) {
-      add("text", { x: X(s), y: H - 12, "text-anchor": "middle", "font-size": 11, fill: "#71717a", "font-family": MONO }, s === 0 ? "0" : (s / 1000) + "k");
-    }
-    const d = VAL.map(([s, v], i) => (i ? "L" : "M") + X(s).toFixed(1) + " " + Y(v).toFixed(1)).join(" ");
-    const area = d + ` L ${X(VAL[VAL.length - 1][0]).toFixed(1)} ${Y(ymin)} L ${X(VAL[0][0]).toFixed(1)} ${Y(ymin)} Z`;
-    add("path", { d: area, fill: "url(#fade)" });
-    add("path", { d, stroke: "#f0a646", "stroke-width": 2, fill: "none", "stroke-linejoin": "round" });
-    const last = VAL[VAL.length - 1];
-    add("circle", { cx: X(last[0]), cy: Y(last[1]), r: 4, fill: "#09090b", stroke: "#f0a646", "stroke-width": 2 });
-    add("text", { x: X(last[0]) - 8, y: Y(last[1]) - 12, "text-anchor": "end", "font-size": 12, fill: "#fafafa", "font-family": MONO }, last[1].toFixed(2));
-  })();
-
-  // Greedy samples for one prompt, from results/milestones/samples.md (trimmed).
-  const PROMPT = "Photosynthesis is the process by which";
-  const SAMPLES = [
-    [100, 6.40, "the first is the first of the first time of the first time of the first time of the first time…"],
-    [250, 5.20, "the system is not the same. The current is the most common type of the system, which is the most common type of the system."],
-    [500, 4.40, "the temperature is measured. The temperature of the temperature is measured by the temperature of the temperature…"],
-    [1000, 3.85, "the body absorbs energy from the sun. The sun is the most abundant source of energy in the sun."],
-    [2000, 3.58, "plants grow and reproduce. Plants are able to produce energy from the sun and sunlight."],
-    [4000, 3.38, "plants convert carbon dioxide into oxygen and convert it into energy."],
-    [5722, 3.31, "plants convert carbon dioxide into oxygen and release carbon dioxide into the atmosphere."]
-  ];
-  const stepper = document.getElementById("stepper"), sample = document.getElementById("sample");
-  function show(i) {
-    const [step, loss, text] = SAMPLES[i];
-    [...stepper.children].forEach((b, j) => b.setAttribute("aria-selected", String(i === j)));
-    sample.innerHTML = "";
-    const b = document.createElement("b"); b.textContent = PROMPT + " ";
-    const l = document.createElement("span"); l.className = "loss";
-    l.textContent = `step ${step.toLocaleString()} · ${(step * 524288 / 1e9).toFixed(2)}B tokens seen · text val loss ${loss.toFixed(2)}`;
-    sample.append(b, document.createTextNode(text), l);
-  }
-  SAMPLES.forEach(([step], i) => {
-    const btn = document.createElement("button");
-    btn.type = "button"; btn.setAttribute("role", "tab"); btn.textContent = step.toLocaleString();
-    btn.addEventListener("click", () => show(i));
-    stepper.appendChild(btn);
-  });
-  show(SAMPLES.length - 1);
-</script>
+<script src="/site.js"></script>
 <!-- Cloudflare Web Analytics: visitors and page views, no cookies -->
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "60f38792070543da81da7b7b615f7ecb"}'></script>
 </body>
