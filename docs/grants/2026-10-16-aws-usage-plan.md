@@ -20,9 +20,11 @@ $9,650 for 12 months, from the AWS Pricing Calculator estimate
 - **quipu-moe-1B-A149M** (998M total / 149M active parameters per token), pretrained from
   scratch on 4.26B tokens for $18.75 on one rented RTX 5090. Weights are public
   under Apache-2.0.
-- **Chat model and distillation:** a 7B open-weight teacher (Qwen2.5-Coder-7B-Instruct,
-  Apache-2.0) generated 638,342 coding answers. Each one was run against its unit
-  tests in a sandbox, and the 498,813 that passed were kept. MBPP went from 1.9% to 7.4%.
+- **Chat model and distillation:** an open-weight teacher (Qwen2.5-Coder-1.5B-Instruct,
+  Apache-2.0) answered 5,000 coding problems. Each answer was run against its unit tests
+  in a sandbox, and fine-tuning on the 3,277 that passed took MBPP from 1.9% to 7.4%.
+  The same method has since been scaled with a 7B teacher (Qwen2.5-Coder-7B-Instruct):
+  498,813 of 638,342 answers passed and are ready for the next fine-tune.
 - **Data v3:** a 10B-token pretraining set from 42 open, licence-checked sources, built
   for $2.51. HumanEval and MBPP are filtered out of it.
 - **Multi-GPU:** data-parallel training is verified on real GPUs (a 2-GPU run, with checkpoint and resume).
