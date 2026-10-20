@@ -58,3 +58,55 @@ def test_apply_precision_leaves_the_model_alone_for_fp16():
     from quipu.fp8 import apply_precision
     m = torch.nn.Linear(4, 4)
     assert apply_precision(m, "fp16", "cpu") is m
+
+
+# ---- loss scaler -------------------------------------------------------------------
+
+from quipu.lossscale import LossScaler
+
+
+def test_disabled_scaler_is_identity():
+    s = LossScaler(enabled=False)
+    assert s.scale == 1.0
+    p = torch.nn.Parameter(torch.ones(3)); p.grad = torch.full((3,), 4.0)
+    s.unscale_([p])
+    assert torch.equal(p.grad, torch.full((3,), 4.0))
+
+
+def test_unscale_divides_grads():
+    s = LossScaler(enabled=True, init_scale=8.0)
+    p = torch.nn.Parameter(torch.ones(3)); p.grad = torch.full((3,), 4.0)
+    q = torch.nn.Parameter(torch.ones(2))       # no grad: skipped
+    s.unscale_([p, q])
+    assert torch.equal(p.grad, torch.full((3,), 0.5)) and q.grad is None
+
+
+def test_overflow_halves_and_resets_the_clean_count():
+    s = LossScaler(enabled=True, init_scale=1024.0, growth_interval=3)
+    s.good_step(); s.good_step()
+    s.overflow()
+    assert s.scale == 512.0 and s.clean_steps == 0
+
+
+def test_growth_after_interval():
+    s = LossScaler(enabled=True, init_scale=2.0, growth_interval=3)
+    for _ in range(3):
+        s.good_step()
+    assert s.scale == 4.0 and s.clean_steps == 0
+
+
+def test_scale_never_goes_below_the_floor():
+    s = LossScaler(enabled=True, init_scale=2.0, floor=1.0)
+    assert not s.at_floor
+    s.overflow()
+    assert s.scale == 1.0 and s.at_floor
+    s.overflow()
+    assert s.scale == 1.0
+
+
+def test_state_round_trips():
+    s = LossScaler(enabled=True, init_scale=64.0, growth_interval=5)
+    s.overflow(); s.good_step()
+    t = LossScaler(enabled=True)
+    t.load_state_dict(s.state_dict())
+    assert (t.scale, t.clean_steps) == (32.0, 1)
