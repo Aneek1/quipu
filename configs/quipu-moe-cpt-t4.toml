@@ -13,9 +13,10 @@ moe_dispatch = "loop"
 precision             = "fp16"
 optimizer_state_dtype = "bf16"
 activation_checkpoint = "block"
-# Each 4096-token chunk of the loss peaks at ~2.4 GB (logits + their gradient,
-# measured); 1024-2048 lowers peak memory if headroom is tight.
-loss_chunk_tokens     = 4096
+# A 4096-token chunk of the loss peaks at ~2.4 GB (logits + their gradient,
+# measured), and at micro_batch 2 that is the whole micro-batch (2 x 2048), so no
+# saving; 2048 halves it (~1.2 GB). 1024 if headroom is tight.
+loss_chunk_tokens     = 2048
 compile               = false     # required: block checkpointing is refused with compile
 micro_batch           = 2         # starting point; the first session measures memory
 ckpt_dir              = "/kaggle/working/ckpt"

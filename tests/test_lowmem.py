@@ -537,7 +537,7 @@ def test_t4_config_is_the_cpt_model_with_low_memory_training():
     t = t4.train
     assert (t.precision, t.optimizer_state_dtype, t.activation_checkpoint) == \
         ("fp16", "bf16", "block")
-    assert t.loss_chunk_tokens == 4096 and t.compile is False
+    assert t.loss_chunk_tokens == 2048 and t.compile is False
     assert t.batch_tokens == cpt.train.batch_tokens
     assert t.grad_accum % 2 == 0                      # splits over 2 GPUs
     assert t.ckpt_keep == 1
