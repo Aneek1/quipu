@@ -176,3 +176,38 @@ def test_newton_schulz_fp16_survives_extreme_scales(scale):
     out = newton_schulz(g, work_dtype=torch.float16)
     assert torch.isfinite(out).all()
     assert (out - ref).norm() / ref.norm() < 0.02
+
+
+# ---- chunked loss --------------------------------------------------------------------
+
+import torch.nn.functional as F
+from quipu.lossfn import chunked_cross_entropy
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 64, 1000])
+def test_chunked_ce_equals_full_ce_and_grads(chunk):
+    gen = torch.Generator().manual_seed(0)
+    h = torch.randn(2, 30, 16, generator=gen, requires_grad=True)
+    w = torch.randn(50, 16, generator=gen, requires_grad=True)
+    y = torch.randint(50, (2, 30), generator=gen)
+    y[0, :5] = -100                                   # ignored targets (SFT)
+    full = F.cross_entropy((h @ w.T).view(-1, 50), y.view(-1), ignore_index=-100,
+                           reduction="sum")
+    gh, gw = torch.autograd.grad(full, (h, w))
+    out = chunked_cross_entropy(h, w, y, chunk, ignore_index=-100)
+    ch, cw = torch.autograd.grad(out, (h, w))
+    torch.testing.assert_close(out, full, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(ch, gh, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(cw, gw, rtol=1e-5, atol=1e-6)
+
+
+def test_models_return_hidden_matching_logits(tmp_path):
+    from quipu.model_factory import build_model
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
+    torch.manual_seed(0)
+    m = build_model(cfg.model).eval()
+    x = torch.randint(cfg.model.vocab_size, (2, 16))
+    with torch.no_grad():
+        logits = m(x)
+        h = m(x, return_hidden=True)
+    torch.testing.assert_close(m.lm_head(h), logits)

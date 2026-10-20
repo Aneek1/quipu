@@ -109,7 +109,7 @@ class QuipuMoE(nn.Module):
         self.last_stats[i // 2] = stats
         return m.to(h.dtype)
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, return_hidden: bool = False) -> torch.Tensor:
         assert idx.shape[1] <= self.cfg.context, (
             f"sequence length {idx.shape[1]} exceeds context {self.cfg.context}"
         )
@@ -121,7 +121,9 @@ class QuipuMoE(nn.Module):
                 x, self.last_stats[l] = block(x, cos, sin)
         else:
             x = self.attnres(x, lambda i, h: self._sublayer(i, h, cos, sin))
-        return self.lm_head(self.norm(x))
+        # return_hidden: the final normed hidden states, for quipu.lossfn's chunked loss.
+        h = self.norm(x)
+        return h if return_hidden else self.lm_head(h)
 
     def accumulate_balance_scores(self, max_rows: int | None = None,
                                   index: int | None = None) -> None:

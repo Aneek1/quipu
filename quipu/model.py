@@ -146,7 +146,7 @@ class Quipu(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, return_hidden: bool = False) -> torch.Tensor:
         assert idx.shape[1] <= self.cfg.context, (
             f"sequence length {idx.shape[1]} exceeds context {self.cfg.context}"
         )
@@ -154,4 +154,6 @@ class Quipu(nn.Module):
         cos, sin = self.rope_cos, self.rope_sin
         for block in self.blocks:
             x = block(x, cos, sin)
-        return self.lm_head(self.norm(x))
+        # return_hidden: the final normed hidden states, for quipu.lossfn's chunked loss.
+        h = self.norm(x)
+        return h if return_hidden else self.lm_head(h)
