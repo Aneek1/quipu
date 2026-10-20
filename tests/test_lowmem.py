@@ -495,6 +495,20 @@ def test_loss_scale_is_checkpointed(tmp_path):
     assert r.scaler.state_dict() == t.scaler.state_dict()
 
 
+def test_bf16_checkpoint_resumes_into_fp16_at_the_initial_scale(tmp_path):
+    data = make_data(tmp_path)
+    cfg_bf16 = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
+    t = build(tmp_path, cfg_bf16, data)
+    assert not t.scaler.enabled
+    t.train_step()
+    t.save_checkpoint()
+    cfg_fp16 = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, precision="fp16")
+    r = build(tmp_path, cfg_fp16, data, run_id="t", resume=True)
+    r.resume_from_latest()
+    assert r.step == 1
+    assert r.scaler.enabled and r.scaler.scale == 2.0 ** 16 and r.scaler.clean_steps == 0
+
+
 def test_fp32_momentum_checkpoint_resumes_into_bf16_state(tmp_path):
     data = make_data(tmp_path)
     cfg32 = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
