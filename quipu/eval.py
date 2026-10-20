@@ -47,7 +47,8 @@ def _device_of(model: nn.Module) -> torch.device:
 
 @torch.no_grad()
 def estimate_loss(
-    model: nn.Module, stream: TokenStream, batches: int, device: str, amp: bool = True
+    model: nn.Module, stream: TokenStream, batches: int, device: str, amp: bool = True,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> float:
     """Mean cross-entropy over `batches` batches, leaving the stream where it was.
 
@@ -57,6 +58,7 @@ def estimate_loss(
     Training runs under bf16 autocast; eval defaults to the same numerics so the
     train and val curves are comparable, and because fp32 eval is markedly slower.
     CPU stays fp32 regardless of `amp`, since autocast("cuda", ...) is a no-op there.
+    amp_dtype is the training autocast's (fp16 under train.precision "fp16").
     """
     was_training = model.training
     saved = stream.state_dict()
@@ -64,7 +66,7 @@ def estimate_loss(
     total = 0.0
     try:
         with loop_dispatch(model), torch.autocast(
-            "cuda", dtype=torch.bfloat16, enabled=amp and str(device).startswith("cuda")
+            "cuda", dtype=amp_dtype, enabled=amp and str(device).startswith("cuda")
         ):
             for _ in range(batches):
                 x, y = stream.next_batch()
@@ -81,11 +83,12 @@ def estimate_loss(
 @torch.no_grad()
 def mean_loss(
     model: nn.Module, batches: Iterable[tuple[torch.Tensor, torch.Tensor]], device: str,
-    amp: bool = True,
+    amp: bool = True, amp_dtype: torch.dtype = torch.bfloat16,
 ) -> float:
     """Mean cross-entropy per target token over fixed (x, y) batches (a short last
     batch weighs by its tokens), loop dispatch, the training autocast on CUDA as in
-    estimate_loss. The model's training mode is put back. For the trainer's
+    estimate_loss; amp_dtype is the training autocast's (fp16 under train.precision
+    "fp16"). The model's training mode is put back. For the trainer's
     per-split evaluation (quipu.evalsets.split_batches)."""
     was_training = model.training
     model.eval()
@@ -93,7 +96,7 @@ def mean_loss(
     n = 0
     try:
         with loop_dispatch(model), torch.autocast(
-            "cuda", dtype=torch.bfloat16, enabled=amp and str(device).startswith("cuda")
+            "cuda", dtype=amp_dtype, enabled=amp and str(device).startswith("cuda")
         ):
             for x, y in batches:
                 logits = model(x.to(device))

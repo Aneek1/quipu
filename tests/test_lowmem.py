@@ -329,3 +329,14 @@ def test_dense_checkpointing_engages_and_recomputes(monkeypatch):
     x = torch.randint(256, (2, 16))
     n = mc.n_layer
     assert _count_engagement(m, qm, monkeypatch, x) == (n, n, 2 * n)
+
+
+# ---- eval dtype ----------------------------------------------------------------------
+
+def test_eval_functions_take_amp_dtype():
+    import inspect
+    from quipu.eval import estimate_loss, mean_loss
+    from quipu.train import evaluate_by_source
+    for fn in (estimate_loss, mean_loss, evaluate_by_source):
+        p = inspect.signature(fn).parameters["amp_dtype"]
+        assert p.default is torch.bfloat16

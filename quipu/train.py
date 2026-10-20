@@ -1445,13 +1445,13 @@ class Trainer:
 
 
 @torch.no_grad()
-def evaluate_by_source(model: nn.Module, root: str | Path, context: int,
-                       device: str) -> dict[str, dict[str, Any]]:
+def evaluate_by_source(model: nn.Module, root: str | Path, context: int, device: str,
+                       amp_dtype: torch.dtype = torch.bfloat16) -> dict[str, dict[str, Any]]:
     """Held-out chat loss per source (spec 13): for each <root>/<source>/ of
     scripts/build_chat_data.py's val_by_source split, every block once at
     micro_batch 1, the summed cross-entropy over its assistant targets / their
     count (the mean over the source's assistant tokens, whatever the blocks hold).
-    Loop dispatch, the training autocast on CUDA. {} when there is nothing there."""
+    Loop dispatch, the training autocast (amp_dtype) on CUDA. {} when there is nothing there."""
     from quipu.eval import loop_dispatch
 
     root = Path(root)
@@ -1469,7 +1469,7 @@ def evaluate_by_source(model: nn.Module, root: str | Path, context: int,
             n = 0
             try:
                 with loop_dispatch(model), torch.autocast(
-                        "cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda")):
+                        "cuda", dtype=amp_dtype, enabled=str(device).startswith("cuda")):
                     for _ in range(stream.n_blocks):
                         x, y = stream.next_batch()
                         n += int((y != IGNORE_INDEX).sum())
