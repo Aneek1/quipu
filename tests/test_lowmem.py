@@ -167,3 +167,12 @@ def test_build_optimizers_passes_state_dtype(tmp_path):
     opts = build_optimizers(build_model(cfg.model), cfg.train)
     muon = [o for o in opts if isinstance(o, Muon)][0]
     assert {g["state_dtype"] for g in muon.param_groups} == {"bf16"}
+
+
+@pytest.mark.parametrize("scale", [1e-6, 1e4])
+def test_newton_schulz_fp16_survives_extreme_scales(scale):
+    g = torch.randn(48, 80, generator=torch.Generator().manual_seed(5)) * scale
+    ref = newton_schulz(g, work_dtype=torch.float32)
+    out = newton_schulz(g, work_dtype=torch.float16)
+    assert torch.isfinite(out).all()
+    assert (out - ref).norm() / ref.norm() < 0.02

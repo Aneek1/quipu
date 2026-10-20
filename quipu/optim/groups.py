@@ -145,8 +145,8 @@ def apply_config_lrs(optimizers: list[torch.optim.Optimizer], cfg: TrainConfig) 
     load_state_dict (which restores the checkpoint's values). Muon groups get
     cfg.muon_lr / cfg.muon_weight_decay, and momentum / ns_steps / nesterov /
     state_dtype as build_optimizers sets them (a checkpoint older than state_dtype
-    gets it here, or from _load_optimizer_state's setdefault); AdamW groups cfg.lr, and cfg.weight_decay for the
-    decay group (tagged group["decay"] at build) while the no-decay group stays at 0.
+    gets it here, or from _load_optimizer_state's setdefault); AdamW groups cfg.lr,
+    and cfg.weight_decay for the decay group (tagged group["decay"] at build) while the no-decay group stays at 0.
     group["lr"] is left alone: the LR schedule derives it from base_lr before the
     next step."""
     for opt in optimizers:

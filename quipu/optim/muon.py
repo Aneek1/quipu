@@ -75,13 +75,22 @@ def newton_schulz(g: Tensor, steps: int = 5, work_dtype: torch.dtype | None = No
         work = cuda_work_dtype(torch.cuda.get_device_capability(g.device))
     else:
         work = torch.bfloat16 if g.dtype == torch.bfloat16 else torch.float32
-    x = g.to(work)
-    tall = x.size(-2) > x.size(-1)
-    if tall:
-        x = x.mT
     # Frobenius norm >= spectral norm, so every singular value starts <= 1, inside
     # the iteration's basin.
-    x = x / (x.norm(dim=(-2, -1), keepdim=True) + NS_EPS)
+    if work == torch.float16:
+        # fp16's range is narrow (min normal 6e-5, max 65504): a raw gradient can
+        # underflow or its norm overflow. Normalise in fp32 first, then cast.
+        base = g if g.dtype == torch.float32 else g.float()
+        x = (base / (base.norm(dim=(-2, -1), keepdim=True) + NS_EPS)).to(work)
+        tall = x.size(-2) > x.size(-1)
+        if tall:
+            x = x.mT
+    else:
+        x = g.to(work)
+        tall = x.size(-2) > x.size(-1)
+        if tall:
+            x = x.mT
+        x = x / (x.norm(dim=(-2, -1), keepdim=True) + NS_EPS)
     for _ in range(steps):
         gram = x @ x.mT
         x = a * x + (b * gram + c * gram @ gram) @ x
@@ -191,7 +200,7 @@ class Muon(torch.optim.Optimizer):
                     continue
                 g = p.grad
                 state = self.state[p]
-                dt = STATE_DTYPES[group["state_dtype"]]
+                dt = STATE_DTYPES[group.get("state_dtype", "fp32")]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g, dtype=dt)
                 buf = state["momentum_buffer"]
@@ -218,7 +227,7 @@ class Muon(torch.optim.Optimizer):
         state to the parameter's dtype (fp32), so the trainer calls this right after
         loading a checkpoint: the fp32 copy is dropped before any gradient exists."""
         for group in self.param_groups:
-            dt = STATE_DTYPES[group["state_dtype"]]
+            dt = STATE_DTYPES[group.get("state_dtype", "fp32")]
             for p in group["params"]:
                 st = self.state.get(p)
                 if st and "momentum_buffer" in st and st["momentum_buffer"].dtype != dt:
