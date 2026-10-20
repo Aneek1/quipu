@@ -87,6 +87,14 @@ before the optimizers and the compile trial. The state_dict is bf16's key for ke
 so checkpoints and milestones are unchanged. FP8 on a device without FP8 tensor
 cores (or on CPU) is a usage error, exit 2.
 
+train.precision "fp16" (spec 2026-10-20, Kaggle T4) runs the forward under fp16
+autocast with a dynamic loss scale (quipu.lossscale): an overflowing step is skipped
+and halves the scale without counting toward the non-finite streak, unless the scale
+is at its floor. optimizer_state_dtype, activation_checkpoint and loss_chunk_tokens
+trade compute for memory (quipu.optim.muon, the models' checkpoint_blocks,
+quipu.lossfn). check_device_support refuses bf16 below sm_80 and the grouped
+dispatch below sm_90 at startup.
+
 Chat fine-tune (spec 13), train.mode "sft": the data is scripts/build_chat_data.py's
 blocks read by quipu.loader.MaskedBlockStream, whose targets outside assistant turns
 are IGNORE_INDEX, so the loss is on assistant tokens only. A step's loss (and its
@@ -183,6 +191,8 @@ from quipu.eval import estimate_loss
 from quipu.fp8 import Fp8Unsupported, apply_precision
 from quipu.fsio import replace_with_retry
 from quipu.loader import IGNORE_INDEX, MaskedBlockStream, TokenStream
+from quipu.lossfn import chunked_cross_entropy
+from quipu.lossscale import LossScaler
 from quipu.model_factory import build_model
 from quipu.model_moe import QuipuMoE
 from quipu.optim import Muon, apply_config_lrs, build_optimizers
@@ -492,6 +502,23 @@ def resolve_checkpoint(path: str | Path, flag: str) -> Path:
     return path
 
 
+def check_device_support(model_cfg: ModelConfig, train_cfg: TrainConfig,
+                         capability: tuple[int, int] | None) -> None:
+    """Refuse at startup what this GPU cannot run, rather than failing mid-run.
+    capability: torch.cuda.get_device_capability() of the training device, None on
+    CPU (nothing to check). bf16 tensor cores start at sm_80; torch._grouped_mm (the
+    "grouped" expert dispatch) at sm_90."""
+    if capability is None:
+        return
+    sm = f"sm_{capability[0]}{capability[1]}"
+    if model_cfg.kind == "moe" and model_cfg.moe_dispatch == "grouped" and capability < (9, 0):
+        raise UsageError(f"model.moe_dispatch 'grouped' needs sm_90 or newer, this GPU is "
+                         f"{sm}; use 'loop' or 'padded'")
+    if train_cfg.precision == "bf16" and capability < (8, 0):
+        raise UsageError(f"train.precision 'bf16' needs sm_80 or newer, this GPU is {sm}; "
+                         "use 'fp16'")
+
+
 def _atomic_save(obj: Any, path: Path) -> None:
     """torch.save to a temp name beside `path`, then swap it in. A kill mid-write
     leaves at worst a stray .tmp, never a truncated checkpoint at the final path."""
@@ -578,6 +605,15 @@ class Trainer:
         # into either precision.
         self.model = apply_precision(build_model(model_cfg).to(device),
                                      train_cfg.precision, device)
+        check_device_support(
+            model_cfg, train_cfg,
+            torch.cuda.get_device_capability(device) if device.startswith("cuda") else None)
+        # Low memory (spec 2026-10-20): autocast dtype, the fp16 loss scale, block
+        # activation checkpointing.
+        self.amp_dtype = torch.float16 if train_cfg.precision == "fp16" else torch.bfloat16
+        self.scaler = LossScaler(enabled=train_cfg.precision == "fp16")
+        self.overflow_steps = 0     # fp16 loss-scale overflows skipped (not poison)
+        self.model.checkpoint_blocks = train_cfg.activation_checkpoint == "block"
         # The same seed already gives every rank the same weights; the broadcast
         # makes that a guarantee rather than an assumption about init kernels.
         dist.broadcast_params(self.model)
@@ -753,7 +789,8 @@ class Trainer:
 
         losses = {ENGLISH: val}
         for label, batches in self.mix_batches.items():
-            losses[label] = mean_loss(self.model, batches, self.device)
+            losses[label] = mean_loss(self.model, batches, self.device,
+                                      amp_dtype=self.amp_dtype)
         if self.is_moe:
             self.model.clear_balance_scores()     # eval forwards never reach the balancer
         losses = {k: losses[k] for k in self.mix_weights if k in losses}
@@ -795,7 +832,7 @@ class Trainer:
             self.model.train()
             x = torch.randint(mcfg.vocab_size, (cfg.micro_batch, mcfg.context),
                               device=self.device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with torch.autocast("cuda", dtype=self.amp_dtype, enabled=use_amp):
                 logits = self.forward_model(x)
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), x.reshape(-1))
             loss.backward()
@@ -910,24 +947,35 @@ class Trainer:
             for i in range(accum):
                 x, y = batches[i] if sft else self.stream.next_batch()
                 x, y = x.to(self.device), y.to(self.device)
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    logits = self.forward_model(x)
-                    if sft:
-                        # Targets outside assistant turns are IGNORE_INDEX; every
-                        # block has one at least (MaskedBlockStream), so N > 0.
-                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                               y.reshape(-1), ignore_index=IGNORE_INDEX,
-                                               reduction="sum") / n_targets
+                with torch.autocast("cuda", dtype=self.amp_dtype, enabled=use_amp):
+                    chunk = cfg.loss_chunk_tokens
+                    if chunk:
+                        # loss_chunk_tokens: never the full logits at once
+                        # (quipu.lossfn); the summed NLL over the same denominator.
+                        h = self.forward_model(x, return_hidden=True)
+                        nll = chunked_cross_entropy(h, self.model.lm_head.weight, y, chunk,
+                                                    ignore_index=IGNORE_INDEX)
+                        loss = nll / (n_targets if sft else y.numel())
                     else:
-                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                               y.reshape(-1))
+                        logits = self.forward_model(x)
+                        if sft:
+                            # Targets outside assistant turns are IGNORE_INDEX; every
+                            # block has one at least (MaskedBlockStream), so N > 0.
+                            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                                   y.reshape(-1), ignore_index=IGNORE_INDEX,
+                                                   reduction="sum") / n_targets
+                        else:
+                            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                                   y.reshape(-1))
+                # The fp16 loss scale (1.0 otherwise: an exact multiply).
+                scale = self.scaler.scale
                 if sft:
-                    loss.backward()
+                    (loss * scale).backward()
                     total_t += loss.detach().double()
                 else:
                     # Divide before backward so the accumulated gradient is the mean
                     # over the whole batch, not the sum over micro-batches.
-                    (loss / accum).backward()
+                    (loss * scale / accum).backward()
                     total_t += loss.detach().double() / accum
                 if self.is_moe and sft:
                     self._drop_padding_scores(x)
@@ -955,15 +1003,35 @@ class Trainer:
                 if self.is_moe:
                     dist.all_reduce_(step_counts)
                     dist.all_reduce_(step_dropped)
+            # fp16: the gradients carry the loss scale until here (after the
+            # all-reduce, before clipping); a no-op otherwise.
+            self.scaler.unscale_(self.model.parameters())
             total = total_t.item()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
-            if not (math.isfinite(total) and torch.isfinite(grad_norm)):
+            grads_ok = bool(torch.isfinite(grad_norm))
+            if (math.isfinite(total) and not grads_ok and self.scaler.enabled
+                    and not self.scaler.at_floor):
+                # fp16 overflow: expected now and then. Halve the scale and skip the
+                # step; not a poisoned batch, so the streak is untouched.
+                self._zero_grad()
+                if self.is_moe:
+                    self.model.clear_balance_scores()
+                self.scaler.overflow()
+                self.overflow_steps += 1
+                if dist.is_main():
+                    print(f"fp16 overflow at step {self.step}: loss scale -> "
+                          f"{self.scaler.scale:g}, step skipped", flush=True)
+                return total
+            if not (math.isfinite(total) and grads_ok):
                 # One NaN/inf batch taken as a step would poison the weights and
                 # AdamW's moments, and every later checkpoint (retention would then
                 # prune the clean ones). Skip it: step and lr stay where they are.
                 self._zero_grad()
                 if self.is_moe:
                     self.model.clear_balance_scores()   # nor the balancer
+                # fp16: restarts the growth count, as any overflow does (a no-op
+                # otherwise; the scale may already sit at its floor).
+                self.scaler.overflow()
                 self.nonfinite_streak += 1
                 self.skipped_steps += 1
                 if dist.is_main():      # every rank skips (identical gradients)
@@ -984,6 +1052,7 @@ class Trainer:
             stepped = True
             for opt in self.optimizers:
                 opt.step()
+            self.scaler.good_step()
             if self.is_moe:
                 # After the weights move, from the scores the forwards captured:
                 # no extra forward. Every rank's scores, so every rank's biases
@@ -1125,6 +1194,7 @@ class Trainer:
                                  if self.is_moe else None),
                 "stream": self.stream.state_dict(),
                 "skipped_steps": self.skipped_steps,
+                "loss_scale": self.scaler.state_dict() if self.scaler.enabled else None,
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             },
@@ -1218,6 +1288,8 @@ class Trainer:
             self._interval_dropped = dropped.clone()
         self.stream.load_state_dict(state["stream"])
         self.skipped_steps = int(state.get("skipped_steps", 0))   # absent before it existed
+        if state.get("loss_scale") is not None:     # absent before fp16 existed
+            self.scaler.load_state_dict(state["loss_scale"])
         torch.set_rng_state(state["torch_rng"])
         if state["cuda_rng"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
@@ -1285,6 +1357,11 @@ class Trainer:
         # load_state_dict brought back the checkpoint's base_lr / weight_decay; the
         # config wins (a deliberate LR change on resume must take effect).
         apply_config_lrs(self.optimizers, self.train_cfg)
+        # load_state_dict cast Muon's momentum to fp32 (the parameters' dtype);
+        # back to the configured dtype now, before any gradient takes memory.
+        for opt in self.optimizers:
+            if isinstance(opt, Muon):
+                opt.cast_state_()
 
     def resume_from_latest(self) -> None:
         """Load the latest checkpoint and drop log entries past it: those steps are
@@ -1401,7 +1478,8 @@ class Trainer:
                     # parallel: rank 0 evaluates, the others wait.
                     if dist.is_main():
                         val = estimate_loss(self.model, self.val_stream,
-                                            cfg.eval_batches, self.device)
+                                            cfg.eval_batches, self.device,
+                                            amp_dtype=self.amp_dtype)
                         if self.mix_weights:
                             self._eval_mix(loss, val)
                         else:
@@ -1495,7 +1573,7 @@ def write_val_by_source(trainer: "Trainer", root: Path, out: Path, run_id: str) 
     trained checkpoint is already saved."""
     try:
         results = evaluate_by_source(trainer.model, root, trainer.model_cfg.context,
-                                     trainer.device)
+                                     trainer.device, amp_dtype=trainer.amp_dtype)
         if not results:
             return
         from quipu.fsio import write_text_atomic

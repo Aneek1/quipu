@@ -340,3 +340,114 @@ def test_eval_functions_take_amp_dtype():
     for fn in (estimate_loss, mean_loss, evaluate_by_source):
         p = inspect.signature(fn).parameters["amp_dtype"]
         assert p.default is torch.bfloat16
+
+
+# ---- trainer ---------------------------------------------------------------------------
+
+from quipu.data import write_shard
+from quipu.train import Trainer, UsageError, check_device_support
+
+
+def make_data(tmp_path, tokens=6000, seed=0):
+    d = tmp_path / "data"
+    write_shard(d / "shard_000.bin",
+                np.random.RandomState(seed).randint(0, 512, tokens).astype(np.uint16))
+    return d
+
+
+def build(tmp_path, cfg, data, run_id="t", resume=False):
+    return Trainer(model_cfg=cfg.model, train_cfg=cfg.train, shard_dir=data, device="cpu",
+                   run_dir=tmp_path / "runs", run_id=run_id, resume=resume)
+
+
+def _losses(tmp_path, name, steps=3, **train):
+    cfg = smoke_cfg(tmp_path / name, model={"attnres_blocks": 0}, **train)
+    t = build(tmp_path / name, cfg, make_data(tmp_path / name))
+    return [t.train_step() for _ in range(steps)], t
+
+
+def test_memory_options_do_not_change_training_on_cpu(tmp_path):
+    base, tb = _losses(tmp_path, "base")
+    low, tl = _losses(tmp_path, "low", precision="fp16", optimizer_state_dtype="fp32",
+                      activation_checkpoint="block", loss_chunk_tokens=300)
+    np.testing.assert_allclose(low, base, rtol=1e-5)
+    for (n, p), (_, q) in zip(tb.model.named_parameters(), tl.model.named_parameters()):
+        torch.testing.assert_close(q, p, rtol=1e-4, atol=1e-6, msg=n)
+
+
+def test_bf16_state_trains(tmp_path):
+    losses, t = _losses(tmp_path, "bf16state", steps=5, optimizer_state_dtype="bf16")
+    assert all(math.isfinite(x) for x in losses)
+    muon = t.optimizers[0]
+    assert all(s["momentum_buffer"].dtype is torch.bfloat16 for s in muon.state.values())
+
+
+def test_fp16_overflow_halves_the_scale_and_skips_without_counting(tmp_path):
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, precision="fp16")
+    t = build(tmp_path, cfg, make_data(tmp_path))
+    scale0 = t.scaler.scale
+    p = next(t.model.parameters())
+    h = p.register_hook(lambda g: torch.full_like(g, float("inf")))
+    t.train_step()
+    h.remove()
+    assert t.step == 0 and t.scaler.scale == scale0 / 2
+    assert t.nonfinite_streak == 0 and t.overflow_steps == 1
+    t.train_step()
+    assert t.step == 1
+
+
+def test_fp16_poison_at_the_floor_counts_and_resets_the_growth_counter(tmp_path):
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, precision="fp16")
+    t = build(tmp_path, cfg, make_data(tmp_path))
+    t.scaler.scale = t.scaler.floor
+    t.scaler.clean_steps = 7
+    p = next(t.model.parameters())
+    h = p.register_hook(lambda g: torch.full_like(g, float("inf")))
+    t.train_step()
+    h.remove()
+    assert t.step == 0 and t.nonfinite_streak == 1 and t.overflow_steps == 0
+    assert t.scaler.scale == t.scaler.floor and t.scaler.clean_steps == 0
+
+
+def test_loss_scale_is_checkpointed(tmp_path):
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, precision="fp16")
+    data = make_data(tmp_path)
+    t = build(tmp_path, cfg, data)
+    t.scaler.overflow()
+    t.train_step()
+    t.save_checkpoint()
+    r = build(tmp_path, cfg, data, run_id="t", resume=True)
+    r.resume_from_latest()
+    assert r.scaler.state_dict() == t.scaler.state_dict()
+
+
+def test_fp32_momentum_checkpoint_resumes_into_bf16_state(tmp_path):
+    data = make_data(tmp_path)
+    cfg32 = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
+    t = build(tmp_path, cfg32, data)
+    t.train_step()
+    path = t.save_checkpoint()
+    cfg16 = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, optimizer_state_dtype="bf16")
+    r = build(tmp_path, cfg16, data, run_id="u")
+    r.init_weights_from(path, optimizers=True)
+    muon = r.optimizers[0]
+    assert muon.state
+    assert all(s["momentum_buffer"].dtype is torch.bfloat16 for s in muon.state.values())
+
+
+@pytest.mark.parametrize("cap,dispatch,precision,ok", [
+    ((7, 5), "loop", "fp16", True),
+    ((7, 5), "grouped", "fp16", False),
+    ((7, 5), "loop", "bf16", False),
+    ((9, 0), "grouped", "bf16", True),
+    ((8, 0), "grouped", "bf16", False),
+    (None, "grouped", "bf16", True),          # CPU: nothing to check
+])
+def test_device_guard(tmp_path, cap, dispatch, precision, ok):
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0, "moe_dispatch": dispatch},
+                    precision=precision)
+    if ok:
+        check_device_support(cfg.model, cfg.train, cap)
+    else:
+        with pytest.raises(UsageError):
+            check_device_support(cfg.model, cfg.train, cap)
