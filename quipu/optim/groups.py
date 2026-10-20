@@ -119,7 +119,7 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
 
     muon_common = {"lr": cfg.muon_lr, "base_lr": cfg.muon_lr, "momentum": cfg.muon_momentum,
                    "weight_decay": cfg.muon_weight_decay, "ns_steps": cfg.muon_ns_steps,
-                   "nesterov": MUON_NESTEROV}
+                   "nesterov": MUON_NESTEROV, "state_dtype": cfg.optimizer_state_dtype}
     muon_groups = [
         {"params": ps, "head_dim": hd, "in_out": False, **muon_common}
         for hd, ps in muon_head.items()
@@ -143,8 +143,9 @@ def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Opt
 def apply_config_lrs(optimizers: list[torch.optim.Optimizer], cfg: TrainConfig) -> None:
     """Re-set base_lr and weight_decay on every group from cfg, for use right after
     load_state_dict (which restores the checkpoint's values). Muon groups get
-    cfg.muon_lr / cfg.muon_weight_decay, and momentum / ns_steps / nesterov as
-    build_optimizers sets them; AdamW groups cfg.lr, and cfg.weight_decay for the
+    cfg.muon_lr / cfg.muon_weight_decay, and momentum / ns_steps / nesterov /
+    state_dtype as build_optimizers sets them (a checkpoint older than state_dtype
+    gets it here, or from _load_optimizer_state's setdefault); AdamW groups cfg.lr, and cfg.weight_decay for the
     decay group (tagged group["decay"] at build) while the no-decay group stays at 0.
     group["lr"] is left alone: the LR schedule derives it from base_lr before the
     next step."""
@@ -157,6 +158,7 @@ def apply_config_lrs(optimizers: list[torch.optim.Optimizer], cfg: TrainConfig) 
                 group["momentum"] = cfg.muon_momentum
                 group["ns_steps"] = cfg.muon_ns_steps
                 group["nesterov"] = MUON_NESTEROV
+                group["state_dtype"] = cfg.optimizer_state_dtype
             else:
                 if "decay" not in group:
                     raise ValueError("AdamW group has no 'decay' tag; was it built by "

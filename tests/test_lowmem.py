@@ -110,3 +110,60 @@ def test_state_round_trips():
     t = LossScaler(enabled=True)
     t.load_state_dict(s.state_dict())
     assert (t.scale, t.clean_steps) == (32.0, 1)
+
+
+# ---- Muon ----------------------------------------------------------------------------
+
+from quipu.optim import Muon, newton_schulz
+from quipu.optim.muon import cuda_work_dtype
+
+
+def test_cuda_work_dtype_by_capability():
+    assert cuda_work_dtype((7, 5)) is torch.float16      # T4
+    assert cuda_work_dtype((8, 0)) is torch.bfloat16     # A100
+    assert cuda_work_dtype((12, 0)) is torch.bfloat16    # RTX 50xx
+
+
+def test_newton_schulz_in_fp16_matches_fp32():
+    g = torch.randn(48, 80, generator=torch.Generator().manual_seed(3))
+    ref = newton_schulz(g, work_dtype=torch.float32)
+    out = newton_schulz(g, work_dtype=torch.float16)
+    assert out.dtype == g.dtype
+    assert (out - ref).norm() / ref.norm() < 0.02
+
+
+def _muon_run(state_dtype, steps=20):
+    torch.manual_seed(0)
+    w = torch.nn.Parameter(torch.randn(32, 48))
+    opt = Muon([{"params": [w], "state_dtype": state_dtype}], lr=0.02)
+    gen = torch.Generator().manual_seed(1)
+    for _ in range(steps):
+        w.grad = torch.randn(32, 48, generator=gen)
+        opt.step()
+    return w.detach().clone(), opt
+
+
+def test_bf16_momentum_tracks_fp32():
+    w32, _ = _muon_run("fp32")
+    w16, opt = _muon_run("bf16")
+    buf = next(iter(opt.state.values()))["momentum_buffer"]
+    assert buf.dtype is torch.bfloat16
+    assert (w16 - w32).norm() / w32.norm() < 0.01
+
+
+def test_cast_state_converts_loaded_momentum():
+    _, opt = _muon_run("fp32", steps=2)
+    for g in opt.param_groups:
+        g["state_dtype"] = "bf16"
+    opt.cast_state_()
+    buf = next(iter(opt.state.values()))["momentum_buffer"]
+    assert buf.dtype is torch.bfloat16
+
+
+def test_build_optimizers_passes_state_dtype(tmp_path):
+    from quipu.model_factory import build_model
+    from quipu.optim import build_optimizers
+    cfg = smoke_cfg(tmp_path, optimizer_state_dtype="bf16")
+    opts = build_optimizers(build_model(cfg.model), cfg.train)
+    muon = [o for o in opts if isinstance(o, Muon)][0]
+    assert {g["state_dtype"] for g in muon.param_groups} == {"bf16"}

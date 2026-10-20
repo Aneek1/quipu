@@ -13,9 +13,9 @@ Pieces:
   on X = g / ||g||_F. The coefficients trade exactness for speed: singular values
   land near 1 (roughly [0.7, 1.2]), not exactly on it, which is all Muon needs.
   Wide orientation is used (a tall matrix is transposed and back), so A is the
-  smaller Gram matrix. On CUDA the iteration runs in bf16 whatever the input
-  dtype (training grads are fp32; Keller's reference does G.bfloat16() too), to
-  within a few percent of fp32; on CPU it runs in fp32 unless the input is bf16.
+  smaller Gram matrix. On CUDA the iteration runs in bf16 (fp16 below sm_80, see
+  cuda_work_dtype) whatever the input dtype (training grads are fp32; Keller's
+  reference does G.bfloat16() too), to within a few percent of fp32; on CPU it runs in fp32 unless the input is bf16.
   The result is cast back to the input's dtype.
 - orthogonalize(update, ...): newton_schulz plus the shape scale
   max(1, fan_out / fan_in) ** 0.5, so a tall matrix's rows get RMS comparable to a
@@ -30,7 +30,9 @@ Pieces:
 - Muon: Nesterov momentum (EMA form), orthogonalise, decoupled weight decay
       W <- W (1 - lr wd) - lr orthogonalize(g + momentum (buf - g))
   head_dim / in_out are param-group options, not tensor attributes, so they travel
-  with the optimizer's state_dict.
+  with the optimizer's state_dict. So does state_dtype ("fp32" | "bf16"): the dtype
+  the momentum buffer is stored in. The update itself is always computed in the
+  gradient's dtype; bf16 storage halves the buffer's memory.
 """
 from __future__ import annotations
 
@@ -43,19 +45,36 @@ NS_COEFFS = (3.4445, -4.7750, 2.0315)
 NS_EPS = 1e-7
 
 
-def newton_schulz(g: Tensor, steps: int = 5) -> Tensor:
+STATE_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
+
+
+def cuda_work_dtype(capability: tuple[int, int]) -> torch.dtype:
+    """Newton-Schulz's matmul dtype on a CUDA device of this compute capability: bf16
+    from sm_80 (A100 on), fp16 below (T4, sm_75, has no bf16 tensor cores). fp16 is
+    safe here: X is divided by its Frobenius norm first, so entries stay in [-1, 1]."""
+    return torch.bfloat16 if capability >= (8, 0) else torch.float16
+
+
+def newton_schulz(g: Tensor, steps: int = 5, work_dtype: torch.dtype | None = None) -> Tensor:
     """Approximately orthogonalise g (2-D, or a batch of matrices as 3-D [n, r, c],
     each done on its own). Returns g's shape and dtype. A zero matrix stays zero.
-    Iterates in bf16 on CUDA, fp32 on CPU (bf16 if g is bf16)."""
+    Iterates in work_dtype if given; else bf16 on CUDA (fp16 below sm_80, see
+    cuda_work_dtype), fp32 on CPU (bf16 if g is bf16)."""
     if g.ndim not in (2, 3):
         raise ValueError(f"newton_schulz needs a 2-D or 3-D tensor, got shape {tuple(g.shape)}")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError(f"steps must be a positive int, got {steps!r}")
     a, b, c = NS_COEFFS
     # bf16 on CUDA (as Keller's reference, G.bfloat16()): tensor-core matmuls, and
-    # the iteration only needs singular values in a loose band. fp32 on CPU, where
-    # bf16 matmul is slow, unless the input is already bf16.
-    work = torch.bfloat16 if (g.is_cuda or g.dtype == torch.bfloat16) else torch.float32
+    # the iteration only needs singular values in a loose band; fp16 on pre-Ampere
+    # GPUs, which have no bf16 tensor cores. fp32 on CPU, where bf16 matmul is slow,
+    # unless the input is already bf16.
+    if work_dtype is not None:
+        work = work_dtype
+    elif g.is_cuda:
+        work = cuda_work_dtype(torch.cuda.get_device_capability(g.device))
+    else:
+        work = torch.bfloat16 if g.dtype == torch.bfloat16 else torch.float32
     x = g.to(work)
     tall = x.size(-2) > x.size(-1)
     if tall:
@@ -105,7 +124,8 @@ def orthogonalize(
 
 class Muon(torch.optim.Optimizer):
     """Muon over 2-D / 3-D parameters. Group options: lr, momentum, weight_decay,
-    ns_steps, nesterov, head_dim (None = whole matrix), in_out (ExpertBank layout).
+    ns_steps, nesterov, head_dim (None = whole matrix), in_out (ExpertBank layout),
+    state_dtype ("fp32" | "bf16", the momentum buffer's storage dtype).
     Any extra group keys (base_lr, for the LR schedule) are kept as given."""
 
     def __init__(
@@ -118,10 +138,11 @@ class Muon(torch.optim.Optimizer):
         nesterov: bool = True,
         head_dim: int | None = None,
         in_out: bool = False,
+        state_dtype: str = "fp32",
     ) -> None:
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
                         ns_steps=ns_steps, nesterov=nesterov, head_dim=head_dim,
-                        in_out=in_out)
+                        in_out=in_out, state_dtype=state_dtype)
         super().__init__(params, defaults)
 
     def add_param_group(self, param_group: dict[str, Any]) -> None:
@@ -141,6 +162,9 @@ class Muon(torch.optim.Optimizer):
         steps = group["ns_steps"]
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError(f"ns_steps must be a positive int, got {steps!r}")
+        if group["state_dtype"] not in STATE_DTYPES:
+            raise ValueError(f"state_dtype must be one of {list(STATE_DTYPES)}, "
+                             f"got {group['state_dtype']!r}")
         for p in group["params"]:
             if p.ndim not in (2, 3):
                 raise ValueError(f"Muon takes 2-D or 3-D parameters, got shape {tuple(p.shape)}; "
@@ -167,14 +191,35 @@ class Muon(torch.optim.Optimizer):
                     continue
                 g = p.grad
                 state = self.state[p]
+                dt = STATE_DTYPES[group["state_dtype"]]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
+                    state["momentum_buffer"] = torch.zeros_like(g, dtype=dt)
                 buf = state["momentum_buffer"]
-                buf.lerp_(g, 1 - mom)
-                direction = g.lerp(buf, mom) if group["nesterov"] else buf
+                if buf.dtype != dt:
+                    buf = state["momentum_buffer"] = buf.to(dt)
+                if dt == g.dtype:
+                    buf.lerp_(g, 1 - mom)
+                    m = buf
+                else:
+                    # Stored low, updated in the gradient's dtype (fp32).
+                    m = buf.to(g.dtype).lerp_(g, 1 - mom)
+                    buf.copy_(m)
+                direction = g.lerp(m, mom) if group["nesterov"] else m
                 update = orthogonalize(direction, group["ns_steps"], group["head_dim"],
                                        group["in_out"])
                 if wd:
                     p.mul_(1 - lr * wd)
                 p.add_(update.to(p.dtype), alpha=-lr)
         return loss
+
+    @torch.no_grad()
+    def cast_state_(self) -> None:
+        """Every momentum buffer into its group's state_dtype. load_state_dict casts
+        state to the parameter's dtype (fp32), so the trainer calls this right after
+        loading a checkpoint: the fp32 copy is dropped before any gradient exists."""
+        for group in self.param_groups:
+            dt = STATE_DTYPES[group["state_dtype"]]
+            for p in group["params"]:
+                st = self.state.get(p)
+                if st and "momentum_buffer" in st and st["momentum_buffer"].dtype != dt:
+                    st["momentum_buffer"] = st["momentum_buffer"].to(dt)
