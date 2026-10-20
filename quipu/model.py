@@ -156,9 +156,11 @@ class Quipu(nn.Module):
         )
         x = self.embed(idx)
         cos, sin = self.rope_cos, self.rope_sin
+        # preserve_rng_state=False: no dropout anywhere, so nothing consumes RNG.
         ckpt = self.checkpoint_blocks and self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            x = checkpoint(block, x, cos, sin, use_reentrant=False) if ckpt else block(x, cos, sin)
+            x = checkpoint(block, x, cos, sin, use_reentrant=False,
+                                  preserve_rng_state=False) if ckpt else block(x, cos, sin)
         # return_hidden: the final normed hidden states, for quipu.lossfn's chunked loss.
         h = self.norm(x)
         return h if return_hidden else self.lm_head(h)

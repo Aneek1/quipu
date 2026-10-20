@@ -124,10 +124,12 @@ class QuipuMoE(nn.Module):
         cos, sin = self.rope_cos, self.rope_sin
         self.last_stats = [None] * self.cfg.n_layer
         if self.attnres is None:
+            # preserve_rng_state=False: no dropout anywhere, so nothing consumes RNG.
             ckpt = self.checkpoint_blocks and self.training and torch.is_grad_enabled()
             for l, block in enumerate(self.blocks):
                 if ckpt:
-                    x, self.last_stats[l] = checkpoint(block, x, cos, sin, use_reentrant=False)
+                    x, self.last_stats[l] = checkpoint(block, x, cos, sin, use_reentrant=False,
+                                                       preserve_rng_state=False)
                 else:
                     x, self.last_stats[l] = block(x, cos, sin)
         else:

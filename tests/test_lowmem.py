@@ -274,3 +274,58 @@ def test_checkpointing_is_off_in_eval_and_no_grad(tmp_path, monkeypatch):
         m.train()(x)
     m.eval()(x)
     assert calls == []
+
+
+def test_block_checkpointing_refuses_compile(tmp_path):
+    with pytest.raises(ValueError, match="activation_checkpoint.*compile|compile.*activation_checkpoint"):
+        smoke_cfg(tmp_path, model={"attnres_blocks": 0}, activation_checkpoint="block",
+                  compile=True)
+
+
+def _count_engagement(model, module, monkeypatch, x):
+    """Wrap the real checkpoint and every block.forward with counters; run one
+    training forward + backward; return (checkpoint calls, forwards after fwd, after bwd)."""
+    ck, fw = [0], [0]
+    real = module.checkpoint
+
+    def counting(*a, **k):
+        ck[0] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(module, "checkpoint", counting)
+    for b in model.blocks:
+        orig = b.forward
+
+        def wrapped(*a, _orig=orig, **k):
+            fw[0] += 1
+            return _orig(*a, **k)
+
+        monkeypatch.setattr(b, "forward", wrapped)
+    model.train()
+    loss = F.cross_entropy(model(x).view(-1, model.cfg.vocab_size), x.view(-1))
+    after_fwd = fw[0]
+    loss.backward()
+    return ck[0], after_fwd, fw[0]
+
+
+def test_moe_checkpointing_engages_and_recomputes(tmp_path, monkeypatch):
+    import quipu.model_moe as mm
+    from quipu.model_factory import build_model
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
+    m = build_model(cfg.model)
+    m.checkpoint_blocks = True
+    x = torch.randint(cfg.model.vocab_size, (2, 16))
+    n = cfg.model.n_layer
+    assert _count_engagement(m, mm, monkeypatch, x) == (n, n, 2 * n)
+
+
+def test_dense_checkpointing_engages_and_recomputes(monkeypatch):
+    import quipu.model as qm
+    mc = dataclasses.replace(load_config(ROOT / "configs" / "quipu-114m.toml").model,
+                             vocab_size=256, d_model=64, n_layer=2, n_head=4, n_kv_head=2,
+                             ffn_hidden=128, context=32)
+    m = qm.Quipu(mc)
+    m.checkpoint_blocks = True
+    x = torch.randint(256, (2, 16))
+    n = mc.n_layer
+    assert _count_engagement(m, qm, monkeypatch, x) == (n, n, 2 * n)

@@ -677,6 +677,9 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     if train.activation_checkpoint == "block" and model.attnres_blocks:
         raise ValueError("activation_checkpoint 'block' does not cover Block AttnRes "
                          "(attnres_blocks > 0); use model.attnres_checkpoint there")
+    if train.activation_checkpoint == "block" and train.compile:
+        raise ValueError("activation_checkpoint 'block' with compile: torch.compile "
+                         "cannot trace the checkpointed blocks; set compile = false")
     _check_tokenizer(data, model)
 
     if train.batch_tokens % (train.micro_batch * model.context) != 0:
