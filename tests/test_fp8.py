@@ -51,7 +51,7 @@ def test_precision_fp8_is_accepted_for_moe(tmp_path):
     assert smoke(tmp_path, precision="fp8").train.precision == "fp8"
 
 
-@pytest.mark.parametrize("bad", ["fp16", "FP8", "", 8, None, True])
+@pytest.mark.parametrize("bad", ["fp32", "FP8", "", 8, None, True])
 def test_an_unknown_precision_is_refused(tmp_path, bad):
     with pytest.raises(ValueError, match="precision"):
         smoke(tmp_path, precision=bad)

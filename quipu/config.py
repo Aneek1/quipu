@@ -121,12 +121,14 @@ MODEL_KINDS = ("dense", "moe")
 ACTIVATIONS = ("swiglu", "situ_glu")
 MOE_DISPATCHES = ("loop", "grouped", "padded")
 OPTIMIZERS = ("adamw", "muon")
-PRECISIONS = ("bf16", "fp8")
+PRECISIONS = ("bf16", "fp8", "fp16")
+OPTIMIZER_STATE_DTYPES = ("fp32", "bf16")
+ACTIVATION_CHECKPOINTS = ("none", "block")
 TRAIN_MODES = ("pretrain", "sft")
 LR_SCHEDULES = ("cosine", "wsd")
 DECAY_SHAPES = ("linear", "1-sqrt")
 # TrainConfig int fields that may be 0 (seed; the wsd decay, off at 0).
-TRAIN_ZERO_INTS = frozenset({"seed", "decay_start_step", "decay_steps"})
+TRAIN_ZERO_INTS = frozenset({"seed", "decay_start_step", "decay_steps", "loss_chunk_tokens"})
 GPT2_TOKENIZER = "gpt2"
 # ModelConfig int fields that are 0 for a dense model.
 MOE_INT_FIELDS = ("n_experts", "top_k", "expert_hidden", "shared_experts", "shared_hidden",
@@ -178,7 +180,7 @@ class TrainConfig:
     # "fp8": additionally, attention q/k/v/o and the shared-expert linears run their
     # matmuls in FP8 (quipu.fp8); kind "moe" on CUDA only. Kept for the full run only
     # if A/B pair 4 shows >= 1.2x tokens/s with loss within seed noise.
-    precision: str = "bf16"              # "bf16" | "fp8"
+    precision: str = "bf16"              # "bf16" | "fp8" | "fp16"
     # Spend backstop (spec section 6.4): the trainer stops cleanly (checkpoint, exit 4)
     # once its own elapsed hours x usd_per_hour reach budget_usd. budget_usd 0 = none.
     # The box tools set both per launch (the budget left then, less their reserve).
@@ -207,6 +209,16 @@ class TrainConfig:
     decay_start_step: int = 0            # wsd only; with decay_steps
     decay_steps: int = 0                 # wsd only; 0 = no decay (stable forever)
     decay_shape: str = "linear"          # wsd only: "linear" | "1-sqrt"
+    # Low memory (spec 2026-10-20-t4-low-memory-training-design.md), for GPUs such as
+    # Kaggle's T4. precision "fp16" (above) is fp16 autocast with a dynamic loss
+    # scale (quipu.lossscale), for GPUs without bf16. optimizer_state_dtype "bf16"
+    # stores Muon's momentum in bf16 (math stays fp32). activation_checkpoint "block"
+    # recomputes each block's activations in backward. loss_chunk_tokens > 0 computes
+    # lm_head + cross-entropy that many tokens at a time (quipu.lossfn), so the full
+    # logits never exist at once; 0 = off.
+    optimizer_state_dtype: str = "fp32"  # "fp32" | "bf16"
+    activation_checkpoint: str = "none"  # "none" | "block"
+    loss_chunk_tokens: int = 0
 
     @property
     def steps(self) -> int:
@@ -440,6 +452,8 @@ def _check_train_extras(train: TrainConfig) -> None:
     _check_positive("muon_weight_decay", train.muon_weight_decay, allow_zero=True)
     _check_bool("compile", train.compile)
     _check_choice("precision", train.precision, PRECISIONS)
+    _check_choice("optimizer_state_dtype", train.optimizer_state_dtype, OPTIMIZER_STATE_DTYPES)
+    _check_choice("activation_checkpoint", train.activation_checkpoint, ACTIVATION_CHECKPOINTS)
     _check_positive("budget_usd", train.budget_usd, allow_zero=True)
     _check_positive("usd_per_hour", train.usd_per_hour, allow_zero=True)
     if train.budget_usd > 0 and train.usd_per_hour == 0:
@@ -660,6 +674,9 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     if train.precision == "fp8" and model.kind != "moe":
         # Spec section 12: dense quipu-114m is unaffected by the FP8 option.
         raise ValueError(f"precision 'fp8' applies to kind 'moe', got kind {model.kind!r}")
+    if train.activation_checkpoint == "block" and model.attnres_blocks:
+        raise ValueError("activation_checkpoint 'block' does not cover Block AttnRes "
+                         "(attnres_blocks > 0); use model.attnres_checkpoint there")
     _check_tokenizer(data, model)
 
     if train.batch_tokens % (train.micro_batch * model.context) != 0:

@@ -103,11 +103,11 @@ def fp8_unsupported(device: str | torch.device) -> str | None:
 
 
 def apply_precision(model: nn.Module, precision: str, device: str | torch.device) -> nn.Module:
-    """The model for train.precision: "bf16" returns it untouched, "fp8" converts
+    """The model for train.precision: "bf16" and "fp16" return it untouched, "fp8" converts
     it in place (convert_to_fp8) after checking the device. Returns the model."""
     if precision not in PRECISIONS:
         raise ValueError(f"precision must be one of {list(PRECISIONS)}, got {precision!r}")
-    if precision == "bf16":
+    if precision in ("bf16", "fp16"):
         return model
     reason = fp8_unsupported(device)
     if reason is not None:
