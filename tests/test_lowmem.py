@@ -104,6 +104,16 @@ def test_scale_never_goes_below_the_floor():
     assert s.scale == 1.0
 
 
+def test_reset_growth_keeps_the_scale():
+    s = LossScaler(enabled=True, init_scale=64.0, growth_interval=5)
+    s.good_step(); s.good_step()
+    s.reset_growth()
+    assert (s.scale, s.clean_steps) == (64.0, 0)
+    off = LossScaler(enabled=False)
+    off.reset_growth()
+    assert (off.scale, off.clean_steps) == (1.0, 0)
+
+
 def test_state_round_trips():
     s = LossScaler(enabled=True, init_scale=64.0, growth_interval=5)
     s.overflow(); s.good_step()
@@ -344,7 +354,7 @@ def test_eval_functions_take_amp_dtype():
 
 # ---- trainer ---------------------------------------------------------------------------
 
-from quipu.data import write_shard
+from quipu.data import write_mask, write_shard
 from quipu.train import Trainer, UsageError, check_device_support
 
 
@@ -407,6 +417,70 @@ def test_fp16_poison_at_the_floor_counts_and_resets_the_growth_counter(tmp_path)
     h.remove()
     assert t.step == 0 and t.nonfinite_streak == 1 and t.overflow_steps == 0
     assert t.scaler.scale == t.scaler.floor and t.scaler.clean_steps == 0
+
+
+def test_fp16_nonfinite_loss_above_the_floor_keeps_the_scale(tmp_path):
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, precision="fp16")
+    t = build(tmp_path, cfg, make_data(tmp_path))
+    t.scaler.clean_steps = 7
+    scale0 = t.scaler.scale
+    assert not t.scaler.at_floor
+    model = t.forward_model
+    t.forward_model = lambda x, **kw: model(x, **kw) * float("nan")
+    t.train_step()
+    t.forward_model = model
+    assert t.step == 0 and t.nonfinite_streak == 1 and t.overflow_steps == 0
+    assert t.scaler.scale == scale0 and t.scaler.clean_steps == 0
+    t.train_step()
+    assert t.step == 1 and t.nonfinite_streak == 0
+
+
+def test_fp16_overflows_are_logged_and_checkpointed(tmp_path):
+    import json
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0}, precision="fp16")
+    data = make_data(tmp_path)
+    t = build(tmp_path, cfg, data)
+    p = next(t.model.parameters())
+    h = p.register_hook(lambda g: torch.full_like(g, float("inf")))
+    t.train_step()
+    h.remove()
+    t.train_step()
+    entry = t.log.record["steps"][-1]
+    assert entry["loss_scale"] == t.scaler.scale and entry["overflows"] == 1
+    t.save_checkpoint()
+    r = build(tmp_path, cfg, data, run_id="t", resume=True)
+    r.resume_from_latest()
+    assert r.overflow_steps == 1
+    on_disk = json.loads(t.log.path.read_text(encoding="utf-8"))["steps"][-1]
+    assert on_disk["loss_scale"] == t.scaler.scale
+
+
+def test_bf16_steps_log_no_loss_scale(tmp_path):
+    _, t = _losses(tmp_path, "plain", steps=1)
+    assert "loss_scale" not in t.log.record["steps"][-1]
+
+
+def _sft_losses(tmp_path, name, **train):
+    # Minimal masked blocks: 8 blocks of the smoke context, ~1 in 4 targets assistant.
+    ctx = 256
+    rng = np.random.RandomState(1)
+    d = tmp_path / name / "chat"
+    write_shard(d / "shard_000.bin", rng.randint(0, 512, 8 * ctx).astype(np.uint16))
+    mask = (rng.rand(8 * ctx) < 0.25).astype(np.uint8)
+    mask[1::ctx] = 1                       # every block has an assistant target
+    write_mask(d / "shard_000.mask", mask)
+    cfg = smoke_cfg(tmp_path / name, model={"attnres_blocks": 0}, mode="sft",
+                    milestones=[], **train)
+    t = build(tmp_path / name, cfg, d)
+    return [t.train_step() for _ in range(3)], t
+
+
+def test_sft_chunked_loss_matches_the_full_loss(tmp_path):
+    base, tb = _sft_losses(tmp_path, "full")
+    chunked, tc = _sft_losses(tmp_path, "chunked", loss_chunk_tokens=300)
+    np.testing.assert_allclose(chunked, base, rtol=1e-5)
+    for (n, p), (_, q) in zip(tb.model.named_parameters(), tc.model.named_parameters()):
+        torch.testing.assert_close(q, p, rtol=1e-4, atol=1e-6, msg=n)
 
 
 def test_loss_scale_is_checkpointed(tmp_path):

@@ -6,7 +6,9 @@ multiplied by `scale` before backward and the gradients divided by it afterwards
 finite is an overflow: the trainer skips it and calls overflow(), which halves the
 scale; after growth_interval clean steps in a row good_step() doubles it. The scale
 never drops below `floor`; an overflow at the floor is a real non-finite step and
-counts toward the trainer's poison streak (at_floor).
+counts toward the trainer's poison streak (at_floor). A non-finite LOSS is not a
+scale problem (the scale is applied after it): the trainer counts it as poison and
+calls reset_growth(), which restarts the clean-step count but keeps the scale.
 
 Not torch.amp.GradScaler: the trainer reduces gradients at one known point, has its
 own non-finite skip, and steps two optimizers (Muon + AdamW).
@@ -47,6 +49,10 @@ class LossScaler:
     def overflow(self) -> None:
         if self.enabled:
             self.scale = max(self.floor, self.scale / 2)
+            self.clean_steps = 0
+
+    def reset_growth(self) -> None:
+        if self.enabled:
             self.clean_steps = 0
 
     def good_step(self) -> None:

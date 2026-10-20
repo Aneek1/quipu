@@ -833,8 +833,15 @@ class Trainer:
             x = torch.randint(mcfg.vocab_size, (cfg.micro_batch, mcfg.context),
                               device=self.device)
             with torch.autocast("cuda", dtype=self.amp_dtype, enabled=use_amp):
-                logits = self.forward_model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), x.reshape(-1))
+                if cfg.loss_chunk_tokens:
+                    # train_step's chunked loss path, so the graph compiled here is
+                    # the one training runs.
+                    h = self.forward_model(x, return_hidden=True)
+                    loss = chunked_cross_entropy(h, self.model.lm_head.weight, x,
+                                                 cfg.loss_chunk_tokens) / x.numel()
+                else:
+                    logits = self.forward_model(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), x.reshape(-1))
             loss.backward()
         finally:
             self._zero_grad()
@@ -1029,9 +1036,9 @@ class Trainer:
                 self._zero_grad()
                 if self.is_moe:
                     self.model.clear_balance_scores()   # nor the balancer
-                # fp16: restarts the growth count, as any overflow does (a no-op
-                # otherwise; the scale may already sit at its floor).
-                self.scaler.overflow()
+                # fp16: a poisoned step restarts the growth count, but keeps the
+                # scale: a non-finite loss is not one a smaller scale would fix.
+                self.scaler.reset_growth()
                 self.nonfinite_streak += 1
                 self.skipped_steps += 1
                 if dist.is_main():      # every rank skips (identical gradients)
@@ -1071,6 +1078,8 @@ class Trainer:
         self._zero_grad()
         self.step += 1
         extra = {} if muon_lr is None else {"muon_lr": muon_lr}
+        if self.scaler.enabled:     # fp16: the scale and the overflows skipped so far
+            extra.update(loss_scale=self.scaler.scale, overflows=self.overflow_steps)
         # wraps > 0 means the model is re-reading data; it must be visible in the log.
         self._safe_log(
             self.log.log_step,
@@ -1194,6 +1203,7 @@ class Trainer:
                                  if self.is_moe else None),
                 "stream": self.stream.state_dict(),
                 "skipped_steps": self.skipped_steps,
+                "overflow_steps": self.overflow_steps,
                 "loss_scale": self.scaler.state_dict() if self.scaler.enabled else None,
                 "torch_rng": torch.get_rng_state(),
                 "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -1288,6 +1298,7 @@ class Trainer:
             self._interval_dropped = dropped.clone()
         self.stream.load_state_dict(state["stream"])
         self.skipped_steps = int(state.get("skipped_steps", 0))   # absent before it existed
+        self.overflow_steps = int(state.get("overflow_steps", 0))  # absent before fp16
         if state.get("loss_scale") is not None:     # absent before fp16 existed
             self.scaler.load_state_dict(state["loss_scale"])
         torch.set_rng_state(state["torch_rng"])
