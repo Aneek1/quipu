@@ -525,3 +525,19 @@ def test_device_guard(tmp_path, cap, dispatch, precision, ok):
     else:
         with pytest.raises(UsageError):
             check_device_support(cfg.model, cfg.train, cap)
+
+
+# ---- Kaggle config -------------------------------------------------------------------
+
+def test_t4_config_is_the_cpt_model_with_low_memory_training():
+    cpt = load_config(ROOT / "configs" / "quipu-moe-cpt.toml")
+    t4 = load_config(ROOT / "configs" / "quipu-moe-cpt-t4.toml")
+    assert dataclasses.replace(t4.model, moe_dispatch=cpt.model.moe_dispatch) == cpt.model
+    assert t4.model.moe_dispatch == "loop"
+    t = t4.train
+    assert (t.precision, t.optimizer_state_dtype, t.activation_checkpoint) == \
+        ("fp16", "bf16", "block")
+    assert t.loss_chunk_tokens == 4096 and t.compile is False
+    assert t.batch_tokens == cpt.train.batch_tokens
+    assert t.grad_accum % 2 == 0                      # splits over 2 GPUs
+    assert t.ckpt_keep == 1

@@ -1,0 +1,30 @@
+name = "quipu-moe-cpt-t4"
+
+# quipu-moe-cpt on Kaggle's 2x T4 (16 GB, sm_75: no bf16, no grouped matmul).
+# Spec: docs/superpowers/specs/2026-10-20-t4-low-memory-training-design.md.
+# Runbook: docs/superpowers/specs/2026-10-20-kaggle-t4-runbook.md.
+# Same model and schedule as the B200 run; only how a step is computed changes.
+inherit = "quipu-moe-cpt.toml"
+
+[model]
+moe_dispatch = "loop"
+
+[train]
+precision             = "fp16"
+optimizer_state_dtype = "bf16"
+activation_checkpoint = "block"
+# Each 4096-token chunk of the loss peaks at ~2.4 GB (logits + their gradient,
+# measured); 1024-2048 lowers peak memory if headroom is tight.
+loss_chunk_tokens     = 4096
+compile               = false     # required: block checkpointing is refused with compile
+micro_batch           = 2         # starting point; the first session measures memory
+ckpt_dir              = "/kaggle/working/ckpt"
+ckpt_keep             = 1         # /kaggle/working holds 20 GB
+# Steps take ~25-60 s on 2x T4 (estimate); about every 30-45 minutes. Retune from
+# the first session's step time.
+ckpt_every            = 60
+eval_every            = 60
+# The spend guard doubles as the session clock: 1 "dollar" per hour stops the run
+# cleanly with a checkpoint after 11.25 h, inside Kaggle's 12-hour limit.
+usd_per_hour          = 1.0
+budget_usd            = 11.25
