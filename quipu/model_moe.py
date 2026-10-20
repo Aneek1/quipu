@@ -38,6 +38,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from quipu.attnres import BlockAttnRes
 from quipu.config import ModelConfig
@@ -97,6 +98,12 @@ class QuipuMoE(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layer) ** 0.5)
 
         self.last_stats: list[MoEStats | None] = [None] * cfg.n_layer
+        # train.activation_checkpoint "block" (set by the trainer): each block's
+        # activations are recomputed in backward (training with grad only). The
+        # recompute re-runs the router on the same input, so it leaves _last_scores as
+        # the first pass did, and its stats are discarded (last_stats is assigned
+        # here, from the first pass only).
+        self.checkpoint_blocks = False
 
     def _sublayer(self, i: int, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """AttnRes step i: attention of layer i // 2 (even i) or its MoE (odd i).
@@ -117,8 +124,12 @@ class QuipuMoE(nn.Module):
         cos, sin = self.rope_cos, self.rope_sin
         self.last_stats = [None] * self.cfg.n_layer
         if self.attnres is None:
+            ckpt = self.checkpoint_blocks and self.training and torch.is_grad_enabled()
             for l, block in enumerate(self.blocks):
-                x, self.last_stats[l] = block(x, cos, sin)
+                if ckpt:
+                    x, self.last_stats[l] = checkpoint(block, x, cos, sin, use_reentrant=False)
+                else:
+                    x, self.last_stats[l] = block(x, cos, sin)
         else:
             x = self.attnres(x, lambda i, h: self._sublayer(i, h, cos, sin))
         # return_hidden: the final normed hidden states, for quipu.lossfn's chunked loss.

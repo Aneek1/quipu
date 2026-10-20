@@ -211,3 +211,66 @@ def test_models_return_hidden_matching_logits(tmp_path):
         logits = m(x)
         h = m(x, return_hidden=True)
     torch.testing.assert_close(m.lm_head(h), logits)
+
+
+# ---- activation checkpointing --------------------------------------------------------
+
+def _grads_after_backward(model, x):
+    model.zero_grad(set_to_none=True)
+    loss = F.cross_entropy(model(x).view(-1, model.cfg.vocab_size), x.view(-1))
+    loss.backward()
+    return loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters()
+                           if p.grad is not None}
+
+
+def test_moe_block_checkpointing_changes_nothing(tmp_path):
+    from quipu.model_factory import build_model
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
+    torch.manual_seed(0)
+    plain = build_model(cfg.model).train()
+    ckpt = build_model(cfg.model).train()
+    ckpt.load_state_dict(plain.state_dict())
+    ckpt.checkpoint_blocks = True
+    x = torch.randint(cfg.model.vocab_size, (2, 32), generator=torch.Generator().manual_seed(1))
+    l1, g1 = _grads_after_backward(plain, x)
+    l2, g2 = _grads_after_backward(ckpt, x)
+    torch.testing.assert_close(l2, l1)
+    assert g1.keys() == g2.keys()
+    for n in g1:
+        torch.testing.assert_close(g2[n], g1[n], rtol=1e-5, atol=1e-7, msg=n)
+    for b1, b2 in zip(plain.blocks, ckpt.blocks):
+        torch.testing.assert_close(b2.moe._last_scores, b1.moe._last_scores)
+    for s1, s2 in zip(plain.last_stats, ckpt.last_stats):
+        assert torch.equal(s1.counts, s2.counts) and torch.equal(s1.dropped, s2.dropped)
+
+
+def test_dense_block_checkpointing_changes_nothing():
+    from quipu.model import Quipu
+    mc = dataclasses.replace(load_config(ROOT / "configs" / "quipu-114m.toml").model,
+                             vocab_size=256, d_model=64, n_layer=2, n_head=4, n_kv_head=2,
+                             ffn_hidden=128, context=32)
+    torch.manual_seed(0)
+    plain, ckpt = Quipu(mc).train(), Quipu(mc).train()
+    ckpt.load_state_dict(plain.state_dict())
+    ckpt.checkpoint_blocks = True
+    x = torch.randint(256, (2, 32), generator=torch.Generator().manual_seed(1))
+    l1, g1 = _grads_after_backward(plain, x)
+    l2, g2 = _grads_after_backward(ckpt, x)
+    torch.testing.assert_close(l2, l1)
+    for n in g1:
+        torch.testing.assert_close(g2[n], g1[n], rtol=1e-5, atol=1e-7, msg=n)
+
+
+def test_checkpointing_is_off_in_eval_and_no_grad(tmp_path, monkeypatch):
+    import quipu.model_moe as mm
+    from quipu.model_factory import build_model
+    cfg = smoke_cfg(tmp_path, model={"attnres_blocks": 0})
+    m = build_model(cfg.model)
+    m.checkpoint_blocks = True
+    calls = []
+    monkeypatch.setattr(mm, "checkpoint", lambda *a, **k: calls.append(1) or a[0](*a[1:]))
+    x = torch.randint(cfg.model.vocab_size, (1, 8))
+    with torch.no_grad():
+        m.train()(x)
+    m.eval()(x)
+    assert calls == []

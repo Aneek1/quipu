@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from quipu.config import ModelConfig
 
@@ -139,6 +140,9 @@ class Quipu(nn.Module):
             if name.endswith("o.weight") or name.endswith("down.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / (2 * cfg.n_layer) ** 0.5)
 
+        # train.activation_checkpoint "block": recompute each block in backward.
+        self.checkpoint_blocks = False
+
     @staticmethod
     def _init(module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -152,8 +156,9 @@ class Quipu(nn.Module):
         )
         x = self.embed(idx)
         cos, sin = self.rope_cos, self.rope_sin
+        ckpt = self.checkpoint_blocks and self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            x = block(x, cos, sin)
+            x = checkpoint(block, x, cos, sin, use_reentrant=False) if ckpt else block(x, cos, sin)
         # return_hidden: the final normed hidden states, for quipu.lossfn's chunked loss.
         h = self.norm(x)
         return h if return_hidden else self.lm_head(h)
