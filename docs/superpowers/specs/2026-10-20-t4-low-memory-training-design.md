@@ -154,3 +154,23 @@ and pretraining waits for B200 credits.
 Sharded optimizer state across ranks (approach B, only if the measured memory is too
 tight), FSDP, 8-bit optimizers, CPU offload, torch.compile on T4, moving data or
 checkpoints through Hugging Face.
+
+## Changes during implementation
+
+- The Kaggle config is `configs/quipu-moe-cpt-t4.toml` (inherits quipu-moe-cpt.toml),
+  not `configs/kaggle-t4x2.toml`.
+- Session clock: the spend guard at usd_per_hour 1.0, budget_usd 11.25 stops the run
+  with a checkpoint after 11.25 h, instead of budget_usd 0.
+- loss_chunk_tokens 2048, not 4096: at micro_batch 2 a 4096-token chunk is the whole
+  micro-batch, so it saved nothing.
+- scripts/lowmem_probe.py: both parity runs train until they have taken --steps
+  optimizer steps (fp16 overflows skip steps; capped at 2x calls) and compare the
+  loss tail over the same step indices; pass = within 1%, no non-finite loss, fp16
+  took at least 90% of the steps; overflows reported separately. Memory mode trains
+  until 2 steps were taken (optimizer state allocated) and reports peak allocated and
+  reserved. `--force-fp16-ns` runs Newton-Schulz in fp16 to mimic a T4 on a newer GPU.
+- Runbook order for the first session: environment check, probe memory run at 16
+  layers, a short check run under its own run id (deleted afterwards), the fp16-vs-fp32
+  val loss of step_008129 (no eval was logged at step 8129; step 8000's is the
+  reference), and only then the long run as a committed version. No `pip install -e .`
+  on Kaggle; PYTHONPATH=. instead.
