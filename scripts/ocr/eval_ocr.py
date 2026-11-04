@@ -91,6 +91,87 @@ def read_set(d: Path) -> list[tuple[Path, str]]:
     return rows
 
 
+def predict_ctc(ckpt: Path, paths: list[Path]) -> list[str]:
+    """Greedy CTC decoding with the checkpoint's model (its "vit" dict rebuilds the
+    config; STEPS_PER_COL is a code constant, not stored)."""
+    import torch
+    from PIL import Image
+    from quipu.ocr_ctc import LineCTC, ctc_greedy_decode
+    from quipu.ocr_data import collate, preprocess
+    from quipu.vision import ViTConfig
+
+    ck = torch.load(ckpt, weights_only=False, map_location="cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = LineCTC(ViTConfig(**ck["vit"])).to(device).eval()
+    model.load_state_dict(ck["model"])
+    hyps = []
+    with torch.no_grad():
+        for i in range(0, len(paths), 64):
+            items = []
+            for p in paths[i:i + 64]:
+                with Image.open(p) as im:
+                    items.append((preprocess(im), ""))
+            images, mask, _ = collate(items)
+            lp, lens = model(images.to(device), mask.to(device))
+            hyps += ctc_greedy_decode(lp.cpu(), lens.cpu())
+    return hyps
+
+
+def predict_tesseract(paths: list[Path]) -> list[str] | None:
+    import shutil
+    import subprocess
+    exe = shutil.which("tesseract")
+    if exe is None:
+        print("tesseract not on PATH: skipped", file=sys.stderr)
+        return None
+    return [subprocess.run([exe, str(p), "stdout", "--psm", "7"], capture_output=True,
+                           text=True, encoding="utf-8").stdout.strip() for p in paths]
+
+
+def predict_trocr(paths: list[Path], style: str) -> list[str]:
+    import torch
+    from PIL import Image
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    name = "microsoft/trocr-small-handwritten" if style == "hand" else "microsoft/trocr-small-printed"
+    proc = TrOCRProcessor.from_pretrained(name)
+    model = VisionEncoderDecoderModel.from_pretrained(name).eval()
+    hyps = []
+    with torch.no_grad():
+        for i in range(0, len(paths), 16):
+            imgs = [Image.open(p).convert("RGB") for p in paths[i:i + 16]]
+            ids = model.generate(proc(images=imgs, return_tensors="pt").pixel_values,
+                                 max_new_tokens=64)
+            hyps += [s.strip() for s in proc.batch_decode(ids, skip_special_tokens=True)]
+    return hyps
+
+
+def run(ckpt: Path, sets: Path, out: Path, baselines: list[str]) -> str:
+    from quipu.ocr_metrics import cer, exact_match, wer
+    verify_sums(sets)
+    rows = []
+    for name in SETS:
+        data = read_set(sets / name)
+        paths, refs = [p for p, _ in data], [t for _, t in data]
+        systems = {"quipu-ocr-ctc": predict_ctc(ckpt, paths)}
+        if "tesseract" in baselines:
+            hyp = predict_tesseract(paths)
+            if hyp is None:
+                baselines = [b for b in baselines if b != "tesseract"]   # say it once
+            else:
+                systems["tesseract"] = hyp
+        if "trocr" in baselines:
+            systems["trocr-small"] = predict_trocr(paths, "hand" if name == "hand" else "printed")
+        for system, hyps in systems.items():
+            rows.append(f"| {system} | {name} | {len(refs)} | {cer(refs, hyps):.4f} | "
+                        f"{wer(refs, hyps):.4f} | {exact_match(refs, hyps):.3f} |")
+    table = ("| system | set | lines | CER | WER | exact |\n|---|---|---|---|---|---|\n"
+             + "\n".join(rows) + "\n")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(f"Checkpoint: `{ckpt}`. Sets: `{sets}` (SHA256SUMS verified). "
+                   "Greedy decoding, no language-model rescoring.\n\n" + table, encoding="utf-8")
+    return table
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -100,10 +181,18 @@ def main(argv: list[str] | None = None) -> int:
     mk.add_argument("--out", default=str(ROOT / "data" / "ocr" / "eval"))
     mk.add_argument("--n", type=int, default=1000)
     mk.add_argument("--seed", type=int, default=12345)
+    rn = sub.add_parser("run")
+    rn.add_argument("--ckpt", required=True)
+    rn.add_argument("--sets", default=str(ROOT / "data" / "ocr" / "eval"))
+    rn.add_argument("--out", default=str(ROOT / "results" / "ocr-encoder-stage.md"))
+    rn.add_argument("--baselines", default="tesseract,trocr")
     args = ap.parse_args(argv)
     if args.cmd == "make":
         make_sets(Path(args.text), Path(args.fonts), Path(args.out), args.n, args.seed)
         print(f"eval sets -> {args.out}")
+    if args.cmd == "run":
+        print(run(Path(args.ckpt), Path(args.sets), Path(args.out),
+                  [b for b in args.baselines.split(",") if b]))
     return 0
 
 

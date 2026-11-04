@@ -68,3 +68,45 @@ def test_nonsense_words():
         w = ev.nonsense_line(random.Random(seed))
         assert w and all(part.isalpha() for part in w.split())
         assert w == w.strip() and len(w) <= ev.MAX_CHARS      # render_line's strip rule
+
+
+def _tiny_ckpt(tmp_path):
+    import torch
+    from quipu.ocr_ctc import LineCTC
+    from quipu.vision import ViTConfig
+    vit = ViTConfig(d_model=32, n_layer=2, n_head=4, mlp=64)
+    ck = tmp_path / "best.pt"
+    torch.save({"model": LineCTC(vit).state_dict(), "vit": vars(vit), "step": 1}, ck)
+    return ck
+
+
+def test_run_scores_a_ctc_checkpoint_and_writes_a_table(tmp_path):
+    out = _make(tmp_path)
+    ck = _tiny_ckpt(tmp_path)
+    table = tmp_path / "results.md"
+    ev.main(["run", "--ckpt", str(ck), "--sets", str(out), "--out", str(table),
+             "--baselines", ""])
+    text = table.read_text(encoding="utf-8")
+    assert "| quipu-ocr-ctc" in text
+    for name in ("printed", "hand", "nonsense"):
+        assert f"| quipu-ocr-ctc | {name} | 12 |" in text
+
+
+def test_run_skips_a_missing_tesseract_and_still_writes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    out = _make(tmp_path)
+    table = tmp_path / "results.md"
+    ev.main(["run", "--ckpt", str(_tiny_ckpt(tmp_path)), "--sets", str(out),
+             "--out", str(table), "--baselines", "tesseract"])
+    assert "tesseract not on PATH: skipped" in capsys.readouterr().err
+    text = table.read_text(encoding="utf-8")
+    assert "| quipu-ocr-ctc | printed |" in text and "| tesseract |" not in text
+
+
+def test_run_refuses_a_changed_set(tmp_path):
+    out = _make(tmp_path)
+    png, _ = ev.read_set(out / "hand")[0]
+    png.write_bytes(png.read_bytes() + b"x")
+    with pytest.raises(ValueError, match="changed"):
+        ev.main(["run", "--ckpt", str(_tiny_ckpt(tmp_path)), "--sets", str(out),
+                 "--out", str(tmp_path / "r.md"), "--baselines", ""])
