@@ -18,3 +18,7 @@ results/spend.json*
 data/distill-v2/
 tools/
 models/
+
+# Quipu-OCR data and runs (fonts, rendered eval sets, checkpoints)
+data/ocr/
+runs/
