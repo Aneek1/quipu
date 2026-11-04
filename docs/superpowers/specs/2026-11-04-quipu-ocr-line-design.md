@@ -67,8 +67,10 @@ Rejected:
   layer to the character set plus the CTC blank.
 - Character set: printable ASCII (95) plus a few common symbols (°, £, €, ×, –, ', ').
   Fixed in a file so the encoder and evaluation agree.
-- 64 columns give 64 CTC steps, enough for lines up to about 60 characters with repeats.
-  Lines longer than that are filtered out of the CTC data, not truncated.
+- 64 columns give 64 CTC steps. CTC needs a blank between repeated letters, so a line
+  needs up to about twice its length in steps in the worst case; the encoder stage keeps
+  lines of at most 40 characters (and drops any line whose CTC path does not fit),
+  filtered out, not truncated. The joint stage has no such limit and uses lines up to 60.
 
 ### 3.4 Connector and prompt (`quipu/ocr_lm.py`)
 
