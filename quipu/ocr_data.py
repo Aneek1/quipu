@@ -52,6 +52,20 @@ def collate(items: list[tuple[torch.Tensor, str]]):
     return images, mask, [s for _, s in items]
 
 
+def render_fitting(text: str, style: str, fonts: list[Font], rng: random.Random,
+                   tries: int = FONT_TRIES) -> tuple[Image.Image, torch.Tensor] | None:
+    """Render `text` in a random `style` font (pick_font) until the image is wide enough
+    for its CTC path, trying up to `tries` fonts. Returns (image, preprocessed tensor), or
+    None if every try was too narrow. Raises LineTooWide as soon as one render is wider
+    than MAX_WIDTH: another font would not shorten the text much."""
+    for _ in range(tries):
+        img = render_line(text, pick_font(fonts, style, rng), rng)
+        t = preprocess(img)
+        if ctc_steps_needed(text) <= (t.shape[-1] // PATCH) * STEPS_PER_COL:
+            return img, t
+    return None
+
+
 class LineStream(IterableDataset):
     """Endless (image, text) pairs: a random line, a random style (hand with
     probability hand_frac), a random family then font of that style, rendered and
@@ -75,22 +89,17 @@ class LineStream(IterableDataset):
         while True:
             text = rng.choice(self.lines)
             style = "hand" if rng.random() < self.hand_frac else "printed"
-            result = None
-            for _ in range(FONT_TRIES):             # same text and style, another font
-                font = pick_font(self.fonts, style, rng)
-                try:
-                    img = preprocess(render_line(text, font, rng))
-                except LineTooWide:
-                    too_wide += 1
-                    break
-                if ctc_steps_needed(text) <= (img.shape[-1] // PATCH) * STEPS_PER_COL:
-                    result = img
-                    break
+            try:                                    # same text and style, up to 5 fonts
+                result = render_fitting(text, style, self.fonts, rng)
+            except LineTooWide:
+                result = None
+                too_wide += 1
             else:
-                ctc_miss += 1
+                if result is None:
+                    ctc_miss += 1
             if result is not None:
                 too_wide = ctc_miss = 0
-                yield result, text
+                yield result[1], text
             elif too_wide + ctc_miss >= MAX_SKIPS:
                 if ctc_miss >= too_wide:
                     why = "the fonts are too narrow for the CTC step"
