@@ -97,3 +97,14 @@ def test_ctc_loss_on_padded_batch_is_finite():
     lp, lens = m(images, mask)
     loss = oc.ctc_loss(lp, lens, ["ab", "cab"])
     assert torch.isfinite(loss) and loss.item() > 0
+
+
+def test_checkpoint_compat_fields_round_trip_and_mismatch_is_refused():
+    ck = {"model": {}, **oc.ckpt_compat()}
+    oc.check_ckpt_compat(ck, "x.pt")                       # does not raise
+    with pytest.raises(ValueError, match="charset"):
+        oc.check_ckpt_compat({**ck, "charset_sha256": "0" * 64}, "x.pt")
+    with pytest.raises(ValueError, match="steps"):
+        oc.check_ckpt_compat({**ck, "steps_per_col": 1}, "x.pt")
+    with pytest.raises(ValueError, match="charset"):
+        oc.check_ckpt_compat({"model": {}}, "old.pt")      # written before the fields existed

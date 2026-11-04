@@ -5,6 +5,8 @@ is the CTC blank; character i of CHARSET is class i + 1. The set is fixed here s
 trainer, the data filter and the evaluation can never disagree about it."""
 from __future__ import annotations
 
+import hashlib
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -17,6 +19,7 @@ BLANK = 0
 N_CLASSES = len(CHARSET) + 1
 STEPS_PER_COL = 2          # CTC steps emitted per 16-px patch column
 _INDEX = {ch: i + 1 for i, ch in enumerate(CHARSET)}
+CHARSET_SHA256 = hashlib.sha256(CHARSET.encode("utf-8")).hexdigest()
 
 
 def in_charset(text: str) -> bool:
@@ -28,6 +31,21 @@ def encode_text(text: str) -> list[int]:
         return [_INDEX[ch] for ch in text]
     except KeyError as e:
         raise ValueError(f"character {e.args[0]!r} is not in the OCR character set") from None
+
+
+def ckpt_compat() -> dict:
+    """Fields stored in every checkpoint so a model is never read with another charset
+    or another number of CTC steps per column."""
+    return {"charset_sha256": CHARSET_SHA256, "steps_per_col": STEPS_PER_COL}
+
+
+def check_ckpt_compat(ck: dict, where: object) -> None:
+    if ck.get("charset_sha256") != CHARSET_SHA256:
+        raise ValueError(f"{where}: checkpoint charset sha256 {str(ck.get('charset_sha256'))[:12]} "
+                         f"does not match this code's ({CHARSET_SHA256[:12]})")
+    if ck.get("steps_per_col") != STEPS_PER_COL:
+        raise ValueError(f"{where}: checkpoint has {ck.get('steps_per_col')} CTC steps per "
+                         f"column, this code {STEPS_PER_COL}")
 
 
 def ctc_steps_needed(text: str) -> int:
