@@ -104,6 +104,18 @@ def test_resume_keeps_optimizer_scaler_best_and_patience(tmp_path, monkeypatch, 
     assert _ck(run / "latest.pt")["step"] == 12
 
 
+def test_resume_tolerates_a_torn_last_log_line(tmp_path, monkeypatch):
+    args = _setup(tmp_path, eval_sets=False) + ["--set", "train.patience=5"]
+    run = tmp_path / "run"
+    _fake_eval(monkeypatch, [0.5, 0.6])
+    tc.main(args)
+    with open(run / "log.jsonl", "a") as f:                 # killed mid-write
+        f.write('{"step": 9, "loss": 1.2')
+    _fake_eval(monkeypatch, [0.4])
+    assert tc.main(args + ["--set", "train.steps=9"]) == 0
+    assert [e["step"] for e in _log(run)] == [3, 6, 9]
+
+
 def test_resume_takes_the_lower_of_latest_and_best(tmp_path, monkeypatch):
     args = _setup(tmp_path, eval_sets=False) + ["--set", "train.patience=5"]
     run = tmp_path / "run"

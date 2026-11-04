@@ -9,7 +9,8 @@ eval to <ckpt_dir>/log.jsonl: step, mean loss since the last eval, lr, elapsed_s
 over sessions), lines_per_s (this session), the grad-scaler scale under fp16, and the CER
 of each eval set.
 
-Checkpoints: latest.pt every eval, then best.pt when the printed-set CER improves.
+Checkpoints: best.pt when the printed-set CER improves, then latest.pt every eval
+(resume takes the lower of the two best CERs, so a crash between them is safe).
 <ckpt_dir>/latest.pt is resumed automatically; --resume PATH first copies a latest.pt
 (and the best.pt and log.jsonl beside it) from elsewhere, e.g. a read-only Kaggle input.
 On resume, log entries after the checkpoint's step are dropped, and a run that already
@@ -167,11 +168,18 @@ def _prepare_dir(ckpt_dir: Path, resume: str | None, fresh: bool) -> None:
 
 
 def _truncate_log(log: Path, step: int) -> None:
-    """Drop entries written after the checkpoint (a session that died between them)."""
+    """Drop entries written after the checkpoint (a session that died between them) and
+    any line that is not valid JSON (one killed mid-write leaves a torn last line)."""
     if not log.is_file():
         return
-    keep = [s for s in log.read_text(encoding="utf-8").splitlines()
-            if s.strip() and json.loads(s).get("step", 0) <= step]
+    keep = []
+    for s in log.read_text(encoding="utf-8").splitlines():
+        try:
+            entry = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("step", 0) <= step:
+            keep.append(s)
     log.write_text("".join(k + "\n" for k in keep), encoding="utf-8")
 
 
@@ -276,13 +284,13 @@ def main(argv: list[str] | None = None) -> int:
                 bad += 1
             meta = {"vit": vars(vit), "step": step, "precision": t["precision"],
                     **ckpt_compat()}
+            if improved:          # before latest.pt; resume takes min(latest, best.pt)
+                save(ckpt_dir / "best.pt", {"model": model.state_dict(), "cer_printed": best,
+                                            **meta})
             save(ckpt_dir / "latest.pt", {"model": model.state_dict(), "opt": opt.state_dict(),
                                           "scaler": scaler.state_dict(), "best_cer": best,
                                           "bad_evals": bad, "elapsed_s": elapsed0 + session,
                                           **meta})
-            if improved:                      # after latest.pt: resume needs that one most
-                save(ckpt_dir / "best.pt", {"model": model.state_dict(), "cer_printed": best,
-                                            **meta})
             if bad >= t["patience"]:
                 print(f"stopping: printed CER has not improved for {bad} evals")
                 break
