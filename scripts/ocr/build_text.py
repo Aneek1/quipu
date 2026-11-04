@@ -5,7 +5,9 @@
 
 Documents are the EOT-separated runs of a shard, decoded with Quipu's tokenizer. Shards
 are visited in a seeded random order and each document is kept with probability
---doc-keep, so the lines come from the whole corpus rather than the first shard. Each
+--doc-keep (default 0.012, sized so a 10M-line build reaches the line limit only after
+drawing from all ~83 shards of data/shards-moe/train; at 0.12 it stopped after ~7), so
+the lines come from the whole corpus rather than the first few shards. Each
 kept document is cut into lines of 5-60 characters at word boundaries, keeping only
 characters in the OCR set. About 15% of lines are random strings (codes, digits,
 punctuation) so a model cannot read by guessing language. One document in 20 goes to
@@ -130,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lines", type=int, default=10_000_000)
     ap.add_argument("--random-frac", type=_fraction, default=0.15)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--doc-keep", type=float, default=0.12,
+    ap.add_argument("--doc-keep", type=float, default=0.012,
                     help="probability of keeping each document, in (0, 1]")
     ap.add_argument("--max-shards", type=int, default=None, help="use only the first N shards")
     args = ap.parse_args(argv)
