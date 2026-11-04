@@ -1,0 +1,26 @@
+[model]
+d_model = 32
+n_layer = 2
+n_head  = 4
+mlp     = 64
+
+[data]
+text      = "PLACEHOLDER_SET_BY_TEST"
+fonts     = "PLACEHOLDER_SET_BY_TEST"
+eval_dir  = "PLACEHOLDER_SET_BY_TEST"
+hand_frac = 0.3
+max_chars = 36
+workers   = 0
+
+[train]
+steps        = 6
+batch        = 4
+lr           = 1e-3
+warmup       = 2
+weight_decay = 0.05
+eval_every   = 3
+eval_n       = 4
+patience     = 2
+precision    = "fp32"
+seed         = 0
+ckpt_dir     = "PLACEHOLDER_SET_BY_TEST"

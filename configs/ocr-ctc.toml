@@ -1,0 +1,27 @@
+# Quipu-OCR encoder stage (spec section 5.1). Kaggle T4: precision "fp16".
+[model]
+d_model = 384
+n_layer = 12
+n_head  = 6
+mlp     = 1536
+
+[data]
+text      = "data/ocr/text/train.txt"
+fonts     = "data/ocr/fonts"
+eval_dir  = "data/ocr/eval"
+hand_frac = 0.3
+max_chars = 36            # ~35 characters fit 64x1024; eval_ocr.MAX_CHARS matches
+workers   = 8
+
+[train]
+steps        = 60000
+batch        = 128
+lr           = 1e-3
+warmup       = 1000
+weight_decay = 0.05
+eval_every   = 2000
+eval_n       = 500        # lines per eval set during training (the full sets at the end)
+patience     = 2          # evaluations without a better printed CER before stopping
+precision    = "bf16"     # "bf16" | "fp16" | "fp32"
+seed         = 0
+ckpt_dir     = "runs/ocr-ctc"
