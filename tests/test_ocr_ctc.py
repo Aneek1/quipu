@@ -56,10 +56,11 @@ def test_line_ctc_shapes():
     images = torch.rand(2, 1, 64, 128)
     mask = torch.tensor([[True] * 8, [True] * 5 + [False] * 3])
     lp, lens = m(images, mask)
-    assert lp.shape == (8, 2, oc.N_CLASSES)
+    assert oc.STEPS_PER_COL == 2
+    assert lp.shape == (16, 2, oc.N_CLASSES)
     assert lp.dtype == torch.float32
-    assert lens.tolist() == [8, 5]
-    torch.testing.assert_close(lp.exp().sum(-1), torch.ones(8, 2))
+    assert lens.tolist() == [16, 10]
+    torch.testing.assert_close(lp.exp().sum(-1), torch.ones(16, 2))
 
 
 def test_ctc_loss_goes_down_when_overfitting_two_lines():
@@ -70,7 +71,7 @@ def test_ctc_loss_goes_down_when_overfitting_two_lines():
     texts = ["ab", "cab"]
     opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
     first = None
-    for _ in range(150):
+    for _ in range(300):
         lp, lens = m(images, mask)
         loss = oc.ctc_loss(lp, lens, texts)
         first = first if first is not None else loss.item()
