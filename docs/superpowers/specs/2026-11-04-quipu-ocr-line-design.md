@@ -49,7 +49,8 @@ Rejected:
 ### 3.1 Input
 
 - Grayscale line image, resized to 64 px high keeping the aspect ratio, width capped at
-  1,024 px (wider lines are scaled down to fit), padded on the right to a multiple of 16.
+  1,024 px (a line wider than that is dropped, never squashed; see the 3.3 amendment),
+  padded on the right to a multiple of 16.
 - 16×16 patches: 4 rows × up to 64 columns = at most 256 patches per line.
 - A padding mask marks the right-hand padding so attention ignores it.
 
