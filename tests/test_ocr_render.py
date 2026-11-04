@@ -49,3 +49,17 @@ def test_render_line_is_deterministic_per_seed(tmp_path):
     c = r.render_line("same seed", font, random.Random(8)).tobytes()
     assert a == b
     assert a != c
+
+
+@pytest.mark.parametrize("style", ["printed", "hand"])
+def test_crop_margins_leave_edge_columns_free_of_ink(tmp_path, style):
+    font = next(f for f in r.load_fonts(make_font_dir(tmp_path)) if f.style == style)
+    bg, ink = 230, 20
+    for seed in range(10):
+        text = "Hello, World 42 gjpqy Tall Hill"
+        img = r._draw(text, font, 40, bg, ink, random.Random(seed), hand=style == "hand")
+        arr = np.asarray(img)
+        thr = (bg + ink) / 2
+        assert (arr < thr).any()
+        assert not (arr[:, :2] < thr).any(), f"ink in left 2 columns, seed {seed}"
+        assert not (arr[:, -2:] < thr).any(), f"ink in right 2 columns, seed {seed}"

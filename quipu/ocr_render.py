@@ -116,7 +116,7 @@ def _crop_to_ink(img: Image.Image, bg: int, ink: int, rng: random.Random) -> Ima
     ys, xs = np.nonzero(arr < (bg + ink) / 2)
     if len(xs) == 0:
         return img
-    mx, my = rng.randint(2, 16), rng.randint(3, 12)
+    mx, my = rng.randint(6, 16), rng.randint(4, 12)
     box = (max(0, xs.min() - mx), max(0, ys.min() - my),
            min(img.width, xs.max() + 1 + mx), min(img.height, ys.max() + 1 + my))
     return img.crop(box)
