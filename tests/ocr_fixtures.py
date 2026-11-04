@@ -1,5 +1,7 @@
 """A font directory for OCR tests, built from matplotlib's bundled DejaVu Sans so no
-download is needed. The licence file is a stand-in; only its presence is checked."""
+download is needed. The licence file is a stand-in; only its presence is checked.
+The manifest carries the real sha256 of the font file, which load_fonts verifies."""
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -18,7 +20,7 @@ def make_font_dir(root: Path, families=(("printed", "alpha"), ("printed", "beta"
         shutil.copy(DEJAVU, d / f"{fam}.ttf")
         (d / "OFL.txt").write_text("test licence stand-in\n", encoding="utf-8")
         entries.append({"family": fam, "style": style, "path": f"ofl/{fam}/{fam}.ttf",
-                        "licence": f"ofl/{fam}/OFL.txt", "sha256": "x"})
+                        "licence": f"ofl/{fam}/OFL.txt", "sha256": hashlib.sha256(DEJAVU.read_bytes()).hexdigest()})
     (root / "fonts.json").write_text(json.dumps({"ref": "test", "fonts": entries}),
                                      encoding="utf-8")
     return root

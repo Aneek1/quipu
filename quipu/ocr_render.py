@@ -8,9 +8,11 @@ augmentation. Everything random comes from the `rng` passed in, so a seed fixes 
 image exactly."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,10 @@ STYLES = ("printed", "hand")
 
 
 class FontLicenceError(Exception):
+    pass
+
+
+class FontManifestError(Exception):
     pass
 
 
@@ -43,16 +49,38 @@ def find_licence(font_path: str | Path) -> Path:
 
 
 def load_fonts(font_dir: str | Path) -> list[Font]:
+    """Fonts listed in fonts.json. Every path must stay inside font_dir, have a licence
+    file beside it, and match the sha256 recorded when it was downloaded."""
     font_dir = Path(font_dir)
+    root = font_dir.resolve()
     manifest = json.loads((font_dir / "fonts.json").read_text(encoding="utf-8"))
     fonts = []
     for e in manifest["fonts"]:
         if e["style"] not in STYLES:
             raise ValueError(f"unknown style {e['style']!r} for {e['path']}")
-        path = font_dir / e["path"]
+        rel = Path(e["path"])
+        path = font_dir / rel
+        if rel.is_absolute() or rel.drive or not path.resolve().is_relative_to(root):
+            raise FontManifestError(f"{e['path']}: path is outside the font directory")
+        if not path.is_file():
+            raise FontManifestError(f"{e['path']}: listed in fonts.json but missing")
         find_licence(path)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != e.get("sha256"):
+            raise FontManifestError(f"{e['path']}: sha256 {digest[:12]}... does not match "
+                                    f"the manifest ({str(e.get('sha256'))[:12]}...)")
         fonts.append(Font(e["family"], e["style"], path))
     return fonts
+
+
+def pick_font(fonts: list[Font], style: str, rng: random.Random) -> Font:
+    """Family first, then a file within it, so a family with many files (static weights)
+    is not sampled more often than a single-file one."""
+    pool = [f for f in fonts if f.style == style]
+    if not pool:
+        raise ValueError(f"no {style} fonts")
+    family = rng.choice(sorted({f.family for f in pool}))
+    return rng.choice([f for f in pool if f.family == family])
 
 
 def split_fonts(fonts: list[Font], held_every: int = 5) -> tuple[list[Font], list[Font]]:
@@ -74,8 +102,9 @@ def split_fonts(fonts: list[Font], held_every: int = 5) -> tuple[list[Font], lis
             [f for f in fonts if f.family in held_fams])
 
 
-_FONT_CACHE: dict[tuple, ImageFont.FreeTypeFont] = {}
 _AXES_CACHE: dict[str, list | None] = {}
+WEIGHT_MIN, WEIGHT_MAX, WEIGHT_STEP = 300, 800, 50
+VPAD = 24                    # vertical canvas padding: more than max margin + jitter
 
 
 def _axes(path: Path) -> list | None:
@@ -90,48 +119,69 @@ def _axes(path: Path) -> list | None:
 
 
 def pick_axis_values(axes: list, rng: random.Random) -> list[float]:
-    """A random weight in [minimum, maximum] on the weight axis, every other axis at
-    its default."""
+    """A random weight on the weight axis, every other axis at its default. The weight
+    is clamped to [300, 800] (thinner is near-invisible at 64 px) and quantised to steps
+    of 50, so at most 11 distinct fonts per size are ever built."""
     vals = []
     for a in axes:
         name = a["name"]
         name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
         if name.lower() == "weight":
-            vals.append(rng.uniform(a["minimum"], a["maximum"]))
+            lo, hi = max(a["minimum"], WEIGHT_MIN), min(a["maximum"], WEIGHT_MAX)
+            if lo > hi:
+                lo, hi = a["minimum"], a["maximum"]
+            w = round(rng.uniform(lo, hi) / WEIGHT_STEP) * WEIGHT_STEP
+            vals.append(min(max(w, lo), hi))
         else:
             vals.append(a["default"])
     return vals
 
 
+@functools.lru_cache(maxsize=512)
 def _font(path: Path, size: int, axis_values: tuple | None = None) -> ImageFont.FreeTypeFont:
-    key = (str(path), size, axis_values)
-    if key not in _FONT_CACHE:
-        f = ImageFont.truetype(str(path), size)
-        if axis_values is not None:
-            f.set_variation_by_axes(list(axis_values))
-        _FONT_CACHE[key] = f
-    return _FONT_CACHE[key]
+    f = ImageFont.truetype(str(path), size)
+    if axis_values is not None:
+        f.set_variation_by_axes(list(axis_values))
+    return f
 
 
 def _draw(text: str, font: Font, size: int, bg: int, ink: int, rng: random.Random,
           hand: bool, axis_values: tuple | None = None) -> Image.Image:
+    """Draw on a generous canvas, then crop: horizontally to the ink plus a margin,
+    vertically to a fixed box from the font's ascent/descent, so the glyph scale in the
+    final image does not depend on which letters the line contains."""
     spacing = rng.uniform(-0.5, 2.5)
-    sizes = [max(8, round(size * rng.uniform(0.9, 1.1))) if hand else size for _ in text]
-    advances = [_font(font.path, s, axis_values).getlength(ch) for ch, s in zip(text, sizes)]
-    width = int(sum(advances) + spacing * len(text) + 2 * size) + 16
-    height = int(size * 2.2)
-    img = Image.new("L", (width, height), bg)
+    mx, my = rng.randint(6, 16), rng.randint(4, 12)       # drawn first: text-independent
+    base_font = _font(font.path, size, axis_values)
+    asc, desc = base_font.getmetrics()
+    pad = size
+    baseline = VPAD + asc
+    whole = not hand and spacing <= 0.5                   # keep the font's kerning
+    if whole:
+        width = int(base_font.getlength(text)) + 2 * pad + 2
+    else:
+        sizes = [max(8, 2 * round(size * rng.uniform(0.9, 1.1) / 2)) if hand else size
+                 for _ in text]
+        dys = [rng.gauss(0, size * 0.04) if hand else 0.0 for _ in text]
+        x = float(pad)
+        xs = []
+        for ch, s in zip(text, sizes):
+            xs.append(x)
+            x += _font(font.path, s, axis_values).getlength(ch) + spacing + (
+                rng.gauss(0, size * 0.05) if hand else 0.0)
+        width = int(max(x, xs[-1] + size)) + 2 * pad + 2
+    img = Image.new("L", (width, 2 * VPAD + asc + desc), bg)
     d = ImageDraw.Draw(img)
-    x, base = float(size // 2), size * 0.5
     stroke = rng.choice([0, 0, 1]) if hand else 0
-    for ch, s, adv in zip(text, sizes, advances):
-        dy = rng.gauss(0, size * 0.04) if hand else 0.0
-        d.text((x, base + dy + (size - s) * 0.8), ch, font=_font(font.path, s, axis_values), fill=ink,
-               stroke_width=stroke, stroke_fill=ink)
-        x += adv + spacing + (rng.gauss(0, size * 0.05) if hand else 0.0)
+    if whole:
+        d.text((pad, baseline), text, font=base_font, fill=ink, anchor="ls")
+    else:
+        for ch, s, cx, dy in zip(text, sizes, xs, dys):
+            d.text((cx, baseline + dy), ch, font=_font(font.path, s, axis_values), fill=ink,
+                   anchor="ls", stroke_width=stroke, stroke_fill=ink)
     if hand:
         img = _shear(img, rng.uniform(-0.3, 0.3), bg)
-    return _crop_to_ink(img, bg, ink, rng)
+    return _crop_to_ink(img, bg, ink, mx, (VPAD - my, VPAD + asc + desc + my))
 
 
 def _shear(img: Image.Image, s: float, bg: int) -> Image.Image:
@@ -142,20 +192,21 @@ def _shear(img: Image.Image, s: float, bg: int) -> Image.Image:
                          resample=Image.Resampling.BILINEAR, fillcolor=bg)
 
 
-def _crop_to_ink(img: Image.Image, bg: int, ink: int, rng: random.Random) -> Image.Image:
+def _crop_to_ink(img: Image.Image, bg: int, ink: int, mx: int, vbox: tuple[int, int]
+                 ) -> Image.Image:
     arr = np.asarray(img)
-    ys, xs = np.nonzero(arr < (bg + ink) / 2)
+    xs = np.nonzero((arr < (bg + ink) / 2).any(axis=0))[0]
     if len(xs) == 0:
-        return img
-    mx, my = rng.randint(6, 16), rng.randint(4, 12)
-    box = (max(0, xs.min() - mx), max(0, ys.min() - my),
-           min(img.width, xs.max() + 1 + mx), min(img.height, ys.max() + 1 + my))
-    return img.crop(box)
+        return img.crop((0, vbox[0], img.width, vbox[1]))
+    return img.crop((max(0, xs.min() - mx), vbox[0], min(img.width, xs.max() + 1 + mx),
+                     vbox[1]))
 
 
 def _augment(img: Image.Image, bg: int, rng: random.Random) -> Image.Image:
     nrng = np.random.default_rng(rng.getrandbits(32))
-    img = img.rotate(rng.uniform(-3, 3), resample=Image.Resampling.BILINEAR, expand=True,
+    w0, h0 = img.size
+    lim = min(3.0, math.degrees(math.asin(min(1.0, 0.25 * h0 / w0))))   # w*sin(a) <= h/4
+    img = img.rotate(rng.uniform(-lim, lim), resample=Image.Resampling.BILINEAR, expand=True,
                      fillcolor=bg)
     if rng.random() < 0.3:
         w, h = img.size
@@ -189,6 +240,9 @@ def _augment(img: Image.Image, bg: int, rng: random.Random) -> Image.Image:
 
 def render_line(text: str, font: Font, rng: random.Random) -> Image.Image:
     find_licence(font.path)
+    if not text.strip() or text != text.strip():
+        raise ValueError(f"text must be non-empty with no leading or trailing "
+                         f"whitespace: {text!r}")
     size = rng.randint(28, 48)
     bg, ink = rng.randint(190, 255), rng.randint(0, 90)
     axes = _axes(font.path)

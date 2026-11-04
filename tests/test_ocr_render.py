@@ -98,3 +98,127 @@ def test_licence_names_are_ofl_and_apache_only():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     assert "UFL.txt" not in m.LICENCE_NAMES
+
+
+# ---- code-review fixes -------------------------------------------------------------
+
+import json  # noqa: E402
+
+from PIL import ImageFont  # noqa: E402
+
+
+def _fake_variable(monkeypatch, lo=100, hi=900):
+    """Pretend every font is variable with a weight axis, recording the weights set."""
+    seen = []
+    monkeypatch.setattr(r, "_axes", lambda path: [
+        {"name": b"Weight", "minimum": lo, "default": 400, "maximum": hi}])
+    monkeypatch.setattr(ImageFont.FreeTypeFont, "set_variation_by_axes",
+                        lambda self, v: seen.append(v[0]))
+    r._font.cache_clear()
+    return seen
+
+
+def test_font_cache_is_bounded_and_weights_are_few(tmp_path, monkeypatch):
+    seen = _fake_variable(monkeypatch)
+    fonts = r.load_fonts(make_font_dir(tmp_path))
+    rng = random.Random(0)
+    for i in range(500):
+        r.render_line("Hello world", fonts[i % len(fonts)], rng)
+    assert r._font.cache_info().currsize <= 512
+    assert len(set(seen)) <= 11
+    assert min(seen) >= 300 and max(seen) <= 800
+    assert all(w % 50 == 0 for w in seen)
+
+
+def test_pick_axis_values_is_quantised_and_clamped():
+    axes = [{"name": b"Weight", "minimum": 100, "default": 400, "maximum": 900}]
+    vals = {r.pick_axis_values(axes, random.Random(s))[0] for s in range(300)}
+    assert vals <= set(range(300, 801, 50))
+    assert len(vals) >= 8
+
+
+def test_height_does_not_depend_on_text(tmp_path):
+    for style in ("printed", "hand"):
+        font = next(f for f in r.load_fonts(make_font_dir(tmp_path / style)) if f.style == style)
+        hs = {t: r._draw(t, font, 40, 230, 20, random.Random(4), hand=style == "hand").height
+              for t in ("acemnorsuvwxz", "bdfhklt", ".", "Hello")}
+        assert len(set(hs.values())) == 1, hs
+
+
+def test_rotation_does_not_blow_up_long_lines(tmp_path):
+    font = r.load_fonts(make_font_dir(tmp_path))[0]
+    text = "The quick brown fox jumps over the lazy dog. 0123456789 abc"[:60]
+    for seed in range(20):
+        pre = r._draw(text, font, 40, 230, 20, random.Random(seed), hand=False)
+        post = r._augment(pre, 230, random.Random(seed))
+        assert post.height <= 1.6 * pre.height, (seed, pre.size, post.size)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", " lead", "trail ", "\tx", "x\n"])
+def test_render_line_rejects_bad_text(tmp_path, bad):
+    font = r.load_fonts(make_font_dir(tmp_path))[0]
+    with pytest.raises(ValueError):
+        r.render_line(bad, font, random.Random(0))
+
+
+def test_long_hand_line_keeps_its_last_glyph(tmp_path):
+    font = next(f for f in r.load_fonts(make_font_dir(tmp_path)) if f.style == "hand")
+    text = ("Mw" * 30)[:60]
+    for seed in range(20):
+        arr = np.asarray(r._draw(text, font, 48, 230, 20, random.Random(seed), hand=True))
+        thr = (230 + 20) / 2
+        assert not (arr[:, -2:] < thr).any(), seed
+        assert not (arr[:, :2] < thr).any(), seed
+
+
+def test_printed_uses_one_draw_call_when_spacing_is_small(tmp_path, monkeypatch):
+    from PIL import ImageDraw
+    calls = []
+    real = ImageDraw.ImageDraw.text
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text",
+                        lambda self, xy, text, *a, **k: (calls.append(text), real(self, xy, text, *a, **k))[1])
+    font = next(f for f in r.load_fonts(make_font_dir(tmp_path)) if f.style == "printed")
+    modes = set()
+    for seed in range(40):
+        calls.clear()
+        r._draw("AVAVAV", font, 40, 230, 20, random.Random(seed), hand=False)
+        modes.add(len(calls) == 1)
+    assert modes == {True, False}      # whole-string kerning path and per-char spacing path
+
+
+def test_pick_font_picks_family_first(tmp_path):
+    d = tmp_path
+    fonts = r.load_fonts(make_font_dir(d, families=(("printed", "big"), ("printed", "small"),
+                                                    ("hand", "h1"), ("hand", "h2"))))
+    big = [r.Font("big", "printed", fonts[0].path.with_name(f"big{i}.ttf")) for i in range(4)]
+    pool = big + [f for f in fonts if f.family == "small"] + [f for f in fonts if f.style == "hand"]
+    rng = random.Random(0)
+    picks = [r.pick_font(pool, "printed", rng) for _ in range(2000)]
+    assert all(f.style == "printed" for f in picks)
+    n_big = sum(f.family == "big" for f in picks)
+    assert 850 < n_big < 1150
+    assert {f.path.name for f in picks if f.family == "big"} == {f"big{i}.ttf" for i in range(4)}
+
+
+def _edit_manifest(root, fn):
+    m = json.loads((root / "fonts.json").read_text())
+    fn(m)
+    (root / "fonts.json").write_text(json.dumps(m))
+
+
+def test_load_fonts_rejects_sha_mismatch(tmp_path):
+    make_font_dir(tmp_path)
+    (tmp_path / "ofl" / "alpha" / "alpha.ttf").write_bytes(b"tampered")
+    with pytest.raises(r.FontManifestError, match="sha256"):
+        r.load_fonts(tmp_path)
+
+
+@pytest.mark.parametrize("bad", ["../outside.ttf", "ofl/../../outside.ttf", "/abs/x.ttf",
+                                 "C:/abs/x.ttf"])
+def test_load_fonts_rejects_paths_outside_dir(tmp_path, bad):
+    root = tmp_path / "fonts"
+    root.mkdir()
+    make_font_dir(root)
+    _edit_manifest(root, lambda m: m["fonts"][0].__setitem__("path", bad))
+    with pytest.raises(r.FontManifestError):
+        r.load_fonts(root)
