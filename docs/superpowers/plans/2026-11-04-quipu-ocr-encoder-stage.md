@@ -2053,12 +2053,18 @@ python scripts/ocr/train_ctc.py --config configs/ocr-ctc.toml \
   --set train.ckpt_dir=/kaggle/working/ocr-ctc
 ```
 
-Expected: one JSON line per 2,000 steps with falling `cer_printed`. Kaggle sessions cap at 12 hours; if it stops, rerun the same command in a new session with the previous `/kaggle/working/ocr-ctc` restored (it resumes from `latest.pt`).
+Expected: one JSON line per 2,000 steps with falling `cer_val`. Check `lines_per_s` in the first line: real variable fonts render slower than the test font.
+
+Kaggle notes (from the final review):
+- `/kaggle/working` is wiped between sessions. Run as "Save & Run All" so the output persists, add that output as an input to the next session, then pass `--resume /kaggle/input/<previous output>/ocr-ctc/latest.pt`.
+- `kaggle datasets create` skips subfolders by default, and fonts (`ofl/<family>/`) and eval sets (`printed/`, `hand/`, `nonsense/`, `val/`) are in subfolders. Use `--dir-mode tar` (or a zip) and check the mounted layout. `load_fonts` fails loudly if files are missing.
+- TrOCR needs internet enabled in the notebook; Tesseract is skipped with a message if not installed.
 
 - [ ] **Step 3: Score and write the results** (on Kaggle or locally with `best.pt` downloaded)
 
 ```bash
 python scripts/ocr/eval_ocr.py run --ckpt runs/ocr-ctc/best.pt --baselines tesseract,trocr
+# on Kaggle: add --sets /kaggle/input/quipu-ocr/eval --out /kaggle/working/ocr-encoder-stage.md
 ```
 
 TrOCR-small downloads about 250 MB per model the first time: tell the user before running locally. Expected: a table with `quipu-ocr-ctc`, `tesseract` (if installed) and `trocr-small` rows for printed, hand and nonsense, written to `results/ocr-encoder-stage.md`.

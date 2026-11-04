@@ -158,7 +158,10 @@ records every source, its licence and a sha256.
   easily.
 - Stop rule: CER on the held-out synthetic printed set stops improving for two
   evaluations in a row.
-- Checkpoint: `ocr-encoder/step_*.pt`, encoder weights only kept for the next stage.
+- Checkpoint: `runs/ocr-ctc/best.pt` and `latest.pt` hold the whole CTC model (encoder and
+  head, plus the charset hash and CTC steps per column); the joint stage takes the
+  `encoder.*` weights from `best.pt`. Model selection and early stopping use a separate
+  `val/` set, never the reported test sets.
 
 ### 5.2 Joint stage
 
