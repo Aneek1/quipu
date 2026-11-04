@@ -12,7 +12,8 @@ A family that does not exist (HTTP 404) is skipped with a warning. Any other HTT
 font set. A failed re-fetch deletes the old fonts.json on purpose: the directory is then in an
 unknown state and must be fetched again before use. A family is downloaded into <dir>.tmp and moved into place only when complete,
 and fonts.json is removed at the start and written last, so it never describes a
-half-fetched directory."""
+half-fetched directory. Each font's entry records, under "missing", the OCR characters it
+has no glyph for (rendering skips a font for a line it cannot draw)."""
 from __future__ import annotations
 
 import argparse
@@ -29,6 +30,11 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from quipu.ocr_ctc import CHARSET  # noqa: E402
+from quipu.ocr_render import missing_chars  # noqa: E402
+
 API = "https://api.github.com/repos/google/fonts"
 RAW = "https://raw.githubusercontent.com/google/fonts"
 LICENCE_NAMES = ("OFL.txt", "LICENSE.txt", "LICENCE.txt")
@@ -115,7 +121,18 @@ def fetch_family(family_dir: str, style: str, ref: str, out: Path) -> list[dict]
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return [{"family": parts[1], "style": style, "path": f"{family_dir}/{n}",
-             "licence": f"{family_dir}/{licence}", "sha256": digests[n]} for n in fonts]
+             "licence": f"{family_dir}/{licence}", "sha256": digests[n],
+             "missing": _missing(dest / n)} for n in fonts]
+
+
+def _missing(path: Path) -> str | None:
+    """OCR characters the font has no glyph for, for the record; render time checks
+    coverage again and is the authority. None if the file cannot be parsed."""
+    try:
+        return missing_chars(path, CHARSET)
+    except Exception as e:                            # noqa: BLE001 - recorded, not fatal
+        print(f"warning: {path.name}: cannot read its character map ({e})", file=sys.stderr)
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

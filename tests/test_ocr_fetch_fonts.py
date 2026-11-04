@@ -170,3 +170,13 @@ def test_truncated_download_is_retried(run):
     assert (out / "ofl" / "a" / "A-Regular.ttf").read_bytes() == TTF
     rc, out, net = run(TREE, truncate=3)                     # all three tries truncated
     assert rc == 1
+
+
+def test_manifest_records_missing_ocr_characters(run):
+    from tests.ocr_fixtures import DEJAVU
+    real = {"OFL.txt": b"licence", "A-Regular.ttf": DEJAVU.read_bytes()}
+    rc, out, _ = run({"ofl/a": real, "ofl/b": family()})
+    assert rc == 0
+    m = {e["family"]: e for e in json.loads((out / "fonts.json").read_text())["fonts"]}
+    assert m["a"]["missing"] == ""                    # DejaVu has every OCR character
+    assert m["b"]["missing"] is None                  # fake bytes: no character map

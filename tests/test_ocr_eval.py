@@ -183,3 +183,14 @@ def test_run_refuses_a_changed_set(tmp_path):
     png.write_bytes(png.read_bytes() + b"x")
     with pytest.raises(ValueError, match="changed"):
         _run(tmp_path, out, "")
+
+
+def test_make_sets_redraws_when_no_font_covers_the_text(tmp_path, monkeypatch):
+    from quipu.ocr_data import NoCoveringFont
+
+    def no_font(*a, **k):
+        raise NoCoveringFont("x")
+
+    monkeypatch.setattr(ev, "render_fitting", no_font)
+    with pytest.raises(RuntimeError, match="1000"):
+        _make(tmp_path)

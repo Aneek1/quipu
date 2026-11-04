@@ -245,3 +245,20 @@ def test_line_box_comes_from_glyph_bounds_not_declared_metrics(tmp_path, monkeyp
 
 def test_font_cache_holds_a_realistic_pool():
     assert r._font.cache_info().maxsize >= 4096
+
+
+def test_dejavu_fixture_covers_the_whole_charset(tmp_path):
+    from quipu.ocr_ctc import CHARSET
+    fonts = r.load_fonts(make_font_dir(tmp_path))
+    assert all(r.font_covers(f, CHARSET) for f in fonts)
+    assert r.missing_chars(DEJAVU, CHARSET) == ""
+
+
+def test_font_covers_sees_a_missing_glyph_and_ignores_space(tmp_path):
+    from tests.ocr_fixtures import drop_glyphs
+    d = make_font_dir(tmp_path)
+    drop_glyphs(d, "alpha", "€ ")
+    alpha = next(f for f in r.load_fonts(d) if f.family == "alpha")
+    assert r.missing_chars(alpha.path, "a€b") == "€"
+    assert not r.font_covers(alpha, "5 €")
+    assert r.font_covers(alpha, "5 euro")                  # space is always fine

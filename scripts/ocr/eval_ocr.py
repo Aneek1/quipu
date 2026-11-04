@@ -7,7 +7,7 @@
 make: fixed sets from held-out text and held-out fonts (quipu.ocr_render.split_fonts):
 printed/, hand/ and nonsense/ (random letters and made-up words, a held-out font of
 either style). Lines are at most MAX_CHARS characters, and a line is kept only if its
-render is scorable by the CTC model (no wider than 1024 px at 64 px high, wide enough
+render is scorable by the CTC model (a held-out font of its style has every glyph, no wider than 1024 px at 64 px high, wide enough
 for its CTC path); otherwise a new text and font are drawn. Each set is PNGs plus
 labels.tsv (png, text, style). SHA256SUMS covers each labels.tsv and the PNGs it names,
 and `run` refuses a set whose files changed. make refuses a non-empty output directory
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from quipu.ocr_ctc import in_charset  # noqa: E402
-from quipu.ocr_data import LineTooWide, render_fitting  # noqa: E402
+from quipu.ocr_data import LineTooWide, NoCoveringFont, render_fitting  # noqa: E402
 from quipu.ocr_render import load_fonts, split_fonts  # noqa: E402
 
 SETS = ("printed", "hand", "nonsense")
@@ -79,7 +79,7 @@ def make_sets(held_text: Path, font_dir: Path, out: Path, n: int, seed: int,
                     text, style = rng.choice(lines), name
                 try:
                     fit = render_fitting(text, style, held_fonts, rng, tries=1)
-                except LineTooWide:
+                except (LineTooWide, NoCoveringFont):
                     fit = None
                 if fit is not None:
                     break

@@ -83,6 +83,29 @@ def pick_font(fonts: list[Font], style: str, rng: random.Random) -> Font:
     return rng.choice([f for f in pool if f.family == family])
 
 
+@functools.lru_cache(maxsize=None)
+def _cmap(path: Path) -> frozenset[int]:
+    """Codepoints the font maps to a glyph, read once per file on first use (not in
+    load_fonts, which stays fast)."""
+    from fontTools.ttLib import TTFont
+    with TTFont(str(path), lazy=True) as f:
+        return frozenset(f.getBestCmap() or {})
+
+
+def missing_chars(path: str | Path, chars: str) -> str:
+    """The characters of `chars` (space excepted) the font file has no glyph for."""
+    cmap = _cmap(Path(path))
+    return "".join(c for c in dict.fromkeys(chars) if c != " " and ord(c) not in cmap)
+
+
+def font_covers(font: Font, text: str) -> bool:
+    """True if the font has a glyph for every character of text (space always counts:
+    it draws nothing). Rendering a missing glyph draws a box or nothing, so the image
+    would not show its label."""
+    cmap = _cmap(font.path)
+    return all(c == " " or ord(c) in cmap for c in set(text))
+
+
 def split_fonts(fonts: list[Font], held_every: int = 5) -> tuple[list[Font], list[Font]]:
     """Held-out fonts by family: sha256(family) % held_every == 0. Each style keeps at
     least one family on each side (the first family by name moves if needed)."""

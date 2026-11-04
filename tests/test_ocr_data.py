@@ -125,3 +125,30 @@ def test_ctc_miss_gives_up_on_a_text_after_five_renders(tmp_path, monkeypatch):
         next(iter(stream))
     assert "1000 CTC misses" in str(e.value) and "0 too wide" in str(e.value)
     assert len(calls) == 5 * 1000
+
+
+def test_a_font_without_a_glyph_is_never_chosen_for_that_text(tmp_path, monkeypatch):
+    from tests.ocr_fixtures import drop_glyphs
+    d = make_font_dir(tmp_path)
+    drop_glyphs(d, "alpha", "€")
+    fonts = r.load_fonts(d)
+    used = []
+    orig = ocr_data.render_line
+    monkeypatch.setattr(ocr_data, "render_line",
+                        lambda text, font, rng: (used.append((text, font.family)),
+                                                 orig(text, font, rng))[1])
+    stream = LineStream(["price 5 €", "price 5 euro"], fonts, hand_frac=0.0, max_chars=36,
+                        seed=0)
+    list(itertools.islice(iter(stream), 30))
+    assert {fam for text, fam in used if "€" in text} == {"beta"}
+    assert {fam for text, fam in used if "€" not in text} == {"alpha", "beta"}
+
+
+def test_stream_gives_up_when_no_font_covers_the_text(tmp_path):
+    from tests.ocr_fixtures import drop_glyphs
+    d = make_font_dir(tmp_path)
+    for fam in ("alpha", "beta"):
+        drop_glyphs(d, fam, "€")
+    stream = LineStream(["price 5 €"], r.load_fonts(d), hand_frac=0.0, max_chars=36, seed=0)
+    with pytest.raises(RuntimeError, match="1000 with no font covering"):
+        next(iter(stream))
