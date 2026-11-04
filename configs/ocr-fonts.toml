@@ -1,0 +1,24 @@
+# Font families for OCR rendering (spec section 4.2, 4.3), from github.com/google/fonts.
+# Each entry is the family's directory in that repo; its licence file (OFL.txt or
+# LICENSE.txt) is downloaded with it, and the renderer refuses a font without one.
+# Families missing at the pinned commit are skipped with a warning; fetch_fonts.py
+# fails if fewer than min_per_style of a style are fetched.
+
+min_per_style = 8
+
+printed = [
+  "ofl/lora", "ofl/merriweather", "ofl/opensans", "ofl/lato", "ofl/inter",
+  "ofl/sourcecodepro", "ofl/ibmplexmono", "ofl/ibmplexsans", "ofl/ibmplexserif",
+  "ofl/ptserif", "ofl/ptsans", "ofl/librebaskerville", "ofl/firasans", "ofl/firamono",
+  "ofl/nunito", "ofl/oswald", "ofl/ebgaramond", "ofl/crimsontext", "ofl/spacemono",
+  "ofl/courierprime", "ofl/notosans", "ofl/notoserif", "ofl/worksans", "ofl/rubik",
+  "ofl/karla", "ofl/abrilfatface", "ofl/bebasneue", "apache/robotoslab",
+]
+
+hand = [
+  "ofl/caveat", "ofl/indieflower", "ofl/patrickhand", "ofl/shadowsintolight",
+  "ofl/kalam", "ofl/gloriahallelujah", "ofl/architectsdaughter", "ofl/handlee",
+  "ofl/nanumpenscript", "ofl/reeniebeanie", "apache/homemadeapple", "ofl/dancingscript",
+  "apache/rocksalt", "apache/justanotherhand", "ofl/coveredbyyourgrace",
+  "ofl/sueellenfrancisco", "ofl/zeyada", "ofl/marckscript", "ofl/kristi",
+]
