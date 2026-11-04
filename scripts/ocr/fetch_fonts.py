@@ -9,13 +9,15 @@ GitHub contents API; set GITHUB_TOKEN to lift the 60 requests/hour anonymous lim
 
 A family that does not exist (HTTP 404) is skipped with a warning. Any other HTTP error
 (rate limit, server error) aborts the run, so a throttled run cannot pass as a small
-font set. A family is downloaded into <dir>.tmp and moved into place only when complete,
+font set. A failed re-fetch deletes the old fonts.json on purpose: the directory is then in an
+unknown state and must be fetched again before use. A family is downloaded into <dir>.tmp and moved into place only when complete,
 and fonts.json is removed at the start and written last, so it never describes a
 half-fetched directory."""
 from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -52,7 +54,8 @@ def _get_raw(url: str) -> bytes:
     for attempt in range(RAW_TRIES):
         try:
             return _get(url)
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError,
+                ConnectionError) as e:
             if attempt == RAW_TRIES - 1:
                 raise FetchError(f"download failed after {RAW_TRIES} tries: {url}: {e}") from e
             time.sleep(2 ** attempt)
@@ -140,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"only {got} {style} families, need {cfg['min_per_style']}",
                       file=sys.stderr)
                 return 1
-    except (FetchError, urllib.error.URLError) as e:
+    except (FetchError, urllib.error.URLError, http.client.HTTPException) as e:
         print(f"fetch aborted: {e}", file=sys.stderr)
         return 1
     for e in entries:                                 # verify what is on disk

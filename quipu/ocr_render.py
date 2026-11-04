@@ -104,7 +104,8 @@ def split_fonts(fonts: list[Font], held_every: int = 5) -> tuple[list[Font], lis
 
 _AXES_CACHE: dict[str, list | None] = {}
 WEIGHT_MIN, WEIGHT_MAX, WEIGHT_STEP = 300, 800, 50
-VPAD = 24                    # vertical canvas padding: more than max margin + jitter
+VPAD = 24                    # vertical canvas padding: more than the largest margin (12)
+BOX_REF = "Hbdfhklgjpqy|[]{}()"   # tall, deep and bracket glyphs that set the line box
 
 
 def _axes(path: Path) -> list | None:
@@ -137,7 +138,7 @@ def pick_axis_values(axes: list, rng: random.Random) -> list[float]:
     return vals
 
 
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=4096)
 def _font(path: Path, size: int, axis_values: tuple | None = None) -> ImageFont.FreeTypeFont:
     f = ImageFont.truetype(str(path), size)
     if axis_values is not None:
@@ -148,14 +149,23 @@ def _font(path: Path, size: int, axis_values: tuple | None = None) -> ImageFont.
 def _draw(text: str, font: Font, size: int, bg: int, ink: int, rng: random.Random,
           hand: bool, axis_values: tuple | None = None) -> Image.Image:
     """Draw on a generous canvas, then crop: horizontally to the ink plus a margin,
-    vertically to a fixed box from the font's ascent/descent, so the glyph scale in the
-    final image does not depend on which letters the line contains."""
+    vertically to a fixed box built from the font (declared ascent/descent or the bounds
+    of BOX_REF glyphs, whichever is larger, plus jitter room for the hand style), so the
+    glyph scale in the final image does not depend on which letters the line contains
+    and fonts with understated metrics are not clipped."""
     spacing = rng.uniform(-0.5, 2.5)
     mx, my = rng.randint(6, 16), rng.randint(4, 12)       # drawn first: text-independent
     base_font = _font(font.path, size, axis_values)
-    asc, desc = base_font.getmetrics()
+    big = 2 * round(size * 1.1 / 2) if hand else size      # largest per-letter size
+    ref_font = _font(font.path, big, axis_values)
+    asc, desc = ref_font.getmetrics()
+    _, ref_top, _, ref_bottom = ref_font.getbbox(BOX_REF, anchor="ls")
+    top, bottom = max(asc, -ref_top), max(desc, ref_bottom)
+    if hand:                                              # 3 sigma of the baseline jitter + stroke
+        top += math.ceil(0.12 * size) + 1
+        bottom += math.ceil(0.12 * size) + 1
     pad = size
-    baseline = VPAD + asc
+    baseline = VPAD + top
     whole = not hand and spacing <= 0.5                   # keep the font's kerning
     if whole:
         width = int(base_font.getlength(text)) + 2 * pad + 2
@@ -170,7 +180,7 @@ def _draw(text: str, font: Font, size: int, bg: int, ink: int, rng: random.Rando
             x += _font(font.path, s, axis_values).getlength(ch) + spacing + (
                 rng.gauss(0, size * 0.05) if hand else 0.0)
         width = int(max(x, xs[-1] + size)) + 2 * pad + 2
-    img = Image.new("L", (width, 2 * VPAD + asc + desc), bg)
+    img = Image.new("L", (width, 2 * VPAD + top + bottom), bg)
     d = ImageDraw.Draw(img)
     stroke = rng.choice([0, 0, 1]) if hand else 0
     if whole:
@@ -181,7 +191,7 @@ def _draw(text: str, font: Font, size: int, bg: int, ink: int, rng: random.Rando
                    anchor="ls", stroke_width=stroke, stroke_fill=ink)
     if hand:
         img = _shear(img, rng.uniform(-0.3, 0.3), bg)
-    return _crop_to_ink(img, bg, ink, mx, (VPAD - my, VPAD + asc + desc + my))
+    return _crop_to_ink(img, bg, ink, mx, (VPAD - my, VPAD + top + bottom + my))
 
 
 def _shear(img: Image.Image, s: float, bg: int) -> Image.Image:

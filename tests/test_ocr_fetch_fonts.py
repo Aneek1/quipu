@@ -1,5 +1,6 @@
 """scripts/ocr/fetch_fonts.py with the network replaced by a fake _get."""
 import hashlib
+import http.client
 import importlib.util
 import json
 import urllib.error
@@ -22,8 +23,9 @@ def http_error(code):
 
 class FakeNet:
     """A tiny google/fonts: dir -> {name: bytes} (or a str for a plain file)."""
-    def __init__(self, tree, api_error=None, fail_raw=()):
+    def __init__(self, tree, api_error=None, fail_raw=(), truncate=0):
         self.tree, self.api_error, self.fail_raw = tree, api_error or {}, set(fail_raw)
+        self.truncate = truncate            # first N raw downloads raise IncompleteRead
         self.calls = []
 
     def __call__(self, url):
@@ -41,6 +43,9 @@ class FakeNet:
                 return json.dumps({"type": "file", "name": d}).encode()
             return json.dumps([{"name": n, "type": "file"} for n in v]).encode()
         d, name = url.split(f"/{REF}/")[1].rsplit("/", 1)
+        if self.truncate > 0:
+            self.truncate -= 1
+            raise http.client.IncompleteRead(b"par", 10)
         if name in self.fail_raw:
             raise http_error(500)
         return self.tree[d][name]
@@ -157,3 +162,11 @@ def test_token_is_sent_when_set(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN")
     ff._get("http://x")
     assert "Authorization" not in seen
+
+
+def test_truncated_download_is_retried(run):
+    rc, out, net = run(TREE, truncate=2)
+    assert rc == 0
+    assert (out / "ofl" / "a" / "A-Regular.ttf").read_bytes() == TTF
+    rc, out, net = run(TREE, truncate=3)                     # all three tries truncated
+    assert rc == 1

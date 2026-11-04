@@ -124,7 +124,7 @@ def test_font_cache_is_bounded_and_weights_are_few(tmp_path, monkeypatch):
     rng = random.Random(0)
     for i in range(500):
         r.render_line("Hello world", fonts[i % len(fonts)], rng)
-    assert r._font.cache_info().currsize <= 512
+    assert r._font.cache_info().currsize <= r._font.cache_info().maxsize == 4096
     assert len(set(seen)) <= 11
     assert min(seen) >= 300 and max(seen) <= 800
     assert all(w % 50 == 0 for w in seen)
@@ -222,3 +222,26 @@ def test_load_fonts_rejects_paths_outside_dir(tmp_path, bad):
     _edit_manifest(root, lambda m: m["fonts"][0].__setitem__("path", bad))
     with pytest.raises(r.FontManifestError):
         r.load_fonts(root)
+
+
+def test_line_box_comes_from_glyph_bounds_not_declared_metrics(tmp_path, monkeypatch):
+    """Fonts with understated ascent/descent must not clip tall glyphs or descenders."""
+    real = ImageFont.FreeTypeFont.getmetrics
+    monkeypatch.setattr(ImageFont.FreeTypeFont, "getmetrics",
+                        lambda self, *a, **k: tuple(int(0.6 * v) for v in real(self, *a, **k)))
+    r._font.cache_clear()
+    text = "Hgjp|[]{}() Tally"
+    bg, ink = 230, 20
+    for style in ("printed", "hand"):
+        font = next(f for f in r.load_fonts(make_font_dir(tmp_path / style)) if f.style == style)
+        for seed in range(50):
+            arr = np.asarray(r._draw(text, font, 48, bg, ink, random.Random(seed),
+                                     hand=style == "hand"))
+            thr = (bg + ink) / 2
+            assert not (arr[0] < thr).any(), (style, seed, "ink in top row")
+            assert not (arr[-1] < thr).any(), (style, seed, "ink in bottom row")
+    r._font.cache_clear()
+
+
+def test_font_cache_holds_a_realistic_pool():
+    assert r._font.cache_info().maxsize >= 4096
