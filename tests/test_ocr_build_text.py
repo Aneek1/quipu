@@ -134,3 +134,10 @@ def test_main_writes_a_manifest(tmp_path, monkeypatch):
         assert m[f"{name}_sha256"] == hashlib.sha256(f.read_bytes()).hexdigest()
         assert m[f"{name}_lines"] == len(f.read_text(encoding="utf-8").splitlines())
     assert m["shards"] and m["tokenizer"]
+
+
+def test_cut_lines_maps_curly_quotes_dashes_and_ellipses():
+    lines = bt.cut_lines("He said “stop” — then… left ‘it’",
+                         random.Random(0), 5, 60)
+    joined = " ".join(lines)                       # cut points are random; words are not
+    assert joined.split() == ["He", "said", '"stop"', "-", "then...", "left", "‘it’"]

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
-from quipu.ocr_ctc import STEPS_PER_COL, ctc_steps_needed, in_charset
+from quipu.ocr_ctc import STEPS_PER_COL, ctc_steps_needed, usable_line
 from quipu.ocr_render import Font, font_covers, pick_font, render_line
 
 HEIGHT, MAX_WIDTH, PATCH = 64, 1024, 16
@@ -83,8 +83,7 @@ class LineStream(IterableDataset):
 
     def __init__(self, lines: list[str], fonts: list[Font], hand_frac: float,
                  max_chars: int, seed: int) -> None:
-        self.lines = [s for s in lines
-                      if 0 < len(s) <= max_chars and s == s.strip() and in_charset(s)]
+        self.lines = [s for s in lines if usable_line(s, max_chars)]
         if not self.lines:
             raise ValueError("no usable lines after filtering")
         self.fonts = fonts

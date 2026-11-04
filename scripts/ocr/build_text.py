@@ -36,9 +36,14 @@ MIN_CHARS, MAX_CHARS = 5, 60
 LEAK_MIN_CHARS = 12      # shorter train lines that also occur in held are not leakage
 
 
+# Typographic marks outside the OCR set, mapped before the charset check so words
+# that use them are kept (the single curly quotes are in the set already).
+TYPOGRAPHY = str.maketrans({"“": '"', "”": '"', "—": "-", "…": "..."})
+
+
 def cut_lines(doc: str, rng: random.Random, min_chars: int = MIN_CHARS,
               max_chars: int = MAX_CHARS) -> list[str]:
-    words = [w for w in doc.split() if in_charset(w)]
+    words = [w for w in doc.translate(TYPOGRAPHY).split() if in_charset(w)]
     lines, cur = [], []
     target = rng.randint(min_chars, max_chars)
     for w in words:

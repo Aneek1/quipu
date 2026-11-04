@@ -220,3 +220,21 @@ def test_val_set_picks_the_best_checkpoint(tmp_path, capsys):
     best = _ck(run / "best.pt")
     assert best["cer_val"] == min(e["cer_val"] for e in log)
     assert _ck(run / "latest.pt")["best_cer"] == best["cer_val"]
+
+
+def test_relative_config_paths_resolve_against_the_repo_root(tmp_path):
+    cfg = {"data": {"text": "data/ocr/text/train.txt", "fonts": str(tmp_path),
+                    "eval_dir": "data/ocr/eval", "hand_frac": 0.3},
+           "train": {"ckpt_dir": "runs/ocr-ctc", "lr": 1e-3}}
+    tc.resolve_paths(cfg)
+    assert cfg["data"]["text"] == str(ROOT / "data" / "ocr" / "text" / "train.txt")
+    assert cfg["data"]["eval_dir"] == str(ROOT / "data" / "ocr" / "eval")
+    assert cfg["train"]["ckpt_dir"] == str(ROOT / "runs" / "ocr-ctc")
+    assert cfg["data"]["fonts"] == str(tmp_path)                 # absolute: unchanged
+    assert cfg["data"]["hand_frac"] == 0.3
+
+
+def test_warns_when_max_chars_differs_from_the_eval_sets(tmp_path, monkeypatch, capsys):
+    _fake_eval(monkeypatch, [0.5, 0.6])
+    tc.main(_setup(tmp_path, eval_sets=False) + ["--set", "data.max_chars=30"])
+    assert "max_chars=30" in capsys.readouterr().out

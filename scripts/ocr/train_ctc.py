@@ -40,7 +40,7 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from eval_ocr import SETS, VAL, read_set  # noqa: E402
+from eval_ocr import MAX_CHARS, SETS, VAL, read_set  # noqa: E402
 from quipu.ocr_ctc import (LineCTC, check_ckpt_compat, ckpt_compat,  # noqa: E402
                            ctc_greedy_decode, ctc_loss)
 from quipu.ocr_data import LineStream, collate, preprocess  # noqa: E402
@@ -77,6 +77,17 @@ def load_config(path: str, sets: list[str]) -> dict:
             if isinstance(v, str) and "PLACEHOLDER" in v:
                 raise SystemExit(f"config value {k}={v!r}: PLACEHOLDER not replaced")
     return cfg
+
+
+PATH_KEYS = (("data", "text"), ("data", "fonts"), ("data", "eval_dir"),
+             ("train", "ckpt_dir"))
+
+
+def resolve_paths(cfg: dict) -> None:
+    """Relative config paths are relative to the repo root, not the working directory."""
+    for section, key in PATH_KEYS:
+        p = Path(cfg[section][key])
+        cfg[section][key] = str(p if p.is_absolute() else ROOT / p)
 
 
 def lr_at(step: int, cfg: dict) -> float:
@@ -193,7 +204,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="start over in a ckpt_dir that has an old log.jsonl")
     args = ap.parse_args(argv)
     cfg = load_config(args.config, args.set)
+    resolve_paths(cfg)
     t, d = cfg["train"], cfg["data"]
+    print(f"data: text {d['text']}, fonts {d['fonts']}, eval sets {d['eval_dir']}")
+    if d["max_chars"] != MAX_CHARS:
+        print(f"warning: data.max_chars={d['max_chars']} but the eval sets use "
+              f"eval_ocr.MAX_CHARS={MAX_CHARS}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     check_precision(t["precision"], device)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[t["precision"]]

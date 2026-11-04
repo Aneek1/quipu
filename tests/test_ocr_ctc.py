@@ -108,3 +108,10 @@ def test_checkpoint_compat_fields_round_trip_and_mismatch_is_refused():
         oc.check_ckpt_compat({**ck, "steps_per_col": 1}, "x.pt")
     with pytest.raises(ValueError, match="charset"):
         oc.check_ckpt_compat({"model": {}}, "old.pt")      # written before the fields existed
+
+
+def test_usable_line():
+    assert oc.usable_line("hello world", 36)
+    for bad in ("", " padded", "padded ", "x" * 37, "naïve"):
+        assert not oc.usable_line(bad, 36)
+    assert oc.usable_line("x" * 36, 36)

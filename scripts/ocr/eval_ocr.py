@@ -37,7 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from quipu.ocr_ctc import in_charset  # noqa: E402
+from quipu.ocr_ctc import usable_line  # noqa: E402
 from quipu.ocr_data import LineTooWide, NoCoveringFont, render_fitting  # noqa: E402
 from quipu.ocr_render import load_fonts, split_fonts  # noqa: E402
 
@@ -101,7 +101,7 @@ def make_sets(held_text: Path, font_dir: Path, out: Path, n: int, seed: int,
     rng = random.Random(seed)
     _, held_fonts = split_fonts(load_fonts(font_dir))
     lines = [s for s in held_text.read_text(encoding="utf-8").splitlines()
-             if 0 < len(s) <= MAX_CHARS and s == s.strip() and in_charset(s)]
+             if usable_line(s, MAX_CHARS)]
     if not lines:
         raise ValueError(f"{held_text}: no usable lines")
     written = []

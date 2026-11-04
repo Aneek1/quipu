@@ -26,6 +26,12 @@ def in_charset(text: str) -> bool:
     return all(ch in _INDEX for ch in text)
 
 
+def usable_line(s: str, max_chars: int) -> bool:
+    """The one line filter (training stream and eval sets): non-empty, at most max_chars,
+    no leading or trailing whitespace, every character in the set."""
+    return 0 < len(s) <= max_chars and s == s.strip() and in_charset(s)
+
+
 def encode_text(text: str) -> list[int]:
     try:
         return [_INDEX[ch] for ch in text]
