@@ -1,6 +1,6 @@
 """Quipu-OCR evaluation (spec section 6).
 
-    .venv/Scripts/python scripts/ocr/eval_ocr.py make [--n 1000]
+    .venv/Scripts/python scripts/ocr/eval_ocr.py make [--n 1000] [--force]
     .venv/Scripts/python scripts/ocr/eval_ocr.py run --ckpt runs/ocr-ctc/best.pt \
         [--baselines tesseract,trocr]
 
@@ -9,13 +9,22 @@ printed/, hand/ and nonsense/ (random letters and made-up words, a held-out font
 either style). Lines are at most MAX_CHARS characters, and a line is kept only if its
 render is scorable by the CTC model (no wider than 1024 px at 64 px high, wide enough
 for its CTC path); otherwise a new text and font are drawn. Each set is PNGs plus
-labels.tsv; SHA256SUMS covers every file and `run` refuses a set whose files changed."""
+labels.tsv (png, text, style). SHA256SUMS covers each labels.tsv and the PNGs it names,
+and `run` refuses a set whose files changed. make refuses a non-empty output directory
+unless --force, which first removes the three set directories and SHA256SUMS.
+
+run: scores the CTC checkpoint and the baselines on every set. TrOCR reads each line
+with trocr-small-handwritten if it was rendered in a hand font, trocr-small-printed
+otherwise. The table has CER both as is and ignoring case."""
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import random
+import shutil
 import string
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,6 +38,8 @@ from quipu.ocr_render import load_fonts, split_fonts  # noqa: E402
 SETS = ("printed", "hand", "nonsense")
 MAX_CHARS = 36          # the encoder stage's limit (~35 characters fit 64x1024)
 MAX_ATTEMPTS = 1000     # draws per eval line before make gives up
+TROCR = {"hand": "microsoft/trocr-small-handwritten",
+         "printed": "microsoft/trocr-small-printed"}
 
 
 def nonsense_line(rng: random.Random) -> str:
@@ -40,13 +51,21 @@ def nonsense_line(rng: random.Random) -> str:
     return " ".join(words)
 
 
-def make_sets(held_text: Path, font_dir: Path, out: Path, n: int, seed: int) -> None:
+def make_sets(held_text: Path, font_dir: Path, out: Path, n: int, seed: int,
+              force: bool = False) -> None:
+    if out.is_dir() and any(out.iterdir()):
+        if not force:
+            raise FileExistsError(f"{out} is not empty; pass --force to replace its eval sets")
+        for name in SETS:
+            shutil.rmtree(out / name, ignore_errors=True)
+        (out / "SHA256SUMS").unlink(missing_ok=True)
     rng = random.Random(seed)
     _, held_fonts = split_fonts(load_fonts(font_dir))
     lines = [s for s in held_text.read_text(encoding="utf-8").splitlines()
              if 0 < len(s) <= MAX_CHARS and s == s.strip() and in_charset(s)]
     if not lines:
         raise ValueError(f"{held_text}: no usable lines")
+    written = []
     for name in SETS:
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
@@ -69,10 +88,12 @@ def make_sets(held_text: Path, font_dir: Path, out: Path, n: int, seed: int) -> 
                                    "draws of text and font")
             png = f"{i:05d}.png"
             fit[0].save(d / png)
-            rows.append(f"{png}\t{text}")
+            rows.append(f"{png}\t{text}\t{style}")
+            written.append(d / png)
         (d / "labels.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        written.append(d / "labels.tsv")
     sums = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.relative_to(out).as_posix()}"
-            for p in sorted(out.rglob("*")) if p.is_file() and p.name != "SHA256SUMS"]
+            for p in sorted(written)]
     (out / "SHA256SUMS").write_text("\n".join(sums) + "\n", encoding="utf-8")
 
 
@@ -83,76 +104,111 @@ def verify_sums(out: Path) -> None:
             raise ValueError(f"{rel} changed since the eval set was made")
 
 
-def read_set(d: Path) -> list[tuple[Path, str]]:
+def read_set(d: Path) -> list[tuple[Path, str, str]]:
+    """(png path, text, style) per line; style is "printed" or "hand"."""
     rows = []
     for line in (d / "labels.tsv").read_text(encoding="utf-8").splitlines():
-        png, text = line.split("\t", 1)
-        rows.append((d / png, text))
+        png, text, style = line.split("\t")
+        rows.append((d / png, text, style))
     return rows
 
 
-def predict_ctc(ckpt: Path, paths: list[Path]) -> list[str]:
-    """Greedy CTC decoding with the checkpoint's model (its "vit" dict rebuilds the
-    config; STEPS_PER_COL is a code constant, not stored)."""
-    import torch
-    from PIL import Image
-    from quipu.ocr_ctc import LineCTC, ctc_greedy_decode
-    from quipu.ocr_data import collate, preprocess
-    from quipu.vision import ViTConfig
+class CTCReader:
+    """The CTC checkpoint, loaded once. Its "vit" dict rebuilds the config; the charset
+    and CTC steps per column must match this code."""
 
-    ck = torch.load(ckpt, weights_only=False, map_location="cpu")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = LineCTC(ViTConfig(**ck["vit"])).to(device).eval()
-    model.load_state_dict(ck["model"])
-    hyps = []
-    with torch.no_grad():
-        for i in range(0, len(paths), 64):
-            items = []
-            for p in paths[i:i + 64]:
-                with Image.open(p) as im:
-                    items.append((preprocess(im), ""))
-            images, mask, _ = collate(items)
-            lp, lens = model(images.to(device), mask.to(device))
-            hyps += ctc_greedy_decode(lp.cpu(), lens.cpu())
-    return hyps
+    def __init__(self, ckpt: Path) -> None:
+        import torch
+        from quipu.ocr_ctc import LineCTC, check_ckpt_compat
+        from quipu.vision import ViTConfig
+
+        ck = torch.load(ckpt, weights_only=False, map_location="cpu")
+        check_ckpt_compat(ck, ckpt)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = LineCTC(ViTConfig(**ck["vit"])).to(self.device).eval()
+        self.model.load_state_dict(ck["model"])
+
+    def __call__(self, paths: list[Path]) -> list[str]:
+        import torch
+        from PIL import Image
+        from quipu.ocr_ctc import ctc_greedy_decode
+        from quipu.ocr_data import collate, preprocess
+
+        hyps = []
+        with torch.no_grad():
+            for i in range(0, len(paths), 64):
+                items = []
+                for p in paths[i:i + 64]:
+                    with Image.open(p) as im:
+                        items.append((preprocess(im), ""))
+                images, mask, _ = collate(items)
+                lp, lens = self.model(images.to(self.device), mask.to(self.device))
+                hyps += ctc_greedy_decode(lp.cpu(), lens.cpu())
+        return hyps
 
 
 def predict_tesseract(paths: list[Path]) -> list[str] | None:
-    import shutil
-    import subprocess
     exe = shutil.which("tesseract")
     if exe is None:
         print("tesseract not on PATH: skipped", file=sys.stderr)
         return None
-    return [subprocess.run([exe, str(p), "stdout", "--psm", "7"], capture_output=True,
-                           text=True, encoding="utf-8").stdout.strip() for p in paths]
+    hyps = []
+    for p in paths:
+        r = subprocess.run([exe, str(p), "stdout", "-l", "eng", "--psm", "7"],
+                           capture_output=True, text=True, encoding="utf-8")
+        if r.returncode != 0:              # a broken install must not score as CER 1.0
+            raise RuntimeError(f"tesseract failed on {p} (exit {r.returncode}): "
+                               f"{r.stderr.strip()}")
+        hyps.append(r.stdout.strip())
+    return hyps
 
 
-def predict_trocr(paths: list[Path], style: str) -> list[str]:
+@functools.lru_cache(maxsize=None)
+def _trocr_model(name: str):
+    import torch
+    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return (TrOCRProcessor.from_pretrained(name),
+            VisionEncoderDecoderModel.from_pretrained(name).to(device).eval(), device)
+
+
+def _trocr_read(name: str, paths: list[Path]) -> list[str]:
     import torch
     from PIL import Image
-    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-    name = "microsoft/trocr-small-handwritten" if style == "hand" else "microsoft/trocr-small-printed"
-    proc = TrOCRProcessor.from_pretrained(name)
-    model = VisionEncoderDecoderModel.from_pretrained(name).eval()
+    proc, model, device = _trocr_model(name)
     hyps = []
     with torch.no_grad():
         for i in range(0, len(paths), 16):
-            imgs = [Image.open(p).convert("RGB") for p in paths[i:i + 16]]
-            ids = model.generate(proc(images=imgs, return_tensors="pt").pixel_values,
-                                 max_new_tokens=64)
+            imgs = []
+            for p in paths[i:i + 16]:
+                with Image.open(p) as im:
+                    imgs.append(im.convert("RGB"))
+            pixels = proc(images=imgs, return_tensors="pt").pixel_values.to(device)
+            ids = model.generate(pixels, max_new_tokens=64)
             hyps += [s.strip() for s in proc.batch_decode(ids, skip_special_tokens=True)]
+    return hyps
+
+
+def predict_trocr(paths: list[Path], styles: list[str]) -> list[str]:
+    """Each line through the TrOCR model for the style it was rendered in."""
+    hyps: list[str | None] = [None] * len(paths)
+    for style, name in TROCR.items():
+        idx = [i for i, s in enumerate(styles) if (s == "hand") == (style == "hand")]
+        if idx:
+            for i, h in zip(idx, _trocr_read(name, [paths[i] for i in idx])):
+                hyps[i] = h
     return hyps
 
 
 def run(ckpt: Path, sets: Path, out: Path, baselines: list[str]) -> str:
     from quipu.ocr_metrics import cer, exact_match, wer
     verify_sums(sets)
+    ctc = CTCReader(ckpt)
     rows = []
     for name in SETS:
         data = read_set(sets / name)
-        paths, refs = [p for p, _ in data], [t for _, t in data]
-        systems = {"quipu-ocr-ctc": predict_ctc(ckpt, paths)}
+        paths, refs, styles = [p for p, _, _ in data], [t for _, t, _ in data], [s for *_, s in data]
+        systems = {"quipu-ocr-ctc": ctc(paths)}
         if "tesseract" in baselines:
             hyp = predict_tesseract(paths)
             if hyp is None:
@@ -160,15 +216,22 @@ def run(ckpt: Path, sets: Path, out: Path, baselines: list[str]) -> str:
             else:
                 systems["tesseract"] = hyp
         if "trocr" in baselines:
-            systems["trocr-small"] = predict_trocr(paths, "hand" if name == "hand" else "printed")
+            systems["trocr-small"] = predict_trocr(paths, styles)
         for system, hyps in systems.items():
+            ci = cer([r.lower() for r in refs], [h.lower() for h in hyps])
             rows.append(f"| {system} | {name} | {len(refs)} | {cer(refs, hyps):.4f} | "
-                        f"{wer(refs, hyps):.4f} | {exact_match(refs, hyps):.3f} |")
-    table = ("| system | set | lines | CER | WER | exact |\n|---|---|---|---|---|---|\n"
-             + "\n".join(rows) + "\n")
+                        f"{ci:.4f} | {wer(refs, hyps):.4f} | {exact_match(refs, hyps):.3f} |")
+    table = ("| system | set | lines | CER | CER (any case) | WER | exact |\n"
+             "|---|---|---|---|---|---|---|\n" + "\n".join(rows) + "\n")
+    note = (f"Checkpoint: `{ckpt}`. Sets: `{sets}` (SHA256SUMS verified). "
+            "Greedy decoding, no language-model rescoring.")
+    if "trocr" in baselines:
+        note += ("\n\ntrocr-small reads hand lines with trocr-small-handwritten and the rest "
+                 "with trocr-small-printed. trocr-small-printed was fine-tuned on receipts "
+                 "(SROIE) and tends to output uppercase; the any-case CER column shows "
+                 "how much of its error is case alone.")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(f"Checkpoint: `{ckpt}`. Sets: `{sets}` (SHA256SUMS verified). "
-                   "Greedy decoding, no language-model rescoring.\n\n" + table, encoding="utf-8")
+    out.write_text(note + "\n\n" + table, encoding="utf-8")
     return table
 
 
@@ -181,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
     mk.add_argument("--out", default=str(ROOT / "data" / "ocr" / "eval"))
     mk.add_argument("--n", type=int, default=1000)
     mk.add_argument("--seed", type=int, default=12345)
+    mk.add_argument("--force", action="store_true",
+                    help="replace the eval sets in a non-empty --out")
     rn = sub.add_parser("run")
     rn.add_argument("--ckpt", required=True)
     rn.add_argument("--sets", default=str(ROOT / "data" / "ocr" / "eval"))
@@ -188,7 +253,11 @@ def main(argv: list[str] | None = None) -> int:
     rn.add_argument("--baselines", default="tesseract,trocr")
     args = ap.parse_args(argv)
     if args.cmd == "make":
-        make_sets(Path(args.text), Path(args.fonts), Path(args.out), args.n, args.seed)
+        try:
+            make_sets(Path(args.text), Path(args.fonts), Path(args.out), args.n, args.seed,
+                      args.force)
+        except FileExistsError as e:
+            raise SystemExit(str(e)) from None
         print(f"eval sets -> {args.out}")
     if args.cmd == "run":
         print(run(Path(args.ckpt), Path(args.sets), Path(args.out),
