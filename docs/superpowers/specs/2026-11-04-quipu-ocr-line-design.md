@@ -71,6 +71,12 @@ Rejected:
   needs up to about twice its length in steps in the worst case; the encoder stage keeps
   lines of at most 40 characters (and drops any line whose CTC path does not fit),
   filtered out, not truncated. The joint stage has no such limit and uses lines up to 60.
+- **Amended 4 Nov (renderer review):** at 64 px high and 1,024 px wide, a line fits only
+  up to about 35 characters (measured: 30 characters fit in every render, 60 characters
+  are too wide in 97%). Lines are never squashed to fit: the loader drops a line that
+  renders wider than 1,024 px. The encoder stage therefore uses `max_chars = 36`, and the
+  joint stage's 60-character lines need either a wider image cap (1,536 px = 384 image
+  tokens) or a lower limit; that is decided in the joint-stage plan.
 
 ### 3.4 Connector and prompt (`quipu/ocr_lm.py`)
 
