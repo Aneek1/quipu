@@ -110,3 +110,27 @@ def test_shard_documents_keeps_about_doc_keep_with_stable_keys(tmp_path, monkeyp
     assert 0.08 < len(kept) / 2000 < 0.16
     every = {k for k, _ in bt.shard_documents(tmp_path, "x", seed=1, doc_keep=1.0, tok=_FakeTok())}
     assert {k for k, _ in kept} <= every and len(every) == 2000
+
+
+def test_main_writes_a_manifest(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    import quipu.tokenizer
+    shards = tmp_path / "shards"
+    shards.mkdir()
+    _fake_shards(shards, monkeypatch, n_shards=3, docs_per_shard=50)
+    monkeypatch.setattr(quipu.tokenizer, "make_tokenizer", lambda path: _FakeTok())
+    tok = tmp_path / "tokenizer.json"
+    tok.write_text("{}")
+    out = tmp_path / "text"
+    assert bt.main(["--shards", str(shards), "--tokenizer", str(tok), "--out", str(out),
+                    "--doc-keep", "0.5", "--seed", "3"]) == 0
+    m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert m["tokenizer_sha256"] == hashlib.sha256(b"{}").hexdigest()
+    assert sorted(m["shards_read"]) == ["shard_000.bin", "shard_001.bin", "shard_002.bin"]
+    assert (m["seed"], m["doc_keep"], m["random_frac"]) == (3, 0.5, 0.15)
+    for name in ("train", "held"):
+        f = out / f"{name}.txt"
+        assert m[f"{name}_sha256"] == hashlib.sha256(f.read_bytes()).hexdigest()
+        assert m[f"{name}_lines"] == len(f.read_text(encoding="utf-8").splitlines())
+    assert m["shards"] and m["tokenizer"]

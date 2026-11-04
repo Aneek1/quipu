@@ -20,8 +20,9 @@ lr           = 1e-3
 warmup       = 1000
 weight_decay = 0.05
 eval_every   = 2000
-eval_n       = 500        # lines per eval set during training (the full sets at the end)
-patience     = 2          # evaluations without a better printed CER before stopping
+eval_n       = 500        # test-set lines logged per eval (monitoring; eval_ocr run scores all)
+val_n        = 0          # val lines per eval, 0 = all (eval_ocr make --n-val, 500)
+patience     = 2          # evaluations without a better val CER before stopping
 precision    = "fp16"     # "fp16" (T4) | "bf16" (compute capability 8.0+) | "fp32"
 seed         = 0
 ckpt_dir     = "runs/ocr-ctc"

@@ -13,11 +13,14 @@ characters in the OCR set. About 15% of lines are random strings (codes, digits,
 punctuation) so a model cannot read by guessing language. One document in 20 goes to
 held.txt, chosen by a hash of "shard_name:doc_index" (so the choice does not depend on
 sampling), the rest to train.txt; a line of 12+ characters that lands in both is removed
-from train. Files are written with LF line endings."""
+from train. Files are written with LF line endings. manifest.json records the inputs
+(shards dir, tokenizer and its sha256, the shard files read, seed, doc_keep,
+random_frac), the line counts and the sha256 of train.txt and held.txt."""
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import random
 import string
 import sys
@@ -92,10 +95,12 @@ def build(docs: Iterable[tuple[str, str]], out: Path, random_frac: float, seed: 
 
 
 def shard_documents(shard_dir: Path, tokenizer: str, max_shards: int | None = None,
-                    seed: int = 0, doc_keep: float = 1.0, tok=None) -> Iterator[tuple[str, str]]:
+                    seed: int = 0, doc_keep: float = 1.0, tok=None,
+                    read: list[str] | None = None) -> Iterator[tuple[str, str]]:
     """Yield (key, text) for a random sample of documents. Shards come in a seeded random
     order (the first max_shards of it), each document is kept with probability doc_keep,
-    and the key "shard_name:doc_index" names a document whether or not it is sampled."""
+    and the key "shard_name:doc_index" names a document whether or not it is sampled.
+    Each shard's name is appended to `read` (if given) when it is opened."""
     from quipu.data import read_shard
 
     if tok is None:
@@ -105,6 +110,8 @@ def shard_documents(shard_dir: Path, tokenizer: str, max_shards: int | None = No
     shards = sorted(shard_dir.glob("shard_*.bin"))
     rng.shuffle(shards)
     for shard in shards[:max_shards]:
+        if read is not None:
+            read.append(shard.name)
         ids = read_shard(shard)
         cuts = [-1, *(int(j) for j in (ids == tok.eot).nonzero()[0]), len(ids)]
         index = 0
@@ -115,6 +122,35 @@ def shard_documents(shard_dir: Path, tokenizer: str, max_shards: int | None = No
             index += 1
             if rng.random() < doc_keep:
                 yield key, tok.decode(ids[a + 1:b].tolist())
+
+
+def _sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _rel(p: str | Path) -> str:
+    try:
+        return Path(p).resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return Path(p).as_posix()
+
+
+def write_manifest(out: Path, args: argparse.Namespace, read: list[str], n_train: int,
+                   n_held: int) -> None:
+    m = {"shards": _rel(args.shards), "tokenizer": _rel(args.tokenizer),
+         "tokenizer_sha256": _sha256(Path(args.tokenizer)), "shards_read": read,
+         "seed": args.seed, "doc_keep": args.doc_keep, "random_frac": args.random_frac,
+         "max_shards": args.max_shards, "lines_limit": args.lines,
+         "train_lines": n_train, "held_lines": n_held,
+         "train_sha256": _sha256(out / "train.txt"), "held_sha256": _sha256(out / "held.txt")}
+    (out / "manifest.json").write_text(json.dumps(m, indent=1) + "\n", encoding="utf-8",
+                                       newline="\n")
 
 
 def _fraction(text: str) -> float:
@@ -138,9 +174,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if not 0.0 < args.doc_keep <= 1.0:
         ap.error("--doc-keep must be in (0, 1]")
-    n_train, n_held = build(shard_documents(Path(args.shards), args.tokenizer, args.max_shards, args.seed,
-                                  args.doc_keep), Path(args.out),
-                            args.random_frac, args.seed, args.lines)
+    read: list[str] = []
+    out = Path(args.out)
+    n_train, n_held = build(shard_documents(Path(args.shards), args.tokenizer, args.max_shards,
+                                            args.seed, args.doc_keep, read=read),
+                            out, args.random_frac, args.seed, args.lines)
+    write_manifest(out, args, read, n_train, n_held)
     print(f"train {n_train:,} lines, held {n_held:,} lines -> {args.out}")
     return 0
 

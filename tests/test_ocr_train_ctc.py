@@ -27,7 +27,7 @@ def _setup(tmp_path, eval_sets=True, run="run"):
     text = tmp_path / "train.txt"
     text.write_text("\n".join(f"line {i} of text" for i in range(100)) + "\n", encoding="utf-8")
     if eval_sets and not (tmp_path / "eval").exists():
-        ev.make_sets(text, fonts, tmp_path / "eval", n=4, seed=0)
+        ev.make_sets(text, fonts, tmp_path / "eval", n=4, seed=0, n_val=4)
     return ["--config", SMOKE,
             "--set", f"data.text={text}", "--set", f"data.fonts={fonts}",
             "--set", f"data.eval_dir={tmp_path / 'eval'}",
@@ -39,10 +39,10 @@ def _ck(path):
 
 
 def _fake_eval(monkeypatch, cers):
-    """evaluate() returns the given printed CERs in order (hand and nonsense 0.9)."""
+    """evaluate() returns the given val CERs in order (the test sets 0.9)."""
     it = iter(cers)
     monkeypatch.setattr(tc, "evaluate", lambda *a, **k: {
-        "cer_printed": next(it), "cer_hand": 0.9, "cer_nonsense": 0.9})
+        "cer_val": next(it), "cer_printed": 0.9, "cer_hand": 0.9, "cer_nonsense": 0.9})
 
 
 def _log(run):
@@ -60,7 +60,7 @@ def test_smoke_trains_checkpoints_and_resumes(tmp_path):
     assert best["charset_sha256"] == oc.CHARSET_SHA256
     log = _log(run)
     for e in log:
-        assert {"loss", "lr", "elapsed_s", "lines_per_s", "cer_printed", "cer_hand",
+        assert {"loss", "lr", "elapsed_s", "lines_per_s", "cer_val", "cer_printed", "cer_hand",
                 "cer_nonsense"} <= e.keys()
         assert "scale" not in e                           # fp32: no grad scaler
     # resume with more steps: starts at 6, ends at 9
@@ -122,10 +122,10 @@ def test_resume_takes_the_lower_of_latest_and_best(tmp_path, monkeypatch):
     _fake_eval(monkeypatch, [0.5, 0.6])
     tc.main(args)
     best = _ck(run / "best.pt")
-    torch.save({**best, "cer_printed": 0.1}, run / "best.pt")  # e.g. latest written, crash
+    torch.save({**best, "cer_val": 0.1}, run / "best.pt")  # e.g. latest written, crash
     _fake_eval(monkeypatch, [0.2])
     tc.main(args + ["--set", "train.steps=9"])
-    assert _ck(run / "latest.pt")["best_cer"] == 0.1 and _ck(run / "best.pt")["cer_printed"] == 0.1
+    assert _ck(run / "latest.pt")["best_cer"] == 0.1 and _ck(run / "best.pt")["cer_val"] == 0.1
 
 
 def test_resume_from_another_path_copies_latest_and_best(tmp_path, monkeypatch):
@@ -136,7 +136,7 @@ def test_resume_from_another_path_copies_latest_and_best(tmp_path, monkeypatch):
     args = _setup(tmp_path, eval_sets=False, run="new")
     assert tc.main(args + ["--resume", str(old / "latest.pt"), "--set", "train.steps=9"]) == 0
     new = tmp_path / "new"
-    assert _ck(new / "latest.pt")["step"] == 9 and _ck(new / "best.pt")["cer_printed"] == 0.4
+    assert _ck(new / "latest.pt")["step"] == 9 and _ck(new / "best.pt")["cer_val"] == 0.4
     assert _ck(old / "latest.pt")["step"] == 6                # source untouched
 
 
@@ -209,3 +209,14 @@ def test_set_coerces_to_the_config_type(tmp_path):
         tc.load_config(str(p), ["a.flag=yes"])
     with pytest.raises(SystemExit, match="a.n"):
         tc.load_config(str(p), ["a.n=lots"])
+
+
+def test_val_set_picks_the_best_checkpoint(tmp_path, capsys):
+    args = _setup(tmp_path)
+    assert tc.main(args) == 0
+    run = tmp_path / "run"
+    log = _log(run)
+    assert all("cer_val" in e for e in log)
+    best = _ck(run / "best.pt")
+    assert best["cer_val"] == min(e["cer_val"] for e in log)
+    assert _ck(run / "latest.pt")["best_cer"] == best["cer_val"]

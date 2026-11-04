@@ -7,15 +7,16 @@ Single GPU (the model is ~22M parameters; a second T4 is not worth DDP here). Th
 default precision is fp16 with a grad scaler (a T4 has no bf16). Logs one JSON line per
 eval to <ckpt_dir>/log.jsonl: step, mean loss since the last eval, lr, elapsed_s (summed
 over sessions), lines_per_s (this session), the grad-scaler scale under fp16, and the CER
-of each eval set.
+of each eval set. The val set (eval_dir/val, val_n lines, 0 = all) picks best.pt and
+decides early stopping; the test sets are logged at eval_n lines for monitoring only.
 
-Checkpoints: best.pt when the printed-set CER improves, then latest.pt every eval
+Checkpoints: best.pt when the val CER improves, then latest.pt every eval
 (resume takes the lower of the two best CERs, so a crash between them is safe).
 <ckpt_dir>/latest.pt is resumed automatically; --resume PATH first copies a latest.pt
 (and the best.pt and log.jsonl beside it) from elsewhere, e.g. a read-only Kaggle input.
 On resume, log entries after the checkpoint's step are dropped, and a run that already
 stopped early stays stopped. A fresh start over an existing log.jsonl needs --fresh,
-which moves the old log and best.pt aside to *.prev. Stops early when the printed CER
+which moves the old log and best.pt aside to *.prev. Stops early when the val CER
 has not improved for `patience` evals in a row. The data stream is seeded by
 seed + step on resume, so a resumed run does not replay the same images. Runs are not
 bit-for-bit reproducible on GPU: CUDA's CTC backward has no deterministic kernel."""
@@ -39,7 +40,7 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from eval_ocr import read_set  # noqa: E402
+from eval_ocr import SETS, VAL, read_set  # noqa: E402
 from quipu.ocr_ctc import (LineCTC, check_ckpt_compat, ckpt_compat,  # noqa: E402
                            ctc_greedy_decode, ctc_loss)
 from quipu.ocr_data import LineStream, collate, preprocess  # noqa: E402
@@ -48,7 +49,6 @@ from quipu.ocr_render import load_fonts, split_fonts  # noqa: E402
 from quipu.vision import ViTConfig  # noqa: E402
 
 PRECISIONS = ("bf16", "fp16", "fp32")
-EVAL_SETS = ("printed", "hand", "nonsense")
 
 
 def _coerce(key: str, old, value: str):
@@ -106,14 +106,15 @@ def load_scaler_state(scaler, state: dict) -> None:
 
 
 @torch.no_grad()
-def evaluate(model, eval_dir: Path, n: int, device, autocast) -> dict:
-    """CER on the first n lines of each eval set. The sets are built to fit (eval_ocr
-    make), so a LineTooWide from preprocess is let through: the set and code disagree."""
+def evaluate(model, eval_dir: Path, n: int, device, autocast, val_n: int = 0) -> dict:
+    """cer_val on the first val_n lines of val/ (0 = all), and cer_<set> on the first n
+    lines of each test set. The sets are built to fit (eval_ocr make), so a LineTooWide
+    from preprocess is let through: the set and code disagree."""
     model.eval()
     try:
         out = {}
-        for name in EVAL_SETS:
-            rows = read_set(eval_dir / name)[:n]
+        for name, k in ((VAL, val_n or None), *((s, n) for s in SETS)):
+            rows = read_set(eval_dir / name)[:k]
             refs, hyps = [], []
             for i in range(0, len(rows), 64):
                 items = []
@@ -224,11 +225,11 @@ def main(argv: list[str] | None = None) -> int:
         del ck
         if (ckpt_dir / "best.pt").is_file():
             best = min(best, torch.load(ckpt_dir / "best.pt", weights_only=False,
-                                        map_location="cpu")["cer_printed"])
+                                        map_location="cpu").get("cer_val", best))
         _truncate_log(ckpt_dir / "log.jsonl", step)
-        print(f"checkpoints: {ckpt_dir} (resuming at step {step}, best printed CER {best:.4f})")
+        print(f"checkpoints: {ckpt_dir} (resuming at step {step}, best val CER {best:.4f})")
         if bad >= t["patience"]:
-            print(f"already stopped early at step {step} (printed CER not improved for {bad} "
+            print(f"already stopped early at step {step} (val CER not improved for {bad} "
                   "evals; raise train.patience to go on)")
             return 0
     else:
@@ -265,7 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         loss_sum += loss.detach()                 # no .item(): no GPU sync every step
         loss_n += 1
         if step % t["eval_every"] == 0 or step == t["steps"]:
-            metrics = evaluate(model, Path(d["eval_dir"]), t["eval_n"], device, autocast)
+            metrics = evaluate(model, Path(d["eval_dir"]), t["eval_n"], device, autocast,
+                               t["val_n"])
             session = time.time() - t0
             entry = {"step": step, "loss": round((loss_sum / loss_n).item(), 4), "lr": lr,
                      "elapsed_s": round(elapsed0 + session, 1),
@@ -277,22 +279,22 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(entry), flush=True)
             log.write(json.dumps(entry) + "\n")
             log.flush()
-            improved = metrics["cer_printed"] < best
+            improved = metrics["cer_val"] < best
             if improved:
-                best, bad = metrics["cer_printed"], 0
+                best, bad = metrics["cer_val"], 0
             else:
                 bad += 1
             meta = {"vit": vars(vit), "step": step, "precision": t["precision"],
                     **ckpt_compat()}
             if improved:          # before latest.pt; resume takes min(latest, best.pt)
-                save(ckpt_dir / "best.pt", {"model": model.state_dict(), "cer_printed": best,
+                save(ckpt_dir / "best.pt", {"model": model.state_dict(), "cer_val": best,
                                             **meta})
             save(ckpt_dir / "latest.pt", {"model": model.state_dict(), "opt": opt.state_dict(),
                                           "scaler": scaler.state_dict(), "best_cer": best,
                                           "bad_evals": bad, "elapsed_s": elapsed0 + session,
                                           **meta})
             if bad >= t["patience"]:
-                print(f"stopping: printed CER has not improved for {bad} evals")
+                print(f"stopping: val CER has not improved for {bad} evals")
                 break
     del loader                                # shuts the workers down
     log.close()

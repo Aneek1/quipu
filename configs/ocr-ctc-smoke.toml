@@ -20,6 +20,7 @@ warmup       = 2
 weight_decay = 0.05
 eval_every   = 3
 eval_n       = 4
+val_n        = 0
 patience     = 2
 precision    = "fp32"
 seed         = 0

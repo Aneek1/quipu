@@ -17,14 +17,14 @@ ev = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ev)
 
 
-def _make(tmp_path, seed=0, n=12, force=False):
+def _make(tmp_path, seed=0, n=12, force=False, n_val=6):
     fonts = tmp_path / "fonts"
     if not fonts.exists():
         make_font_dir(fonts)
     held = tmp_path / "held.txt"
     held.write_text("\n".join(f"held line number {i}" for i in range(50)) + "\n", encoding="utf-8")
     out = tmp_path / f"eval{seed}"
-    ev.make_sets(held, fonts, out, n=n, seed=seed, force=force)
+    ev.make_sets(held, fonts, out, n=n, seed=seed, force=force, n_val=n_val)
     return out
 
 
@@ -65,7 +65,7 @@ def test_remake_with_force_and_smaller_n_leaves_no_stale_files(tmp_path):
     (out / "notes.txt").write_text("mine")                 # not ours: kept, not hashed
     _make(tmp_path, n=5, force=True)
     sums = (out / "SHA256SUMS").read_text().splitlines()
-    assert len(sums) == 3 * (5 + 1)                        # 5 PNGs + labels.tsv per set
+    assert len(sums) == 3 * (5 + 1) + (6 + 1)              # PNGs + labels.tsv per set, val
     assert not any("notes.txt" in s for s in sums)
     for name in ("printed", "hand", "nonsense"):
         assert len(list((out / name).glob("*.png"))) == 5
@@ -105,10 +105,10 @@ def _tiny_ckpt(tmp_path, **extra):
     return ck
 
 
-def _run(tmp_path, out, baselines, **ck_extra):
+def _run(tmp_path, out, baselines, date=None, **ck_extra):
     table = tmp_path / "results.md"
     ev.main(["run", "--ckpt", str(_tiny_ckpt(tmp_path, **ck_extra)), "--sets", str(out),
-             "--out", str(table), "--baselines", baselines])
+             "--out", str(table), "--baselines", baselines] + (["--date", date] if date else []))
     return table.read_text(encoding="utf-8")
 
 
@@ -194,3 +194,33 @@ def test_make_sets_redraws_when_no_font_covers_the_text(tmp_path, monkeypatch):
     monkeypatch.setattr(ev, "render_fitting", no_font)
     with pytest.raises(RuntimeError, match="1000"):
         _make(tmp_path)
+
+
+def test_make_writes_a_mixed_val_set_with_its_own_stream(tmp_path):
+    out = _make(tmp_path, n=12, n_val=20)
+    val = ev.read_set(out / "val")
+    assert len(val) == 20 and {s for *_, s in val} == {"printed", "hand"}
+    assert any("val/labels.tsv" in s for s in (out / "SHA256SUMS").read_text().splitlines())
+    printed = [t for _, t, _ in ev.read_set(out / "printed")]
+    # the test sets do not depend on n_val: val draws from its own random stream
+    other = _make(tmp_path / "b", n=12, n_val=3)
+    assert [t for _, t, _ in ev.read_set(other / "printed")] == printed
+
+
+def test_labels_and_sums_use_lf(tmp_path):
+    out = _make(tmp_path)
+    assert b"\r" not in (out / "SHA256SUMS").read_bytes()
+    for name in ev.ALL_SETS:
+        assert b"\r" not in (out / name / "labels.tsv").read_bytes()
+
+
+def test_run_never_scores_val_and_writes_a_header(tmp_path):
+    import hashlib
+    out = _make(tmp_path)
+    text = _run(tmp_path, out, "", date="2026-11-04")
+    assert "| val |" not in text
+    assert text.startswith("# Quipu-OCR encoder stage results\n")
+    ck = tmp_path / "best.pt"
+    assert "2026-11-04" in text and "step 1" in text
+    assert hashlib.sha256(ck.read_bytes()).hexdigest()[:12] in text
+    assert hashlib.sha256((out / "SHA256SUMS").read_bytes()).hexdigest()[:12] in text
