@@ -78,6 +78,12 @@ Rejected:
   renders wider than 1,024 px. The encoder stage therefore uses `max_chars = 36`, and the
   joint stage's 60-character lines need either a wider image cap (1,536 px = 384 image
   tokens) or a lower limit; that is decided in the joint-stage plan.
+- **Amended 4 Nov (data review):** one CTC step per 16-px column was too coarse. With
+  narrow and script fonts, 42% of candidate lines could not fit their CTC path, and
+  dropping them cut the handwriting share from the intended 50% to 19%. The head now emits
+  2 steps per column (a linear layer to 2 × classes, reshaped), so a line of up to 64
+  columns has up to 128 CTC steps. When a line still misses, the loader retries the same
+  text and style with other fonts before dropping it, so the style mix is not biased.
 
 ### 3.4 Connector and prompt (`quipu/ocr_lm.py`)
 
