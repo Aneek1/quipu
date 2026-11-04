@@ -48,3 +48,37 @@ def test_greedy_decode_respects_lengths():
     a, b = oc.encode_text("a")[0], oc.encode_text("b")[0]
     lp = _one_hot_path([a, oc.BLANK, b, b], oc.N_CLASSES)
     assert oc.ctc_greedy_decode(lp, torch.tensor([2])) == ["a"]
+from quipu.vision import ViTConfig
+
+TINY = ViTConfig(d_model=32, n_layer=2, n_head=4, mlp=64)
+
+
+def test_line_ctc_shapes():
+    m = oc.LineCTC(TINY)
+    images = torch.rand(2, 1, 64, 128)
+    mask = torch.tensor([[True] * 8, [True] * 5 + [False] * 3])
+    lp, lens = m(images, mask)
+    assert lp.shape == (8, 2, oc.N_CLASSES)
+    assert lp.dtype == torch.float32
+    assert lens.tolist() == [8, 5]
+    torch.testing.assert_close(lp.exp().sum(-1), torch.ones(8, 2))
+
+
+def test_ctc_loss_goes_down_when_overfitting_two_lines():
+    torch.manual_seed(0)
+    m = oc.LineCTC(TINY)
+    images = torch.rand(2, 1, 64, 128)
+    mask = torch.ones(2, 8, dtype=torch.bool)
+    texts = ["ab", "cab"]
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
+    first = None
+    for _ in range(150):
+        lp, lens = m(images, mask)
+        loss = oc.ctc_loss(lp, lens, texts)
+        first = first if first is not None else loss.item()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    assert loss.item() < 0.1 * first
+    lp, lens = m(images, mask)
+    assert oc.ctc_greedy_decode(lp, lens) == texts

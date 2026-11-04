@@ -6,6 +6,10 @@ trainer, the data filter and the evaluation can never disagree about it."""
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+from torch import nn
+
+from quipu.vision import LineViT, ViTConfig
 
 EXTRA = "°£€×–‘’"
 CHARSET = "".join(chr(c) for c in range(32, 127)) + EXTRA
@@ -43,3 +47,36 @@ def ctc_greedy_decode(log_probs: torch.Tensor, lengths: torch.Tensor) -> list[st
             prev = k
         out.append("".join(chars))
     return out
+
+
+class CTCHead(nn.Module):
+    """Mean over the 4 patch rows of each column, then a linear layer to the classes."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, N_CLASSES)
+
+    def forward(self, feats: torch.Tensor, col_mask: torch.Tensor):
+        """feats [B, R, C, D], col_mask [B, C] -> (log_probs [C, B, K] float32, lengths [B])."""
+        logits = self.proj(feats.mean(dim=1)).float()
+        return logits.log_softmax(-1).transpose(0, 1), col_mask.sum(1)
+
+
+class LineCTC(nn.Module):
+    def __init__(self, cfg: ViTConfig) -> None:
+        super().__init__()
+        self.encoder = LineViT(cfg)
+        self.head = CTCHead(cfg.d_model)
+
+    def forward(self, images: torch.Tensor, col_mask: torch.Tensor):
+        return self.head(self.encoder(images, col_mask), col_mask)
+
+
+def ctc_loss(log_probs: torch.Tensor, lengths: torch.Tensor, texts: list[str]) -> torch.Tensor:
+    """Mean CTC loss over the batch (PyTorch divides each item by its target length)."""
+    targets = [encode_text(t) for t in texts]
+    flat = torch.tensor([k for t in targets for k in t], dtype=torch.long,
+                        device=log_probs.device)
+    tgt_lens = torch.tensor([len(t) for t in targets], dtype=torch.long)
+    return F.ctc_loss(log_probs, flat, lengths.cpu(), tgt_lens, blank=BLANK,
+                      reduction="mean", zero_infinity=True)
