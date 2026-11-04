@@ -60,6 +60,13 @@ class LineViT(nn.Module):
         self.col_pos = nn.Parameter(torch.randn(cfg.max_cols, cfg.d_model) * 0.02)
         self.blocks = nn.ModuleList(_Block(cfg) for _ in range(cfg.n_layer))
         self.norm = nn.LayerNorm(cfg.d_model)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m: nn.Module) -> None:
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02, a=-0.04, b=0.04)
+            nn.init.zeros_(m.bias)
 
     def forward(self, images: torch.Tensor, col_mask: torch.Tensor) -> torch.Tensor:
         """images [B, 1, 64, W] (ink 1, background 0), col_mask [B, W/16] True on real
@@ -75,6 +82,11 @@ class LineViT(nn.Module):
         C = W // cfg.patch
         if tuple(col_mask.shape) != (B, C):
             raise ValueError(f"col_mask shape {tuple(col_mask.shape)}, expected {(B, C)}")
+        if col_mask.dtype != torch.bool:
+            raise ValueError(f"col_mask must be bool, got {col_mask.dtype} (a float mask "
+                             "would be added to the attention scores, not used as a mask)")
+        if (col_mask.sum(1) == 0).any():
+            raise ValueError("an item has no real columns (col_mask all False)")
         x = self.patch(images).permute(0, 2, 3, 1)                     # B, R, C, D
         R = x.shape[1]
         x = x + self.row_pos[:R, None, :] + self.col_pos[None, :C, :]

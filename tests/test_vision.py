@@ -40,3 +40,24 @@ def test_bad_inputs_raise(shape, cols, match):
     m = LineViT(TINY)
     with pytest.raises(ValueError, match=match):
         m(torch.zeros(shape), torch.ones(1, cols, dtype=torch.bool))
+
+
+def test_float_mask_raises():
+    m = LineViT(TINY)
+    with pytest.raises(ValueError, match="col_mask must be bool"):
+        m(torch.zeros(1, 1, 64, 64), torch.ones(1, 4))
+
+
+def test_item_with_no_real_columns_raises():
+    m = LineViT(TINY)
+    mask = torch.tensor([[True] * 4, [False] * 4])
+    with pytest.raises(ValueError, match="no real columns"):
+        m(torch.zeros(2, 1, 64, 64), mask)
+
+
+def test_linear_init_is_small_with_zero_bias():
+    m = LineViT(TINY)
+    lin = m.blocks[0].qkv
+    assert lin.bias.abs().max().item() == 0
+    assert 0.01 < lin.weight.std().item() < 0.03
+    assert lin.weight.abs().max().item() <= 0.04 + 1e-6

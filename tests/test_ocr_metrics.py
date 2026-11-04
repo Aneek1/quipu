@@ -1,4 +1,6 @@
 """quipu/ocr_metrics.py."""
+import pytest
+
 from quipu.ocr_metrics import cer, edit_distance, exact_match, wer
 
 
@@ -22,6 +24,10 @@ def test_exact_match():
 
 
 def test_empty_reference_set_raises():
-    import pytest
     with pytest.raises(ValueError):
         cer([], [])
+
+
+def test_exact_match_length_mismatch_raises():
+    with pytest.raises(ValueError, match="references"):
+        exact_match(["a", "b"], ["a"])

@@ -50,7 +50,10 @@ def ctc_greedy_decode(log_probs: torch.Tensor, lengths: torch.Tensor) -> list[st
 
 
 class CTCHead(nn.Module):
-    """Mean over the 4 patch rows of each column, then a linear layer to the classes."""
+    """Mean over the 4 patch rows of each column, then a linear layer to the classes.
+
+    col_mask must be a prefix mask (real columns first, padding after): the returned
+    lengths are col_mask.sum(1) and the loss and decoder read the first `length` steps."""
 
     def __init__(self, d_model: int) -> None:
         super().__init__()
@@ -63,6 +66,9 @@ class CTCHead(nn.Module):
 
 
 class LineCTC(nn.Module):
+    """ViT encoder plus CTC head. col_mask must be a bool prefix mask (real columns
+    first, padding after)."""
+
     def __init__(self, cfg: ViTConfig) -> None:
         super().__init__()
         self.encoder = LineViT(cfg)
@@ -74,6 +80,10 @@ class LineCTC(nn.Module):
 
 def ctc_loss(log_probs: torch.Tensor, lengths: torch.Tensor, texts: list[str]) -> torch.Tensor:
     """Mean CTC loss over the batch (PyTorch divides each item by its target length)."""
+    for i, (t, n) in enumerate(zip(texts, lengths.tolist())):
+        need = ctc_steps_needed(t)
+        if need > n:
+            raise ValueError(f"item {i}: text needs {need} CTC steps but has only {n}")
     targets = [encode_text(t) for t in texts]
     flat = torch.tensor([k for t in targets for k in t], dtype=torch.long,
                         device=log_probs.device)

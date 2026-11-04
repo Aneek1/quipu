@@ -3,6 +3,9 @@ import pytest
 import torch
 
 from quipu import ocr_ctc as oc
+from quipu.vision import ViTConfig
+
+TINY = ViTConfig(d_model=32, n_layer=2, n_head=4, mlp=64)
 
 
 def test_charset_is_printable_ascii_plus_extras():
@@ -48,11 +51,6 @@ def test_greedy_decode_respects_lengths():
     a, b = oc.encode_text("a")[0], oc.encode_text("b")[0]
     lp = _one_hot_path([a, oc.BLANK, b, b], oc.N_CLASSES)
     assert oc.ctc_greedy_decode(lp, torch.tensor([2])) == ["a"]
-from quipu.vision import ViTConfig
-
-TINY = ViTConfig(d_model=32, n_layer=2, n_head=4, mlp=64)
-
-
 def test_line_ctc_shapes():
     m = oc.LineCTC(TINY)
     images = torch.rand(2, 1, 64, 128)
@@ -82,3 +80,19 @@ def test_ctc_loss_goes_down_when_overfitting_two_lines():
     assert loss.item() < 0.1 * first
     lp, lens = m(images, mask)
     assert oc.ctc_greedy_decode(lp, lens) == texts
+
+
+def test_ctc_loss_raises_when_text_cannot_fit():
+    lp = torch.randn(5, 2, oc.N_CLASSES).log_softmax(-1)
+    with pytest.raises(ValueError, match=r"item 1.*needs 6"):
+        oc.ctc_loss(lp, torch.tensor([5, 5]), ["abc", "hello"])
+
+
+def test_ctc_loss_on_padded_batch_is_finite():
+    torch.manual_seed(0)
+    m = oc.LineCTC(TINY)
+    images = torch.rand(2, 1, 64, 128)
+    mask = torch.tensor([[True] * 8, [True] * 5 + [False] * 3])
+    lp, lens = m(images, mask)
+    loss = oc.ctc_loss(lp, lens, ["ab", "cab"])
+    assert torch.isfinite(loss) and loss.item() > 0

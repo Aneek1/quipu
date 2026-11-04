@@ -17,9 +17,13 @@ def edit_distance(ref: Sequence, hyp: Sequence) -> int:
     return prev[-1]
 
 
-def _rate(refs: list[Sequence], hyps: list[Sequence]) -> float:
+def _check(refs: list, hyps: list) -> None:
     if len(refs) != len(hyps):
         raise ValueError(f"{len(refs)} references but {len(hyps)} hypotheses")
+
+
+def _rate(refs: list[Sequence], hyps: list[Sequence]) -> float:
+    _check(refs, hyps)
     total = sum(len(r) for r in refs)
     if total == 0:
         raise ValueError("no reference characters to score against")
@@ -35,6 +39,7 @@ def wer(refs: list[str], hyps: list[str]) -> float:
 
 
 def exact_match(refs: list[str], hyps: list[str]) -> float:
+    _check(refs, hyps)
     if not refs:
         raise ValueError("no references")
     return sum(r == h for r, h in zip(refs, hyps)) / len(refs)
