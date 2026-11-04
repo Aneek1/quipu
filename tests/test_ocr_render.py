@@ -63,3 +63,38 @@ def test_crop_margins_leave_edge_columns_free_of_ink(tmp_path, style):
         assert (arr < thr).any()
         assert not (arr[:, :2] < thr).any(), f"ink in left 2 columns, seed {seed}"
         assert not (arr[:, -2:] < thr).any(), f"ink in right 2 columns, seed {seed}"
+
+
+def test_pick_axis_values_varies_only_the_weight_axis():
+    axes = [{"name": b"Weight", "minimum": 400, "default": 400, "maximum": 700},
+            {"name": "Width", "minimum": 75, "default": 100, "maximum": 125}]
+    seen = set()
+    for seed in range(30):
+        vals = r.pick_axis_values(axes, random.Random(seed))
+        assert 400 <= vals[0] <= 700
+        assert vals[1] == 100
+        seen.add(vals[0])
+    assert len(seen) > 5
+    assert r.pick_axis_values(axes, random.Random(3)) == r.pick_axis_values(axes, random.Random(3))
+
+
+def test_pick_axis_values_without_weight_axis_keeps_defaults():
+    axes = [{"name": b"Slant", "minimum": -10, "default": 0, "maximum": 0}]
+    assert r.pick_axis_values(axes, random.Random(0)) == [0]
+
+
+def test_static_font_has_no_axes_and_still_renders(tmp_path):
+    font = r.load_fonts(make_font_dir(tmp_path))[0]
+    assert r._axes(font.path) is None
+    assert r.render_line("static", font, random.Random(2)).mode == "L"
+
+
+def test_licence_names_are_ofl_and_apache_only():
+    import importlib.util
+    from pathlib import Path
+    assert "UFL.txt" not in r.LICENCE_NAMES
+    spec = importlib.util.spec_from_file_location(
+        "fetch_fonts", Path(__file__).parents[1] / "scripts" / "ocr" / "fetch_fonts.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    assert "UFL.txt" not in m.LICENCE_NAMES

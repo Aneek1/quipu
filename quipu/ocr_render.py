@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-LICENCE_NAMES = ("OFL.txt", "LICENSE.txt", "LICENCE.txt", "UFL.txt")
+LICENCE_NAMES = ("OFL.txt", "LICENSE.txt", "LICENCE.txt")
 STYLES = ("printed", "hand")
 
 
@@ -74,29 +74,60 @@ def split_fonts(fonts: list[Font], held_every: int = 5) -> tuple[list[Font], lis
             [f for f in fonts if f.family in held_fams])
 
 
-_FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
+_FONT_CACHE: dict[tuple, ImageFont.FreeTypeFont] = {}
+_AXES_CACHE: dict[str, list | None] = {}
 
 
-def _font(path: Path, size: int) -> ImageFont.FreeTypeFont:
-    key = (str(path), size)
+def _axes(path: Path) -> list | None:
+    """Variation axes of a variable font, or None for a static one."""
+    key = str(path)
+    if key not in _AXES_CACHE:
+        try:
+            _AXES_CACHE[key] = ImageFont.truetype(key, 20).get_variation_axes()
+        except (OSError, AttributeError):
+            _AXES_CACHE[key] = None
+    return _AXES_CACHE[key]
+
+
+def pick_axis_values(axes: list, rng: random.Random) -> list[float]:
+    """A random weight in [minimum, maximum] on the weight axis, every other axis at
+    its default."""
+    vals = []
+    for a in axes:
+        name = a["name"]
+        name = name.decode("latin-1") if isinstance(name, bytes) else str(name)
+        if name.lower() == "weight":
+            vals.append(rng.uniform(a["minimum"], a["maximum"]))
+        else:
+            vals.append(a["default"])
+    return vals
+
+
+def _font(path: Path, size: int, axis_values: tuple | None = None) -> ImageFont.FreeTypeFont:
+    key = (str(path), size, axis_values)
     if key not in _FONT_CACHE:
-        _FONT_CACHE[key] = ImageFont.truetype(str(path), size)
+        f = ImageFont.truetype(str(path), size)
+        if axis_values is not None:
+            f.set_variation_by_axes(list(axis_values))
+        _FONT_CACHE[key] = f
     return _FONT_CACHE[key]
 
 
 def _draw(text: str, font: Font, size: int, bg: int, ink: int, rng: random.Random,
-          hand: bool) -> Image.Image:
+          hand: bool, axis_values: tuple | None = None) -> Image.Image:
     spacing = rng.uniform(-0.5, 2.5)
     sizes = [max(8, round(size * rng.uniform(0.9, 1.1))) if hand else size for _ in text]
-    advances = [_font(font.path, s).getlength(ch) for ch, s in zip(text, sizes)]
+    advances = [_font(font.path, s, axis_values).getlength(ch) for ch, s in zip(text, sizes)]
     width = int(sum(advances) + spacing * len(text) + 2 * size) + 16
     height = int(size * 2.2)
     img = Image.new("L", (width, height), bg)
     d = ImageDraw.Draw(img)
     x, base = float(size // 2), size * 0.5
+    stroke = rng.choice([0, 0, 1]) if hand else 0
     for ch, s, adv in zip(text, sizes, advances):
         dy = rng.gauss(0, size * 0.04) if hand else 0.0
-        d.text((x, base + dy + (size - s) * 0.8), ch, font=_font(font.path, s), fill=ink)
+        d.text((x, base + dy + (size - s) * 0.8), ch, font=_font(font.path, s, axis_values), fill=ink,
+               stroke_width=stroke, stroke_fill=ink)
         x += adv + spacing + (rng.gauss(0, size * 0.05) if hand else 0.0)
     if hand:
         img = _shear(img, rng.uniform(-0.3, 0.3), bg)
@@ -160,5 +191,8 @@ def render_line(text: str, font: Font, rng: random.Random) -> Image.Image:
     find_licence(font.path)
     size = rng.randint(28, 48)
     bg, ink = rng.randint(190, 255), rng.randint(0, 90)
-    img = _draw(text, font, size, bg, ink, rng, hand=font.style == "hand")
+    axes = _axes(font.path)
+    axis_values = tuple(pick_axis_values(axes, rng)) if axes else None
+    img = _draw(text, font, size, bg, ink, rng, hand=font.style == "hand",
+                axis_values=axis_values)
     return _augment(img, bg, rng)

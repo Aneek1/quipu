@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 API = "https://api.github.com/repos/google/fonts"
 RAW = "https://raw.githubusercontent.com/google/fonts"
-LICENCE_NAMES = ("OFL.txt", "LICENSE.txt", "LICENCE.txt", "UFL.txt")
+LICENCE_NAMES = ("OFL.txt", "LICENSE.txt", "LICENCE.txt")
 
 
 def _get(url: str) -> bytes:
