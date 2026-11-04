@@ -1,7 +1,7 @@
 """OCR data: image preprocessing, batching, and the on-the-fly training stream.
 
-Spec sections 3.1 and 4.5. Images become [1, 64, W] float tensors with ink 1 and
-paper 0, W a multiple of 16 and at most 1024. A line is skipped (never truncated or
+Spec sections 3.1 and 4.5. Images become [1, 64, W] float tensors with ink near 1
+and paper 0 (the median grey level of the image is subtracted, then clipped to [0, 1]), W a multiple of 16 and at most 1024. A line is skipped (never truncated or
 squashed) when it is too long for the encoder stage, has characters outside the set,
 has leading or trailing whitespace, renders wider than 1024 px at 64 px high, or
 renders narrower than its CTC path needs."""
@@ -15,11 +15,12 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
-from quipu.ocr_ctc import ctc_steps_needed, in_charset
+from quipu.ocr_ctc import STEPS_PER_COL, ctc_steps_needed, in_charset
 from quipu.ocr_render import Font, pick_font, render_line
 
 HEIGHT, MAX_WIDTH, PATCH = 64, 1024, 16
-MAX_SKIPS = 1000
+MAX_SKIPS = 1000          # consecutive skipped texts before the stream gives up
+FONT_TRIES = 5            # renders of one text (first try plus 4 retries) on a CTC miss
 
 
 class LineTooWide(ValueError):
@@ -33,7 +34,9 @@ def preprocess(img: Image.Image) -> torch.Tensor:
     if w > MAX_WIDTH:
         raise LineTooWide(f"line is {w} px wide at {HEIGHT} px high; the limit is {MAX_WIDTH}")
     img = img.resize((w, HEIGHT), Image.Resampling.BILINEAR)
-    t = torch.from_numpy(1.0 - np.asarray(img, dtype=np.float32) / 255.0)[None]
+    ink = 1.0 - np.asarray(img, dtype=np.float32) / 255.0
+    ink = np.clip(ink - np.median(ink), 0.0, 1.0)      # paper to 0; no contrast stretch
+    t = torch.from_numpy(ink)[None]
     pad = (-w) % PATCH
     return F.pad(t, (0, pad)) if pad else t
 
@@ -68,22 +71,30 @@ class LineStream(IterableDataset):
     def __iter__(self):
         info = get_worker_info()
         rng = random.Random(self.seed * 1000 + (info.id if info else 0))
-        skipped = 0
+        too_wide = ctc_miss = 0
         while True:
             text = rng.choice(self.lines)
             style = "hand" if rng.random() < self.hand_frac else "printed"
-            font = pick_font(self.fonts, style, rng)
-            try:
-                img = preprocess(render_line(text, font, rng))
-            except LineTooWide:
-                img = None
-            if img is not None and ctc_steps_needed(text) <= img.shape[-1] // PATCH:
-                skipped = 0
-                yield img, text
-                continue
-            skipped += 1
-            if skipped >= MAX_SKIPS:
-                raise RuntimeError(
-                    f"{MAX_SKIPS} candidate lines in a row were skipped (too wide or too "
-                    f"narrow for CTC); the lines are probably too long for these fonts. "
-                    f"Lower max_chars (now {self.max_chars}).")
+            result = None
+            for _ in range(FONT_TRIES):             # same text and style, another font
+                font = pick_font(self.fonts, style, rng)
+                try:
+                    img = preprocess(render_line(text, font, rng))
+                except LineTooWide:
+                    too_wide += 1
+                    break
+                if ctc_steps_needed(text) <= (img.shape[-1] // PATCH) * STEPS_PER_COL:
+                    result = img
+                    break
+            else:
+                ctc_miss += 1
+            if result is not None:
+                too_wide = ctc_miss = 0
+                yield result, text
+            elif too_wide + ctc_miss >= MAX_SKIPS:
+                if ctc_miss >= too_wide:
+                    why = "the fonts are too narrow for the CTC step"
+                else:
+                    why = f"the lines are too long for these fonts; lower max_chars (now {self.max_chars})"
+                raise RuntimeError(f"{MAX_SKIPS} candidate lines in a row were skipped "
+                                   f"({too_wide} too wide, {ctc_miss} CTC misses): {why}.")

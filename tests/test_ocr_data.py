@@ -48,7 +48,7 @@ def test_line_stream_yields_fitting_lines(tmp_path):
     for img, text in items:
         assert text in ("hello world", "Quipu reads 42 lines")   # long, non-charset, padded dropped
         assert img.shape[1] == 64
-        assert oc.ctc_steps_needed(text) <= img.shape[-1] // 16
+        assert oc.ctc_steps_needed(text) <= (img.shape[-1] // 16) * oc.STEPS_PER_COL
 
 
 def test_line_stream_hand_frac_needs_hand_fonts(tmp_path):
@@ -61,5 +61,67 @@ def test_line_stream_gives_up_when_every_line_is_too_wide(tmp_path, monkeypatch)
     fonts = r.load_fonts(make_font_dir(tmp_path))
     monkeypatch.setattr(ocr_data, "render_line", lambda text, font, rng: Image.new("L", (5000, 64), 255))
     stream = LineStream(["hello world"], fonts, hand_frac=0.0, max_chars=36, seed=0)
-    with pytest.raises(RuntimeError, match="max_chars"):
+    with pytest.raises(RuntimeError, match=r"lower max_chars"):
         next(iter(stream))
+
+
+def test_preprocess_subtracts_the_paper_level():
+    img = Image.new("L", (160, 64), 200)
+    img.paste(20, (40, 20, 120, 40))
+    t = preprocess(img)
+    assert float(t[0, 2, 2]) == 0.0                     # paper
+    assert float(t[0, 30, 80]) > 0.6                    # ink
+    assert 0.0 <= float(t.min()) and float(t.max()) <= 1.0
+
+
+def _stream(tmp_path, lines=("hello world",), **kw):
+    fonts = r.load_fonts(make_font_dir(tmp_path))
+    return LineStream(list(lines), fonts, **{"hand_frac": 0.5, "max_chars": 36, "seed": 0, **kw})
+
+
+def test_workers_get_different_streams(tmp_path, monkeypatch):
+    monkeypatch.setattr(ocr_data, "render_line",
+                        lambda text, font, rng: Image.new("L", (400, 64), 255))
+    lines = [f"line number {i}" for i in range(200)]
+    stream = _stream(tmp_path, lines)
+
+    def first_texts(worker_id):
+        class Info:
+            id = worker_id
+        monkeypatch.setattr(ocr_data, "get_worker_info", lambda: Info)
+        return [t for _, t in itertools.islice(iter(stream), 10)]
+
+    assert first_texts(0) != first_texts(1)
+    assert first_texts(0) == first_texts(0)
+
+
+def test_ctc_miss_retries_same_text_and_style_with_another_font(tmp_path, monkeypatch):
+    calls, picks = [], []
+    orig_pick = ocr_data.pick_font
+
+    def pick(fonts, style, rng):
+        picks.append(style)
+        return orig_pick(fonts, style, rng)
+
+    def render(text, font, rng):
+        calls.append(text)
+        width = 16 if len(calls) <= 3 else 400          # first three renders are too narrow
+        return Image.new("L", (width, 64), 255)
+
+    monkeypatch.setattr(ocr_data, "pick_font", pick)
+    monkeypatch.setattr(ocr_data, "render_line", render)
+    stream = _stream(tmp_path, ["hello world", "another line here"])
+    _, text = next(iter(stream))
+    assert len(calls) == 4 and len(set(calls)) == 1 and calls[0] == text
+    assert len(picks) == 4 and len(set(picks)) == 1
+
+
+def test_ctc_miss_gives_up_on_a_text_after_five_renders(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ocr_data, "render_line",
+                        lambda text, font, rng: (calls.append(text), Image.new("L", (16, 64), 255))[1])
+    stream = _stream(tmp_path)
+    with pytest.raises(RuntimeError, match="too narrow for the CTC step") as e:
+        next(iter(stream))
+    assert "1000 CTC misses" in str(e.value) and "0 too wide" in str(e.value)
+    assert len(calls) == 5 * 1000
