@@ -262,3 +262,40 @@ def test_font_covers_sees_a_missing_glyph_and_ignores_space(tmp_path):
     assert r.missing_chars(alpha.path, "a€b") == "€"
     assert not r.font_covers(alpha, "5 €")
     assert r.font_covers(alpha, "5 euro")                  # space is always fine
+
+
+# ---- 5 Nov sample review: thin static fonts, perspective clipping -----------------
+
+def test_load_fonts_skips_static_fonts_thinner_than_weight_min(tmp_path):
+    from tests.ocr_fixtures import set_weight_class
+    d = make_font_dir(tmp_path)
+    set_weight_class(d, "alpha", 100)                 # a static Thin file
+    set_weight_class(d, "beta", r.WEIGHT_MIN)         # exactly the floor: kept
+    fams = {f.family for f in r.load_fonts(d)}
+    assert "alpha" not in fams
+    assert {"beta", "gamma", "delta"} <= fams
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_perspective_quad_only_zooms_out(seed):
+    """The QUAD source corners lie on or outside the image, so the warp can shrink the
+    line inside the frame but never crop ink off an edge."""
+    w, h = 1000, 80
+    x0, y0, x1, y1, x2, y2, x3, y3 = r.perspective_quad(w, h, random.Random(seed))
+    assert x0 <= 0 and x1 <= 0                        # left corners (top, bottom)
+    assert x2 >= w and x3 >= w                        # right corners (bottom, top)
+    assert y0 <= 0 and y3 <= 0                        # top corners
+    assert y1 >= h and y2 >= h                        # bottom corners
+
+
+def test_augment_keeps_ink_off_the_left_and_right_edges(tmp_path):
+    """Over many seeds, no rendered line has ink in its first or last column."""
+    fonts = r.load_fonts(make_font_dir(tmp_path))
+    for seed in range(60):
+        rng = random.Random(seed)
+        font = fonts[seed % len(fonts)]
+        img = np.asarray(r.render_line("Wide line of text 0123456789 WWW", font, rng),
+                         dtype=np.float32)
+        bg = np.median(img)
+        dark = img < bg - 60
+        assert not dark[:, 0].any() and not dark[:, -1].any(), seed

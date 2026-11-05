@@ -1,6 +1,10 @@
 """Render sample lines to PNGs for a visual check of fonts and augmentation.
 
-    .venv/Scripts/python scripts/ocr/render_lines.py --n 40 --out runs/ocr-samples"""
+    .venv/Scripts/python scripts/ocr/render_lines.py --n 40 --out runs/ocr-samples
+
+Each sample goes through the training path (usable_line, render_fitting, preprocess),
+styles alternate printed / hand, and the PNG is the 64 px tensor the model sees (ink
+dark on white). labels.tsv beside them holds png, text, style, font file."""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +12,17 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from quipu.ocr_render import load_fonts, render_line  # noqa: E402
+from quipu.ocr_ctc import usable_line  # noqa: E402
+from quipu.ocr_data import LineTooWide, NoCoveringFont, render_fitting  # noqa: E402
+from quipu.ocr_render import STYLES, load_fonts  # noqa: E402
+
+MAX_CHARS = 36      # configs/ocr-ctc.toml data.max_chars
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,13 +36,25 @@ def main(argv: list[str] | None = None) -> int:
     rng = random.Random(args.seed)
     fonts = load_fonts(args.fonts)
     lines = [s for s in Path(args.text).read_text(encoding="utf-8").splitlines()
-             if s.strip() and s == s.strip()]          # render_line's rule
+             if usable_line(s, MAX_CHARS)]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    for i in range(args.n):
-        font = fonts[i % len(fonts)]
+    rows, i = [], 0
+    while i < args.n:
+        style = STYLES[i % len(STYLES)]
         text = rng.choice(lines)
-        render_line(text, font, rng).save(out / f"{i:03d}_{font.style}_{font.family}.png")
+        try:
+            got = render_fitting(text, style, fonts, rng)
+        except (NoCoveringFont, LineTooWide):
+            continue
+        if got is None:
+            continue
+        _, t = got
+        png = f"{i:03d}_{style}.png"
+        Image.fromarray((255 * (1 - t[0].numpy())).astype(np.uint8)).save(out / png)
+        rows.append(f"{png}\t{text}\t{style}")
+        i += 1
+    (out / "labels.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8", newline="\n")
     print(f"{args.n} samples -> {out}")
     return 0
 

@@ -69,8 +69,19 @@ def load_fonts(font_dir: str | Path) -> list[Font]:
         if digest != e.get("sha256"):
             raise FontManifestError(f"{e['path']}: sha256 {digest[:12]}... does not match "
                                     f"the manifest ({str(e.get('sha256'))[:12]}...)")
+        if _too_thin(path):
+            continue
         fonts.append(Font(e["family"], e["style"], path))
     return fonts
+
+
+def _too_thin(path: Path) -> bool:
+    """A static font file lighter than WEIGHT_MIN (Thin, ExtraLight, Hairline): its
+    strokes are near-invisible at 64 px, which makes labels for blank-looking images.
+    Variable fonts are kept; pick_axis_values clamps their weight instead."""
+    from fontTools.ttLib import TTFont
+    with TTFont(str(path), lazy=True) as f:
+        return "fvar" not in f and f["OS/2"].usWeightClass < WEIGHT_MIN
 
 
 def pick_font(fonts: list[Font], style: str, rng: random.Random) -> Font:
@@ -235,6 +246,20 @@ def _crop_to_ink(img: Image.Image, bg: int, ink: int, mx: int, vbox: tuple[int, 
                      vbox[1]))
 
 
+PERSPECTIVE = 0.03     # largest corner shift, as a fraction of the image's width / height
+
+
+def perspective_quad(w: int, h: int, rng: random.Random) -> tuple[float, ...]:
+    """Source corners (top-left, bottom-left, bottom-right, top-right) for a QUAD warp.
+    Every corner moves outward only, by up to PERSPECTIVE of the size: the warp
+    shrinks and skews the line inside the frame but never crops it. (Corners moved
+    inward cut the first or last letters off long lines while the label kept them:
+    3% of a 1,000 px line is 30 px, the side margin only 6-16 px.)"""
+    jx = lambda: rng.uniform(0, PERSPECTIVE) * w                        # noqa: E731
+    jy = lambda: rng.uniform(0, PERSPECTIVE) * h                        # noqa: E731
+    return (-jx(), -jy(), -jx(), h + jy(), w + jx(), h + jy(), w + jx(), -jy())
+
+
 def _augment(img: Image.Image, bg: int, rng: random.Random) -> Image.Image:
     nrng = np.random.default_rng(rng.getrandbits(32))
     w0, h0 = img.size
@@ -242,10 +267,7 @@ def _augment(img: Image.Image, bg: int, rng: random.Random) -> Image.Image:
     img = img.rotate(rng.uniform(-lim, lim), resample=Image.Resampling.BILINEAR, expand=True,
                      fillcolor=bg)
     if rng.random() < 0.3:
-        w, h = img.size
-        j = lambda n: rng.uniform(-0.03, 0.03) * n                      # noqa: E731
-        quad = (j(w), j(h), j(w), h + j(h), w + j(w), h + j(h), w + j(w), j(h))
-        img = img.transform(img.size, Image.Transform.QUAD, quad,
+        img = img.transform(img.size, Image.Transform.QUAD, perspective_quad(*img.size, rng),
                             resample=Image.Resampling.BILINEAR, fillcolor=bg)
     if rng.random() < 0.15:
         img = img.filter(ImageFilter.MinFilter(3))                       # ink bleed

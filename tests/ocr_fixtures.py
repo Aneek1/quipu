@@ -44,3 +44,20 @@ def drop_glyphs(font_dir: Path, family: str, chars: str) -> None:
         if e["family"] == family:
             e["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     (font_dir / "fonts.json").write_text(json.dumps(m), encoding="utf-8")
+
+
+def set_weight_class(font_dir: Path, family: str, weight: int) -> None:
+    """Rewrite one family's font in a make_font_dir tree with OS/2 usWeightClass =
+    weight (a static Thin / Light file as far as load_fonts can tell) and update its
+    sha256 in fonts.json."""
+    from fontTools.ttLib import TTFont
+
+    path = font_dir / "ofl" / family / f"{family}.ttf"
+    font = TTFont(str(path))
+    font["OS/2"].usWeightClass = weight
+    font.save(str(path))
+    m = json.loads((font_dir / "fonts.json").read_text(encoding="utf-8"))
+    for e in m["fonts"]:
+        if e["family"] == family:
+            e["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (font_dir / "fonts.json").write_text(json.dumps(m), encoding="utf-8")
