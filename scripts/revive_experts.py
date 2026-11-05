@@ -116,6 +116,29 @@ def layer_scores(cfg: Config, sd: dict[str, torch.Tensor], layer: int,
     return torch.softmax(h @ blk.moe.router.weight.float().T, -1)
 
 
+@torch.no_grad()
+def eval_loss(cfg: Config, sd: dict[str, torch.Tensor], tokens: np.ndarray, seqs: int,
+              seq_len: int, seed: int) -> float:
+    """Mean next-token cross-entropy of the whole model (fp32, loop dispatch, one
+    window at a time) on `seqs` random windows of `tokens`."""
+    model = build_meta(cfg)
+    model.load_state_dict({k.removeprefix(COMPILE_PREFIX): v for k, v in sd.items()},
+                          assign=True, strict=False)
+    model = model.float().eval()
+    model.rope_cos, model.rope_sin = build_rope_cache(cfg.model.context, cfg.model.head_dim,
+                                                      cfg.model.rope_base)
+    for blk in model.blocks:
+        blk.moe.dispatch = "loop"
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, len(tokens) - seq_len - 1, seqs)
+    losses = []
+    for s in starts:
+        row = torch.tensor(tokens[s:s + seq_len + 1].astype(np.int64))
+        logits = model(row[None, :-1]).float()
+        losses.append(float(torch.nn.functional.cross_entropy(logits[0], row[1:])))
+    return sum(losses) / len(losses)
+
+
 def load_of(scores: torch.Tensor, bias: torch.Tensor, top_k: int) -> torch.Tensor:
     """Top-k assignments per expert as a fraction of the balanced target."""
     n = scores.shape[1]
@@ -242,6 +265,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seqs", type=int, default=32)
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--loss-seqs", type=int, default=0,
+                    help="if > 0: whole-model loss on this many windows before and after "
+                         "(same windows; slow on a CPU, ~10 s per 1024-token window at 1B)")
     a = ap.parse_args(argv)
 
     src, out = Path(a.checkpoint).resolve(), Path(a.out).resolve()
@@ -267,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
     if not pairs:
         print("nothing to revive; no file written")
         return 0
+    loss_seed = a.seed + 2
+    loss_before = (eval_loss(cfg, sd, tokens, a.loss_seqs, a.seq_len, loss_seed)
+                   if a.loss_seqs > 0 else None)
     apply_splits(ck, cfg, a.layer, pairs, a.noise, a.seed)
     bkey = _key(sd, f"blocks.{a.layer}.moe.balancer.bias")
     if sd[bkey].dtype != torch.float32:
@@ -278,6 +307,11 @@ def main(argv: list[str] | None = None) -> int:
     after = measure_load(cfg, sd, a.layer, tokens, a.seqs, a.seq_len, a.seed + 1)
     print(f"after (calibrated bias, fresh windows): dead {int((after < a.threshold).sum())}, "
           f"load {after.min():.2f}-{after.max():.2f}x")
+    loss_after = None
+    if loss_before is not None:
+        loss_after = eval_loss(cfg, sd, tokens, a.loss_seqs, a.seq_len, loss_seed)
+        print(f"loss on {a.loss_seqs} windows: before {loss_before:.4f}, after "
+              f"{loss_after:.4f} ({loss_after - loss_before:+.4f})")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -287,7 +321,8 @@ def main(argv: list[str] | None = None) -> int:
               "noise": a.noise, "seed": a.seed, "pairs": pairs,
               "calib_updates": a.calib_updates, "calib_rows": a.calib_rows,
               "load_before": [round(x, 4) for x in before.tolist()],
-              "load_after": [round(x, 4) for x in after.tolist()]}
+              "load_after": [round(x, 4) for x in after.tolist()],
+              "loss_seqs": a.loss_seqs, "loss_before": loss_before, "loss_after": loss_after}
     Path(str(out) + ".revive.json").write_text(json.dumps(report, indent=1))
     print(f"wrote {out}")
     return 0

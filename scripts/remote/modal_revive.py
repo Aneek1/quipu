@@ -45,6 +45,7 @@ PIP = ["torch==2.11.0", "numpy==2.5.3", "tokenizers==0.23.2", "tiktoken==0.14.0"
        "safetensors==0.8.0", "torchao==0.18.0"]
 CPU, MEMORY_GIB, TIMEOUT_S = 4.0, 32, 40 * 60
 POOL_SHARD = "mixed/shard_00100.bin"
+LOSS_SEQS = 8          # whole-model loss before / after on 8 x 1024 tokens (~3 min CPU)
 CKPT_MOUNT, POOL_MOUNT = "/ckpt", "/pool"
 
 
@@ -66,7 +67,7 @@ def _pointer_file(ckpt_dir: Path) -> Path | None:
 
 
 def revive_in_place(stable: Path, tokens: Path, dry_run: bool, layer: int = 0,
-                    config: str = CONFIG, cwd: Path = HERE) -> dict:
+                    config: str = CONFIG, cwd: Path = HERE, loss_seqs: int = 0) -> dict:
     """The container's work, as a plain function (tests call it on the CPU)."""
     import json
     import importlib.util
@@ -89,7 +90,7 @@ def revive_in_place(stable: Path, tokens: Path, dry_run: bool, layer: int = 0,
     if dry_run and out.parent.exists():
         shutil.rmtree(out.parent)
     argv = ["--config", str(cwd / config), "--checkpoint", str(src), "--tokens", str(tokens),
-            "--out", str(out), "--layer", str(layer)]
+            "--out", str(out), "--layer", str(layer), "--loss-seqs", str(loss_seqs)]
     code = rv.main(argv)
     if code != 0:
         raise RuntimeError(f"revive_experts exited {code}")
@@ -124,7 +125,7 @@ if modal is not None:
     def revive(dry_run: bool) -> dict:
         ckpt_vol.reload()
         result = revive_in_place(Path(CKPT_MOUNT) / "stable", Path(POOL_MOUNT) / POOL_SHARD,
-                                 dry_run)
+                                 dry_run, loss_seqs=LOSS_SEQS)
         if result["written"]:
             ckpt_vol.commit()
         return result
@@ -154,6 +155,9 @@ def main(argv: list[str] | None = None) -> int:
         if v:
             dead = sum(x < result.get("threshold", 0.1) for x in v)
             print(f"{k}: dead {dead}, min {min(v):.2f}, max {max(v):.2f}")
+    lb, la = result.pop("loss_before", None), result.pop("loss_after", None)
+    if lb is not None and la is not None:
+        print(f"loss on {LOSS_SEQS} windows: before {lb:.4f}, after {la:.4f} ({la - lb:+.4f})")
     print(f"{len(pairs)} experts revived: {pairs}")
     print({k: v for k, v in result.items()})
     return 0

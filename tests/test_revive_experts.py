@@ -136,6 +136,44 @@ def test_revived_checkpoint_loads_into_model_and_optimizers_and_revives(tmp_path
         rv.main(argv)
 
 
+def test_eval_loss_matches_a_plain_forward_of_the_model():
+    cfg = _cfg()
+    ck = _trained_checkpoint(cfg)
+    tokens = np.random.default_rng(4).integers(0, cfg.model.vocab_size, 20_000).astype(np.uint16)
+    got = rv.eval_loss(cfg, ck["model"], tokens, seqs=3, seq_len=64, seed=5)
+    model = build_model(cfg.model)
+    model.load_state_dict(ck["model"])
+    model.eval()
+    for blk in model.blocks:
+        blk.moe.dispatch = "loop"
+    starts = np.random.default_rng(5).integers(0, len(tokens) - 65, 3)
+    want = []
+    with torch.no_grad():
+        for s in starts:
+            row = torch.tensor(tokens[s:s + 65].astype(np.int64))
+            want.append(float(torch.nn.functional.cross_entropy(
+                model(row[None, :-1]).float()[0], row[1:])))
+    assert math.isclose(got, sum(want) / 3, rel_tol=1e-5)
+
+
+def test_report_has_loss_before_and_after_when_asked(tmp_path):
+    import json
+    cfg = _cfg()
+    tokens = np.random.default_rng(6).integers(0, cfg.model.vocab_size, 20_000).astype(np.uint16)
+    write_shard(tmp_path / "s.bin", tokens)
+    torch.save(_trained_checkpoint(cfg), tmp_path / "in.pt")
+    cfg_path = tmp_path / "cfg.toml"
+    cfg_path.write_text('inherit = "{}"\n[model]\nattnres_blocks = 0\n'.format(
+        (ROOT / "configs" / "quipu-moe-smoke.toml").as_posix()), encoding="utf-8")
+    out = tmp_path / "out.pt"
+    assert rv.main(["--config", str(cfg_path), "--checkpoint", str(tmp_path / "in.pt"),
+                    "--tokens", str(tmp_path / "s.bin"), "--out", str(out), "--seqs", "8",
+                    "--seq-len", "64", "--loss-seqs", "2"]) == 0
+    rep = json.loads((tmp_path / "out.pt.revive.json").read_text())
+    assert rep["loss_seqs"] == 2
+    assert math.isfinite(rep["loss_before"]) and math.isfinite(rep["loss_after"])
+
+
 # ---- scripts/remote/modal_revive.py: the in-place swap on the Volume ---------------
 
 _mspec = importlib.util.spec_from_file_location(
